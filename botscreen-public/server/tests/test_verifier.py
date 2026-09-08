@@ -218,6 +218,26 @@ class TestBlockAndEscalate:
         assert decision.verdict == "ESCALATE"
 
 
+class TestEmptyAnswerGuard:
+    def test_empty_completed_answer_never_passes(self):
+        # e.g. the #53 no_evidence shape: COMPLETED with evidence but no answer
+        execution = FakeExecution(
+            answer="",
+            evidence=[FakeEvidence("faq-fever", "体温超过38.5建议门诊就诊。")],
+        )
+        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        assert decision.grounded is True
+        assert decision.verdict == "REVISE"
+        assert decision.revision_instructions == "empty_answer"
+
+    def test_empty_answer_without_evidence_revises_ungrounded(self):
+        decision = SafetyEvidenceVerifier().decide(
+            _context(), FakeExecution(answer="", evidence=[])
+        )
+        assert decision.verdict == "REVISE"
+        assert decision.revision_instructions == "ungrounded"
+
+
 class TestRunnerSlot:
     @mark.asyncio
     async def test_pending_execution_rejected_without_checks(self):

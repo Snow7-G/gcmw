@@ -158,6 +158,7 @@ class SafetyEvidenceVerifier:
         )
 
         grounded = bool(evidence)
+        answer_empty = not answer
         resolved_citations, citations_known = _resolve_citations(answer, evidence)
         known_ids = _source_ids(evidence)
         citation_coverage = True
@@ -190,6 +191,7 @@ class SafetyEvidenceVerifier:
                 scope_ok=scope_ok,
                 citation_coverage=citation_coverage,
                 unsupported=unsupported,
+                answer_present=not answer_empty,
                 full=not fast,
             )
 
@@ -213,10 +215,13 @@ class SafetyEvidenceVerifier:
         scope_ok: bool,
         citation_coverage: bool,
         unsupported: bool,
+        answer_present: bool,
         full: bool = False,
     ) -> tuple[str, str]:
         if not grounded:
             return "REVISE", "ungrounded"
+        if not answer_present:
+            return "REVISE", "empty_answer"
         if full and unsupported:
             return "REVISE", "unsupported_claims"
         if not scope_ok:
