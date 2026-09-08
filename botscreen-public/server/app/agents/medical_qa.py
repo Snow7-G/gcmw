@@ -28,7 +28,11 @@ from app.contracts.agent import AgentContext, AgentStatus, Evidence, ToolRequest
 from app.contracts.model import ModelRequest
 from app.rag.retrieval import RetrievalHit
 
-_GROUNDED_HEADER = "请仅依据下方已审核资料作答，不得引用资料外信息。\n\n已审核资料：\n"
+_GROUNDED_HEADER = (
+    "请仅依据下方已审核资料作答，不得引用资料外信息；"
+    "回答中必须标注所用资料的编号（如 资料[1]），"
+    "不得引用未给出的编号。\n\n已审核资料：\n"
+)
 
 
 @dataclass
