@@ -276,13 +276,29 @@ class ManagerAgent:
                 )
                 self._mark(actions, "verify.verdict", approved=verdict.approved)
 
+        if verdict is not None and not verdict.approved:
+            # final rejection after ≤1 controlled revision: an unverified
+            # medical answer must never be delivered — the run fails cleanly
+            # with audit markers only (no answer leaves this module)
+            self._mark(actions, "verify.reject_final")
+            if revisions:
+                self._mark(actions, "manager.revised", count=revisions)
+            return self._finalize(
+                ctx,
+                actions,
+                evidence,
+                status=AgentStatus.FAILED,
+                answer="",
+                safety="revised",
+            )
+
         safety = (
             "passed"
             if execution.safety_status in ("", "unknown")
             else execution.safety_status
         )
         if verdict is not None:
-            safety = "verified" if verdict.approved else "revised"
+            safety = "verified" if verdict.approved else safety
         if revisions:
             self._mark(actions, "manager.revised", count=revisions)
         return self._finalize(

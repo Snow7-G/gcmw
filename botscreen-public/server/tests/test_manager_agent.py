@@ -347,7 +347,30 @@ class TestPipeline:
         # at most one revision: initial run + one rerun, two verdicts consumed
         assert len(runner.calls) == 2
         assert len(verifier.seen) == 2
-        assert result.safety_status == "revised"
+        # an unverified medical answer is never delivered: the run fails clean
+        assert result.status is AgentStatus.FAILED
+        assert result.answer_candidate == ""
+        marker_types = [a["type"] for a in result.actions]
+        assert "verify.reject_final" in marker_types
+        assert "manager.revised" in marker_types
+
+    @mark.asyncio
+    async def test_rejected_twice_marks_reject_final_only_after_revision(self):
+        # reject -> one revision -> reject again: still no answer delivered
+        reg = AgentRegistry()
+        reg.register(_qa_manifest())
+        runner = _Runner()
+        verifier = _Verifier([Verdict(False), Verdict(False)])
+        m = ManagerAgent(
+            registry=reg,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.FAILED
+        assert result.answer_candidate == ""
+        assert [a["type"] for a in result.actions].count("verify.reject_final") == 1
+        assert len(runner.calls) == 2
 
     @mark.asyncio
     async def test_failed_agent_run_skips_verifier(self):
