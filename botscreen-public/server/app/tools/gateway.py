@@ -21,12 +21,14 @@ runaway executor thread is daemon and cannot block process shutdown.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 from app.contracts.agent import ToolRequest, ToolResult
@@ -83,7 +85,7 @@ class ToolGateway:
         default_max_result_bytes: int = 64 * 1024,
     ) -> None:
         self._audit_sink = audit_sink
-        self._clock = clock
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._runner = runner or _default_runner
         self._default_timeout_ms = default_timeout_ms
         self._default_max_result_bytes = default_max_result_bytes
@@ -105,7 +107,7 @@ class ToolGateway:
                     ErrorCode.CONFLICT_IDEMPOTENCY,
                     f"tool {spec.name!r} already registered",
                 )
-            self._specs[spec.name] = spec
+            self._specs[spec.name] = copy.deepcopy(spec)
             self._order.append(spec.name)
 
     def tools(self) -> list[str]:
@@ -115,7 +117,8 @@ class ToolGateway:
 
     def spec(self, name: str) -> ToolSpec | None:
         with self._lock:
-            return self._specs.get(name)
+            spec = self._specs.get(name)
+            return copy.deepcopy(spec) if spec is not None else None
 
     def is_enabled(self, name: str) -> bool:
         with self._lock:
@@ -262,8 +265,6 @@ class ToolGateway:
         """Remaining budget: per-tool default capped by an explicit deadline."""
         timeout_ms = self._default_timeout_ms
         if request.deadline is not None:
-            if self._clock is None:
-                return timeout_ms  # no wall clock wired: honour the default
             remaining_ms = int(
                 (request.deadline - self._clock()).total_seconds() * 1000
             )

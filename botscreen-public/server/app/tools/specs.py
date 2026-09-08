@@ -9,6 +9,7 @@ never echo values in error text.
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -153,7 +154,13 @@ def canonical_spec(
     return ToolSpec(
         name=name,
         description=description,
-        input_schema=input_schema,
-        output_schema=output_schema if output_schema is not None else OUTPUT_SCHEMA,
+        # specs own deep copies of the declarative schemas: mutating one spec
+        # (or the gateway's stored copy) can never corrupt the declarations
+        input_schema=copy.deepcopy(input_schema),
+        output_schema=(
+            copy.deepcopy(output_schema)
+            if output_schema is not None
+            else copy.deepcopy(OUTPUT_SCHEMA)
+        ),
         executor=executor,
     )

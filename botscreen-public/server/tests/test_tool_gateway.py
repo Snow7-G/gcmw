@@ -300,6 +300,22 @@ class TestTimeoutGate:
             time.sleep(0.01)
         assert ran["done"] is True
 
+    def test_deadline_honored_without_explicit_clock(self):
+        # gateway defaults to a real UTC clock, so deadlines always apply
+        gw = ToolGateway()  # no clock injected
+        gw.register(
+            canonical_spec("memory.read_short", executor=lambda args: {"summary": "s"})
+        )
+        past = datetime.now(timezone.utc) - timedelta(seconds=5)
+        with pytest.raises(ToolGatewayError) as exc:
+            gw.invoke(
+                _request("memory.read_short", deadline=past),
+                allowed_tools=["memory.read_short"],
+                agent_id="a",
+                request_id="r",
+            )
+        assert exc.value.code is ErrorCode.TOOL_TIMEOUT
+
     def test_injected_runner_timeout_is_structured(self):
         sink = _Sink()
 
@@ -439,6 +455,34 @@ class TestRealStoreIntegration:
         assert result.data["items"][0]["knowledge_version"] == "faq-1-v1"
         fragment = _call(gw, "knowledge.get_fragment", {"source_id": "faq-1"})
         assert fragment.data["total_fragments"] == 1
+
+
+class TestAliasSafety:
+    def test_canonical_specs_own_their_schemas(self):
+        a = canonical_spec("knowledge.search", executor=lambda args: {})
+        b = canonical_spec("knowledge.search", executor=lambda args: {})
+        a.input_schema["required"] = []
+        assert b.input_schema["required"] == ["query"]  # decl uncorrupted
+        from app.tools.specs import TOOL_INPUT_SCHEMAS
+
+        assert TOOL_INPUT_SCHEMAS["knowledge.search"][1]["required"] == ["query"]
+
+    def test_registered_spec_is_isolated_from_caller_mutation(self):
+        gw = ToolGateway()
+        spec = canonical_spec("knowledge.search", executor=lambda args: {})
+        gw.register(spec)
+        spec.input_schema["required"] = []  # caller mutates its own copy
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.search", {})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED  # still required
+
+    def test_spec_returns_deep_copy(self):
+        gw = ToolGateway()
+        gw.register(canonical_spec("knowledge.search", executor=lambda args: {}))
+        got = gw.spec("knowledge.search")
+        got.input_schema["required"] = []
+        assert gw.spec("knowledge.search").input_schema["required"] == ["query"]
+        assert gw.spec("ghost") is None
 
 
 class TestDomainExecutorSpy:
