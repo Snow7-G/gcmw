@@ -104,7 +104,9 @@ class MedicalQAAgent:
 
     # -- internal helpers -----------------------------------------------------
 
-    async def _search(self, ctx: AgentContext) -> list[RetrievalHit]:
+    async def _search(
+        self, ctx: AgentContext, budget: dict[str, int]
+    ) -> list[RetrievalHit]:
         result = await self._tools.invoke(
             ToolRequest(
                 tool_name="knowledge.search",
@@ -120,7 +122,7 @@ class MedicalQAAgent:
             run_id=ctx.run_id,
             request_id=ctx.run_id,
         )
-        self._tool_calls += 1
+        budget["calls"] += 1
         if not result.ok:
             return []
         data = result.data or {}
@@ -142,7 +144,9 @@ class MedicalQAAgent:
             )
         return hits
 
-    async def _fragment(self, ctx: AgentContext, hit: RetrievalHit) -> str:
+    async def _fragment(
+        self, ctx: AgentContext, hit: RetrievalHit, budget: dict[str, int]
+    ) -> str:
         result = await self._tools.invoke(
             ToolRequest(
                 tool_name="knowledge.get_fragment",
@@ -157,7 +161,7 @@ class MedicalQAAgent:
             run_id=ctx.run_id,
             request_id=ctx.run_id,
         )
-        self._tool_calls += 1
+        budget["calls"] += 1
         if not result.ok:
             return hit.snippet
         data = result.data or {}
@@ -167,18 +171,25 @@ class MedicalQAAgent:
 
     async def run(self, context: AgentContext) -> QAExecution:
         """Answer one grounded turn. Raises nothing by design except gateway
-        violations — failures surface as structured results for the Manager."""
-        self._tool_calls = 0
-        execution = QAExecution(agent_id="qa", status=AgentStatus.COMPLETED)
+        violations — failures surface as structured results for the Manager.
 
-        hits = await self._search(context)
+        All mutable run state (tool budget) lives in a per-run dict so
+        concurrent runs on one shared agent instance can never interleave
+        counters (the budget is a security control, not shared state)."""
+        budget = {"calls": 0}
+        execution = QAExecution(agent_id="qa", status=AgentStatus.COMPLETED)
+        if not (context.normalized_input or "").strip():
+            execution.status = AgentStatus.FAILED
+            return execution
+
+        hits = await self._search(context, budget)
 
         evidence: list[Evidence] = []
         grounded: list[str] = []
         for hit in hits[: self._max_fragments]:
-            if self._tool_calls >= self._max_tool_calls:
+            if budget["calls"] >= self._max_tool_calls:
                 break
-            text = await self._fragment(context, hit)
+            text = await self._fragment(context, hit, budget)
             evidence.append(_evidence_from(hit, text))
             grounded.append(
                 f"[{len(grounded) + 1}] {hit.title}"
@@ -186,7 +197,7 @@ class MedicalQAAgent:
             )
 
         execution.evidence = evidence
-        execution.tool_calls = self._tool_calls
+        execution.tool_calls = budget["calls"]
         if not evidence:
             # no approved evidence: never invent an answer
             execution.safety_status = "no_evidence"
@@ -210,5 +221,10 @@ class MedicalQAAgent:
         execution.model_id = response.model_id
         execution.model_version = response.model_version
         execution.answer_candidate = (response.content or "").strip()
+        if not execution.answer_candidate:
+            # grounded but empty model output: do not deliver an empty success
+            execution.status = AgentStatus.FAILED
+            execution.safety_status = "empty_reply"
+            return execution
         execution.safety_status = "grounded"
         return execution

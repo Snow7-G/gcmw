@@ -211,6 +211,31 @@ class TestEvidenceGrounding:
         assert result.answer_candidate == "ok"
 
 
+class TestRunGuards:
+    @mark.asyncio
+    async def test_empty_input_fails_structurally(self):
+        tools = FakeTools(items=[{"source_id": "x", "title": "t", "content": "c"}])
+        models = FakeModels()
+        models.raise_on_call = True
+        result = await _agent(tools, models).run(_context(text="   "))
+        assert result.status is AgentStatus.FAILED
+        assert result.tool_calls == 0
+        assert tools.calls == []  # nothing hits the gateway
+
+    @mark.asyncio
+    async def test_empty_model_reply_is_a_failure_not_an_answer(self):
+        tools = FakeTools(
+            items=[{"source_id": "g1", "title": "发热", "content": "体温38.5建议就诊"}],
+            fragments={"g1": "体温38.5建议门诊就诊。"},
+        )
+        models = FakeModels(content="   ")  # model returns nothing usable
+        result = await _agent(tools, models).run(_context())
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "empty_reply"
+        assert result.answer_candidate == ""
+        assert len(result.evidence) == 1  # evidence was found and is kept
+
+
 class TestGatewayMediation:
     @mark.asyncio
     async def test_model_calls_ride_the_model_gateway(self):
