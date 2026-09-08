@@ -45,6 +45,7 @@ from app.config import Settings
 from app.contracts.errors import ErrorCode
 from app.providers.model_gateway import ModelGatewayError
 from app.runtime import build_run_repository, readiness_report
+from app.tools.gateway import ToolGatewayError
 
 APP_TITLE = "gcmw agent api"
 APP_VERSION = "0.1.0"
@@ -205,6 +206,10 @@ def create_app(
 
     @app.exception_handler(ModelGatewayError)
     async def gateway_error_handler(request: Request, exc: ModelGatewayError):
+        return _envelope_response(request, exc.code)
+
+    @app.exception_handler(ToolGatewayError)
+    async def tool_error_handler(request: Request, exc: ToolGatewayError):
         return _envelope_response(request, exc.code)
 
     @app.exception_handler(RequestValidationError)
