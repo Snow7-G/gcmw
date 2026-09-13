@@ -712,6 +712,8 @@ async def create_session(
         ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,
+        ErrorCode.VALIDATION_PAYLOAD_TOO_LARGE,
+        ErrorCode.UNAVAILABLE_CLIENT_TIMEOUT,
     ),
 )
 async def delete_session(
@@ -788,6 +790,8 @@ async def get_run(
         ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,
+        ErrorCode.VALIDATION_PAYLOAD_TOO_LARGE,
+        ErrorCode.UNAVAILABLE_CLIENT_TIMEOUT,
     ),
 )
 async def cancel_run(

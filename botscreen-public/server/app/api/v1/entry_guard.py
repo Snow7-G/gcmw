@@ -246,8 +246,12 @@ def _body_session(body: bytes) -> str | None:
     string ``session_id``, or carries an absurdly long one simply yields
     ``None`` (the request is then only tenant/device charged). The route still
     performs full validation — this only decides the session rate-limit key.
+
+    There is deliberately NO size shortcut here: the body is already bounded by
+    ``max_request_body_bytes``, and skipping big-but-legal payloads would let a
+    caller pad a request past a threshold to escape the session window.
     """
-    if not body or len(body) > 64 * 1024:
+    if not body:
         return None
     try:
         payload = json.loads(body)

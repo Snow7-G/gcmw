@@ -7,6 +7,7 @@ requirement is covered by inspecting the AuditRecord the limiter emits.
 
 from __future__ import annotations
 
+import json
 from typing import ClassVar
 
 import pytest
@@ -426,6 +427,57 @@ class TestHttpEnforcement:
             )
         assert second.status_code == 429  # same session: window exhausted
         assert third.status_code == 200  # other session: unaffected
+
+    def test_a_padded_but_legal_body_is_still_session_charged(self):
+        """Review P1: padding a payload must not escape the session window.
+
+        The body stays inside the configured 256 KiB cap, so the session id is
+        extracted and the second request on that session is throttled.
+        """
+        limits = {"rate_limit_session_per_minute": 1, "rate_limit_tenant_per_minute": 0}
+        with running_app(settings_kwargs=limits) as h:
+            session = new_session(h)
+
+            def padded(key: str) -> bytes:
+                """Legal JSON padded with whitespace OUTSIDE the object."""
+                payload = json.dumps(
+                    {
+                        "session_id": session["session_id"],
+                        "input": {"type": "text", "text": "padded"},
+                        "idempotency_key": key,
+                    }
+                ).encode()
+                body = b" " * (66 * 1024) + payload + b" " * 1024
+                assert len(body) < 256 * 1024  # inside the configured cap
+                return body
+
+            headers = {"content-type": "application/json"}
+            first = h.client.post(
+                "/api/v1/agent/runs", content=padded("pad-1"), headers=headers
+            )
+            assert first.status_code == 200, first.text
+            # the same session again: the window (limit 1) must trip BEFORE the
+            # route's single-active-run rule can answer 409
+            second = h.client.post(
+                "/api/v1/agent/runs", content=padded("pad-2"), headers=headers
+            )
+        assert second.status_code == 429  # the session window really was charged
+
+    def test_invalid_json_still_charges_tenant_and_device(self):
+        limits = {
+            "rate_limit_tenant_per_minute": 1,
+            "rate_limit_session_per_minute": 1,
+            "rate_limit_device_per_minute": 0,
+        }
+        with running_app(settings_kwargs=limits) as h:
+            first = h.client.post(
+                "/api/v1/agent/runs",
+                content=b"{not json",
+                headers={"content-type": "application/json"},
+            )
+            assert first.status_code == 400  # validation still rejects it
+            second = h.client.post("/api/v1/sessions", json={"channel": "text"})
+        assert second.status_code == 429  # the invalid attempt was paid for
 
     def test_default_configuration_does_not_throttle_normal_use(self):
         with running_app() as h:

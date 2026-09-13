@@ -157,6 +157,16 @@ class TestDocumentedContract:
             assert "E_VALIDATION_PAYLOAD_TOO_LARGE" in responses["413"]["description"]
             assert "E_UNAVAILABLE_CLIENT_TIMEOUT" in responses["408"]["description"]
 
+    def test_delete_routes_declare_the_guard_codes_they_really_return(self, schema):
+        """The guard buffers DELETE bodies too, so 413/408 are reachable there."""
+        for path in (
+            "/api/v1/sessions/{session_id}",
+            "/api/v1/agent/runs/{run_id}",
+        ):
+            responses = _operation(schema, path, "delete")["responses"]
+            assert "413" in responses, path
+            assert "408" in responses, path
+
     def test_key_table_overload_is_declared_on_every_limited_route(self, schema):
         """503 documents the OVERLOAD reason explicitly, not just any 503."""
         for path, path_item in schema["paths"].items():
@@ -209,6 +219,20 @@ class TestWireParity:
             harness.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
         assert res.status_code == 403
         assert res.json()["code"] == "E_AUTHZ_FORBIDDEN"
+
+    def test_oversized_delete_body_is_a_documented_413(self, harness):
+        """Wire parity for the DELETE routes' 413."""
+        limits = {"max_request_body_bytes": 256}
+        with running_app(settings_kwargs=limits) as h:
+            session = new_session(h)
+            res = h.client.request(
+                "DELETE",
+                f"/api/v1/sessions/{session['session_id']}",
+                content=b"x" * 1024,
+                headers={"content-type": "application/json"},
+            )
+        assert res.status_code == 413
+        assert res.json()["code"] == "E_VALIDATION_PAYLOAD_TOO_LARGE"
 
     def test_404_for_an_unknown_run(self, harness):
         res = harness.client.get("/api/v1/agent/runs/ghost/events")

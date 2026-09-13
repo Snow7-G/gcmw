@@ -131,7 +131,8 @@ class Settings(BaseModel):
     max_request_body_bytes: int = Field(262_144, gt=0)
     # bounded upload: a client that cannot deliver the body within this window is
     # answered with 408 instead of holding a worker hostage
-    request_body_timeout_s: float = Field(10.0, gt=0)
+    # allow_inf_nan=False: "bounded upload" must not be configurable away
+    request_body_timeout_s: float = Field(10.0, gt=0, allow_inf_nan=False)
 
     # request rate limits (#66): requests per minute per tenant/device/session.
     # 0 disables that scope. Process-local counters (see app.api.v1.rate_limit).
