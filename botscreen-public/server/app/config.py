@@ -126,6 +126,12 @@ class Settings(BaseModel):
     max_agent_handoffs: int = Field(2, ge=0)
     max_revisions: int = Field(1, ge=0)
 
+    # request rate limits (#66): requests per minute per tenant/device/session.
+    # 0 disables that scope. Process-local counters (see app.api.v1.rate_limit).
+    rate_limit_tenant_per_minute: int = Field(600, ge=0)
+    rate_limit_device_per_minute: int = Field(300, ge=0)
+    rate_limit_session_per_minute: int = Field(120, ge=0)
+
     model_timeout_ms: int = Field(15_000, gt=0)
     tool_timeout_ms: int = Field(5_000, gt=0)
     sse_timeout_ms: int = Field(30_000, gt=0)
@@ -242,6 +248,11 @@ class Settings(BaseModel):
             max_tool_calls=_int("GCMW_MAX_TOOL_CALLS", 4),
             max_agent_handoffs=_int("GCMW_MAX_AGENT_HANDOFFS", 2),
             max_revisions=_int("GCMW_MAX_REVISIONS", 1),
+            rate_limit_tenant_per_minute=_int("GCMW_RATE_LIMIT_TENANT_PER_MINUTE", 600),
+            rate_limit_device_per_minute=_int("GCMW_RATE_LIMIT_DEVICE_PER_MINUTE", 300),
+            rate_limit_session_per_minute=_int(
+                "GCMW_RATE_LIMIT_SESSION_PER_MINUTE", 120
+            ),
             model_timeout_ms=_int("GCMW_MODEL_TIMEOUT_MS", 15_000),
             tool_timeout_ms=_int("GCMW_TOOL_TIMEOUT_MS", 5_000),
             sse_timeout_ms=_int("GCMW_SSE_TIMEOUT_MS", 30_000),

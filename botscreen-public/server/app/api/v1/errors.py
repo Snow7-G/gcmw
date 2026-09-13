@@ -13,8 +13,16 @@ from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 class AppError(RuntimeError):
     """Application-level failure with a stable ErrorCode (#35)."""
 
-    def __init__(self, code: ErrorCode, message: str = "") -> None:
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str = "",
+        *,
+        retry_after_ms: int | None = None,
+    ) -> None:
         self.code = code
+        #: how long the caller should wait before retrying (rate limiting: #66)
+        self.retry_after_ms = retry_after_ms
         super().__init__(message or code.value)
 
 

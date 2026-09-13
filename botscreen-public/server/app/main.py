@@ -17,11 +17,14 @@
 - device credentials come from the environment (``GCMW_DEVICE_CREDENTIALS`` by
   default) and are only ever kept as digests (see :mod:`app.api.v1.auth`);
 - SSE connection leases (subscriber counting + reconnect grace) are created in
-  the same lifespan scope and torn down with the application.
+  the same lifespan scope and torn down with the application;
+- per-tenant/device/session rate limits are created in the same scope, so a
+  throttled caller is rejected before any work happens (#66).
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
 
@@ -35,6 +38,7 @@ from app.api.v1.agent_api import AppError, RunAdmissionService
 from app.api.v1.agent_api import router as agent_router
 from app.api.v1.auth import CredentialStore
 from app.api.v1.errors import request_ids
+from app.api.v1.rate_limit import RateLimiter, rules_from_settings
 from app.api.v1.stream_leases import DEFAULT_RECONNECT_GRACE_S, RunLeaseRegistry
 from app.config import Settings
 from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
@@ -44,16 +48,31 @@ from app.runtime import build_run_repository, readiness_report
 APP_TITLE = "gcmw agent api"
 APP_VERSION = "0.1.0"
 
+#: structured audit sink for security-relevant decisions (rate limiting today).
+#: A durable audit store is a follow-up slice; operators can route this logger.
+AUDIT_LOGGER_NAME = "gcmw.audit"
+
 #: routes that are public by design (liveness/readiness probes)
 PUBLIC_PATHS = frozenset({"/api/v1/health/live", "/api/v1/health/ready"})
 
 
 def _envelope_response(
-    request: Request, code: ErrorCode, status_override: int | None = None
+    request: Request,
+    code: ErrorCode,
+    status_override: int | None = None,
+    retry_after_ms: int | None = None,
 ) -> JSONResponse:
     request_id, trace_id = request_ids(request)
-    envelope = ErrorEnvelope.build(code=code, request_id=request_id, trace_id=trace_id)
+    envelope = ErrorEnvelope.build(
+        code=code,
+        request_id=request_id,
+        trace_id=trace_id,
+        retry_after_ms=retry_after_ms,
+    )
     headers = {"X-Request-ID": request_id, "X-Trace-ID": trace_id}
+    if retry_after_ms is not None:
+        # standard hint for intermediaries/clients, rounded up to whole seconds
+        headers["Retry-After"] = str(max(1, -(-retry_after_ms // 1000)))
     return JSONResponse(
         status_code=status_override or http_status_for(code),
         content=envelope.model_dump(mode="json"),
@@ -82,6 +101,16 @@ def _declare_bearer_auth(schema: dict) -> None:
         for operation in path_item.values():
             if isinstance(operation, dict):
                 operation["security"] = [{"BearerAuth": []}]
+
+
+def _log_audit_record(record) -> None:
+    """Default audit sink: one structured JSON line per security decision.
+
+    Kept as a logger (not a store) on purpose: it is operable today and can be
+    routed to a file/SIEM, while a durable audit sink needs the persistent
+    store that #65 gates.
+    """
+    logging.getLogger(AUDIT_LOGGER_NAME).warning(record.model_dump_json())
 
 
 def _normalize_stream_media_types(responses: dict) -> None:
@@ -131,6 +160,9 @@ def create_app(
         # between loops (or between workers) by accident
         service = RunAdmissionService(repository=factory(settings))
         credentials = CredentialStore.from_env(settings.auth_credentials_env)
+        rate_limiter = RateLimiter(
+            rules_from_settings(settings), audit=_log_audit_record
+        )
         report = readiness_report(settings, service.repository, credentials)
         if not report.ready:
             raise RuntimeError(
@@ -146,6 +178,7 @@ def create_app(
         )
         app.state.agent_service = service
         app.state.credentials = credentials
+        app.state.rate_limiter = rate_limiter
         app.state.readiness = report
         app.state.stream_leases = leases
         try:
@@ -154,6 +187,7 @@ def create_app(
             await leases.shutdown()
             app.state.agent_service = None
             app.state.credentials = None
+            app.state.rate_limiter = None
             app.state.readiness = None
             app.state.stream_leases = None
 
@@ -161,6 +195,7 @@ def create_app(
     app.state.settings = settings
     app.state.agent_service = None
     app.state.credentials = None
+    app.state.rate_limiter = None
     app.state.readiness = None
     app.state.stream_leases = None
 
@@ -176,7 +211,7 @@ def create_app(
 
     @app.exception_handler(AppError)
     async def app_error_handler(request: Request, exc: AppError):
-        return _envelope_response(request, exc.code)
+        return _envelope_response(request, exc.code, retry_after_ms=exc.retry_after_ms)
 
     @app.exception_handler(RegistryError)
     async def registry_error_handler(request: Request, exc: RegistryError):

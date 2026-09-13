@@ -69,6 +69,7 @@ def running_app(
     *,
     overrides: bool = True,
     credentials: list[dict] | None = None,
+    settings_kwargs: dict | None = None,
 ) -> Iterator[Harness]:
     """Run the application under test.
 
@@ -78,7 +79,7 @@ def running_app(
     tests never bypass the production path.
     """
     repository = repository if repository is not None else MemoryRunRepository()
-    settings = Settings(environment=environment)
+    settings = Settings(environment=environment, **(settings_kwargs or {}))
     env_name = settings.auth_credentials_env
     previous = os.environ.get(env_name)
     if credentials is not None:

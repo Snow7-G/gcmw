@@ -117,6 +117,7 @@ async def _open_stream(
         last_event_id=None,
         service=harness.service,
         leases=harness.app.state.stream_leases,
+        limiter=harness.app.state.rate_limiter,
     )
 
 
@@ -327,6 +328,7 @@ class TestOpenStreams:
             "last_event_id",
             "service",
             "leases",
+            "limiter",
         }
         assert agent_api.SSE_HEARTBEAT_S == 15.0
 

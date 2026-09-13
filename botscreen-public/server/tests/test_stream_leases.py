@@ -420,6 +420,7 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             assert registry.subscribers(run["run_id"]) == 0  # not started yet
             chunks = []
@@ -450,6 +451,7 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             async for _chunk in response.body_iterator:
                 break
@@ -482,6 +484,7 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             async for _chunk in first.body_iterator:
                 break
@@ -495,6 +498,7 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             async for _chunk in second.body_iterator:
                 break
@@ -548,6 +552,7 @@ class TestServerSideEndIsNotADisconnect:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             body = [chunk async for chunk in response.body_iterator]  # consumed
             state = await harness.service.repository.state(run["identity"])
@@ -582,6 +587,7 @@ class TestServerSideEndIsNotADisconnect:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             body = [chunk async for chunk in response.body_iterator]
             return (
@@ -624,6 +630,7 @@ class TestServerSideEndIsNotADisconnect:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
+                limiter=harness.app.state.rate_limiter,
             )
             chunks = []
             async for chunk in response.body_iterator:
