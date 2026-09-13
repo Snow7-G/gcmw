@@ -269,3 +269,52 @@ def test_misspelled_config_field_fails():
 
     with pytest.raises(ValidationError):
         Settings(environment="production", active_providerr="local")
+
+
+class TestUploadBounds:
+    """The #66 entry guard's upload bounds must not be configurable away."""
+
+    @pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+    def test_non_finite_body_timeout_is_rejected_on_construction(self, value):
+        with pytest.raises(ValidationError):
+            Settings(environment="test", request_body_timeout_s=value)
+
+    @pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "Infinity"])
+    def test_non_finite_body_timeout_is_rejected_from_the_environment(
+        self, monkeypatch, raw
+    ):
+        monkeypatch.setenv("GCMW_ENV", "test")
+        monkeypatch.setenv("GCMW_REQUEST_BODY_TIMEOUT_S", raw)
+        with pytest.raises((ValidationError, ValueError)):
+            Settings.from_env()
+
+    @pytest.mark.parametrize("value", [0, -1, -0.5])
+    def test_non_positive_body_timeout_is_rejected(self, value):
+        with pytest.raises(ValidationError):
+            Settings(environment="test", request_body_timeout_s=value)
+
+    def test_a_finite_body_timeout_is_accepted_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv("GCMW_ENV", "test")
+        monkeypatch.setenv("GCMW_REQUEST_BODY_TIMEOUT_S", "2.5")
+        assert Settings.from_env().request_body_timeout_s == 2.5
+
+    @pytest.mark.parametrize("raw", ["not-a-number", ""])
+    def test_a_non_numeric_body_timeout_is_rejected(self, monkeypatch, raw):
+        monkeypatch.setenv("GCMW_ENV", "test")
+        monkeypatch.setenv("GCMW_REQUEST_BODY_TIMEOUT_S", raw)
+        with pytest.raises((ValidationError, ValueError)):
+            Settings.from_env()
+
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_non_finite_timeout_cannot_reach_the_entry_guard(self, value):
+        """End to end: the value never reaches the middleware's constructor."""
+        from app.api.v1.entry_guard import EntryGuardMiddleware
+
+        with pytest.raises(ValidationError):
+            settings = Settings(environment="test", request_body_timeout_s=value)
+            EntryGuardMiddleware(
+                None,
+                public_paths=frozenset(),
+                max_body_bytes=settings.max_request_body_bytes,
+                body_timeout_s=settings.request_body_timeout_s,
+            )
