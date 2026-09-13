@@ -128,17 +128,34 @@ class TestDocumentedContract:
         for path in ("/api/v1/health/live", "/api/v1/health/ready"):
             assert "security" not in schema["paths"][path]["get"]
 
-    def test_rate_limited_routes_document_429(self, schema):
-        """Every route that charges a window publishes the 429 it can return."""
+    def test_rate_limited_routes_document_429_and_503(self, schema):
+        """Every route that charges a window publishes BOTH codes it can return.
+
+        The limiter raises 429 when a window is exhausted and 503 when the key
+        table is at its hard cap — a route that documents only one of them has a
+        contract that disagrees with the wire (review P2).
+        """
         for path, path_item in schema["paths"].items():
             for method, operation in path_item.items():
                 responses = operation.get("responses", {})
                 if path.startswith("/api/v1/health"):
                     assert "429" not in responses, (method, path)
                     continue
-                assert "429" in responses, (method, path)
-                ref = responses["429"]["content"]["application/json"]["schema"]["$ref"]
-                assert ref.endswith("/ErrorEnvelope")
+                for code in ("429", "503"):
+                    assert code in responses, (method, path, code)
+                    ref = responses[code]["content"]["application/json"]["schema"][
+                        "$ref"
+                    ]
+                    assert ref.endswith("/ErrorEnvelope"), (method, path, code)
+
+    def test_key_table_overload_is_declared_on_every_limited_route(self, schema):
+        """503 documents the OVERLOAD reason explicitly, not just any 503."""
+        for path, path_item in schema["paths"].items():
+            if path.startswith("/api/v1/health"):
+                continue
+            for method, operation in path_item.items():
+                description = operation["responses"]["503"]["description"]
+                assert "E_UNAVAILABLE_OVERLOADED" in description, (method, path)
 
     def test_ready_documentation_matches_the_published_schema(self, schema):
         """The readiness body shape is documented, not implied."""

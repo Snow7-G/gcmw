@@ -82,6 +82,20 @@ class TestRuleValidation:
         with pytest.raises(ValueError):
             RateLimiter((TENANT,), max_keys=0)
 
+    def test_mixed_window_lengths_are_refused(self):
+        """Pruning reclaims by age against one horizon; mixing is refused until
+        the pruner tracks per-window expiries (review, non-blocking item)."""
+        long_window = RateLimitRule(scope=SCOPE_DEVICE, limit=1, window_s=3600.0)
+        with pytest.raises(ValueError) as excinfo:
+            RateLimiter((TENANT, long_window))
+        assert "one window length" in str(excinfo.value)
+
+    def test_a_single_window_length_is_accepted(self):
+        limiter = RateLimiter(
+            (TENANT, RateLimitRule(scope=SCOPE_DEVICE, limit=1, window_s=60.0))
+        )
+        assert limiter.tracked_keys() == 0
+
 
 class TestWindowCounting:
     def test_limit_allows_exactly_limit_requests(self):

@@ -105,6 +105,16 @@ class RateLimiter:
     ) -> None:
         if max_keys <= 0:
             raise ValueError("max_keys must be positive")
+        # Pruning reclaims keys by age against ONE horizon; with mixed window
+        # lengths an expired short window could survive next to a long one and
+        # turn a full table into a spurious 503. Mixing is therefore refused
+        # until the pruner tracks per-window expiries.
+        windows = {rule.window_s for rule in rules}
+        if len(windows) > 1:
+            raise ValueError(
+                "all rate-limit rules must share one window length "
+                f"(got {sorted(windows)})"
+            )
         self._rules = rules
         self._clock = clock
         self._audit = audit

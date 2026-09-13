@@ -709,6 +709,7 @@ async def _stream_with_lease(
         ErrorCode.AUTH_MISSING_CREDENTIALS,
         ErrorCode.AUTH_INVALID_CREDENTIALS,
         ErrorCode.AUTH_DEVICE_NOT_REGISTERED,
+        ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,
     ),
