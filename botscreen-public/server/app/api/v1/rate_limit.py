@@ -12,16 +12,14 @@ every configured scope is charged even when a narrower scope rejects it: a
 tenant or device budget limits attempts, so a hammered session cannot hide
 behind its own window.
 
-KNOWN GAP (tracked for #66/#40, do NOT claim otherwise): enforcement lives in
-the route functions, which FastAPI only reaches after request-body validation.
-A request rejected with 400 for a malformed body therefore consumes NOTHING —
-"every attempt is charged" is not yet true at the HTTP boundary. Closing it
-needs a pre-route entry guard (ASGI middleware that resolves the credential,
-charges tenant/device — and the session named by the path — and only then hands
-the request to the route); that slice also has to solve replaying the request
-body for the routes whose session id arrives in the JSON payload. Until it
-lands, rate-limit acceptance for #66 and the full real-entry acceptance for #40
-stay open.
+Enforcement happens in the PRE-ROUTE entry guard (``app.api.v1.entry_guard``),
+in two phases:
+1. right after authentication — the tenant and device windows are charged, so a
+   request that later fails body validation has already been paid for;
+2. after the body has been read (bounded) — ONLY the session window is charged,
+   because the session may only become identifiable once the payload is parsed
+   (``{"session_id": …}``) or the path names one. Phase 2 never re-charges the
+   tenant/device windows, so one request costs exactly one unit per scope.
 
 Keys are structured tuples ``(scope, tenant_id, device_id, session_id)`` — never
 delimiter-joined strings — so two different identities can never collide, and a
@@ -40,7 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 
 from app.contracts.audit import AuditRecord
@@ -129,10 +127,22 @@ class RateLimiter:
         *,
         session_id: str | None = None,
         request_id: str = "",
+        scopes: Collection[str] | None = None,
     ) -> None:
-        """Charge every configured scope; raise on the first exhausted window."""
+        """Charge the configured scopes; raise on the first exhausted window.
+
+        ``scopes`` narrows the charge to specific scopes — the entry guard uses
+        it for its two phases (tenant/device after authentication, session once
+        the session id is known) so a single request is never charged twice for
+        the same scope.
+        """
+        selected = (
+            self._rules
+            if scopes is None
+            else tuple(rule for rule in self._rules if rule.scope in scopes)
+        )
         now = self._clock()
-        for rule in self._rules:
+        for rule in selected:
             key = self._key_for(rule.scope, principal, session_id)
             if key is None:
                 continue

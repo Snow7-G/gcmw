@@ -37,11 +37,12 @@ from app.agents.registry import RegistryError
 from app.api.v1.agent_api import AppError, RunAdmissionService
 from app.api.v1.agent_api import router as agent_router
 from app.api.v1.auth import CredentialStore
-from app.api.v1.errors import request_ids
+from app.api.v1.entry_guard import EntryGuardMiddleware
+from app.api.v1.errors import envelope_response, request_ids
 from app.api.v1.rate_limit import RateLimiter, rules_from_settings
 from app.api.v1.stream_leases import DEFAULT_RECONNECT_GRACE_S, RunLeaseRegistry
 from app.config import Settings
-from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
+from app.contracts.errors import ErrorCode
 from app.providers.model_gateway import ModelGatewayError
 from app.runtime import build_run_repository, readiness_report
 
@@ -62,22 +63,7 @@ def _envelope_response(
     status_override: int | None = None,
     retry_after_ms: int | None = None,
 ) -> JSONResponse:
-    request_id, trace_id = request_ids(request)
-    envelope = ErrorEnvelope.build(
-        code=code,
-        request_id=request_id,
-        trace_id=trace_id,
-        retry_after_ms=retry_after_ms,
-    )
-    headers = {"X-Request-ID": request_id, "X-Trace-ID": trace_id}
-    if retry_after_ms is not None:
-        # standard hint for intermediaries/clients, rounded up to whole seconds
-        headers["Retry-After"] = str(max(1, -(-retry_after_ms // 1000)))
-    return JSONResponse(
-        status_code=status_override or http_status_for(code),
-        content=envelope.model_dump(mode="json"),
-        headers=headers,
-    )
+    return envelope_response(request, code, status_override, retry_after_ms)
 
 
 def _declare_bearer_auth(schema: dict) -> None:
@@ -234,6 +220,16 @@ def create_app(
         return _envelope_response(request, ErrorCode.INTERNAL_UNKNOWN)
 
     app.include_router(agent_router)
+
+    # OUTERMOST middleware (added last on purpose): credentials and rate limits
+    # are decided before routing, so an invalid body cannot buy a free attempt,
+    # and the request body is replayed for the routes after being buffered here.
+    app.add_middleware(
+        EntryGuardMiddleware,
+        public_paths=PUBLIC_PATHS,
+        max_body_bytes=settings.max_request_body_bytes,
+        body_timeout_s=settings.request_body_timeout_s,
+    )
 
     # -- published contract ----------------------------------------------------
 

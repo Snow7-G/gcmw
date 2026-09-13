@@ -254,7 +254,16 @@ def require_owner(
 
 
 async def get_device_principal(request: Request) -> DevicePrincipal:
-    """Authenticate the caller, or deny (default deny, no anonymous path)."""
+    """Authenticate the caller, or deny (default deny, no anonymous path).
+
+    The entry guard resolves the credential BEFORE routing and leaves the
+    principal on the request state, so the served path verifies once per
+    request. The fallback below keeps direct route invocation (unit tests,
+    in-process callers) working against the same authority.
+    """
+    decided = getattr(request.state, "principal", None)
+    if decided is not None:
+        return decided
     credential = presented_credential(request)
     if credential is None:
         raise AppError(ErrorCode.AUTH_MISSING_CREDENTIALS)

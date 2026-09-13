@@ -14,7 +14,7 @@ import json
 
 import pytest
 from api_harness import (
-    OTHER_DEVICE,
+    OTHER_DEVICE_TOKEN,
     PRINCIPAL,
     FakeClock,
     ForcedStateRepository,
@@ -27,7 +27,6 @@ from api_harness import (
 from sse_frames import event_ids, event_names, protocol_frames
 
 from app.api.v1.agent_api import RunAdmissionService
-from app.api.v1.auth import get_device_principal
 from app.api.v1.errors import AppError
 from app.contracts.api import Channel, CreateRunRequest, CreateSessionRequest, RunInput
 from app.contracts.errors import ErrorCode
@@ -74,7 +73,7 @@ class TestHealth:
 
 class TestAuthBoundary:
     def test_default_deny_without_principal(self):
-        with running_app(overrides=False) as h:
+        with running_app(default_credential=None) as h:
             res = h.client.post("/api/v1/sessions", json={"channel": "text"})
         assert res.status_code == 401
         assert ErrorCode.AUTH_MISSING_CREDENTIALS.value == "E_AUTH_MISSING_CREDENTIALS"
@@ -104,11 +103,8 @@ class TestSessions:
 
     def test_delete_foreign_session_forbidden(self, harness):
         session = new_session(harness)
-        harness.app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
-        try:
+        with harness.as_token(OTHER_DEVICE_TOKEN):
             res = harness.client.delete(f"/api/v1/sessions/{session['session_id']}")
-        finally:
-            harness.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
         assert res.status_code == 403
         assert harness.env(res).code == "E_AUTHZ_FORBIDDEN"
 
@@ -251,11 +247,11 @@ class TestRuns:
         assert harness.env(res).code == "E_CONFLICT_IDEMPOTENCY"
 
     def test_ownership_enforced(self, harness):
+        """Another device with a VALID credential still cannot touch the run."""
         session = new_session(harness)
         run = new_run(harness, session["session_id"])
-        harness.app.dependency_overrides[get_device_principal] = lambda: OTHER_DEVICE
-        try:
-            run_id = run["run_id"]
+        run_id = run["run_id"]
+        with harness.as_token(OTHER_DEVICE_TOKEN):
             assert harness.client.get(f"/api/v1/agent/runs/{run_id}").status_code == 403
             assert (
                 harness.client.get(f"/api/v1/agent/runs/{run_id}/events").status_code
@@ -264,8 +260,6 @@ class TestRuns:
             assert (
                 harness.client.delete(f"/api/v1/agent/runs/{run_id}").status_code == 403
             )
-        finally:
-            harness.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
 
     def test_cancel_terminal_once_and_events_no_gap(self, harness):
         session = new_session(harness)

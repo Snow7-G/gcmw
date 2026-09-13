@@ -41,6 +41,7 @@ class ErrorCategory(str, Enum):
 class ErrorCode(str, Enum):
     # validation
     VALIDATION_INVALID_INPUT = "E_VALIDATION_INVALID_INPUT"
+    VALIDATION_PAYLOAD_TOO_LARGE = "E_VALIDATION_PAYLOAD_TOO_LARGE"
     VALIDATION_UNSUPPORTED_MODALITY = "E_VALIDATION_UNSUPPORTED_MODALITY"
     VALIDATION_UNSUPPORTED_FORMAT = "E_VALIDATION_UNSUPPORTED_FORMAT"
     # authentication / authorization
@@ -58,6 +59,7 @@ class ErrorCode(str, Enum):
     NOT_FOUND_KNOWLEDGE = "E_NOT_FOUND_KNOWLEDGE"
     NOT_FOUND_AGENT = "E_NOT_FOUND_AGENT"
     # timeouts / availability
+    UNAVAILABLE_CLIENT_TIMEOUT = "E_UNAVAILABLE_CLIENT_TIMEOUT"
     TIMEOUT_AGENT = "E_TIMEOUT_AGENT"
     TIMEOUT_PROVIDER = "E_TIMEOUT_PROVIDER"
     UNAVAILABLE_OVERLOADED = "E_UNAVAILABLE_OVERLOADED"
@@ -138,6 +140,14 @@ _register(
     False,
     True,
     "不支持的输入类型",
+)
+_register(
+    ErrorCode.VALIDATION_PAYLOAD_TOO_LARGE,
+    ErrorCategory.VALIDATION,
+    413,
+    False,
+    True,
+    "请求体过大",
 )
 _register(
     ErrorCode.VALIDATION_UNSUPPORTED_FORMAT,
@@ -234,6 +244,14 @@ _register(
     False,
     True,
     "Agent 不存在或已停用",
+)
+_register(
+    ErrorCode.UNAVAILABLE_CLIENT_TIMEOUT,
+    ErrorCategory.TIMEOUT,
+    408,
+    True,
+    False,
+    "请求体传输超时",
 )
 _register(
     ErrorCode.TIMEOUT_AGENT, ErrorCategory.TIMEOUT, 504, True, True, "处理超时，请重试"

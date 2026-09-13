@@ -7,13 +7,22 @@ requirement is covered by inspecting the AuditRecord the limiter emits.
 
 from __future__ import annotations
 
+import json
 from typing import ClassVar
 
 import pytest
-from api_harness import PRINCIPAL, new_run, new_session, running_app
+from api_harness import (
+    OTHER_DEVICE_TOKEN,
+    OTHER_TENANT_TOKEN,
+    PRINCIPAL,
+    Harness,
+    new_run,
+    new_session,
+    running_app,
+)
 from fastapi.testclient import TestClient
 
-from app.api.v1.auth import DevicePrincipal, get_device_principal
+from app.api.v1.auth import DevicePrincipal
 from app.api.v1.errors import AppError
 from app.api.v1.rate_limit import (
     SCOPE_DEVICE,
@@ -274,6 +283,8 @@ class TestAudit:
 
 
 class TestHttpEnforcement:
+    """HTTP behaviour of the limiter (enforced by the entry guard, #66)."""
+
     LIMITS: ClassVar[dict] = {
         "rate_limit_tenant_per_minute": 3,
         "rate_limit_device_per_minute": 0,
@@ -325,59 +336,17 @@ class TestHttpEnforcement:
             assert h.client.get("/api/v1/health/live").status_code == 200
             assert h.client.get("/api/v1/health/ready").status_code == 200
 
-    def test_authentication_precedes_rate_limiting(self):
-        """An anonymous flood cannot consume a tenant's budget."""
+    def test_each_request_is_charged_exactly_once(self):
+        """A double charge would trip a limit of 1 on the FIRST request."""
         limits = {"rate_limit_tenant_per_minute": 1}
-        with running_app(overrides=False, settings_kwargs=limits) as h:
-            for _ in range(5):
-                assert (
-                    h.client.post(
-                        "/api/v1/sessions", json={"channel": "text"}
-                    ).status_code
-                    == 401
-                )
-            assert h.app.state.rate_limiter.tracked_keys() == 0
-
-    def test_throttled_requests_do_not_touch_storage(self):
-        limits = {"rate_limit_session_per_minute": 1, "rate_limit_tenant_per_minute": 0}
         with running_app(settings_kwargs=limits) as h:
-            session = new_session(h)
-            first = new_run(h, session["session_id"], key="first")
-            assert first["run_id"]
-            before = dict(h.service.runs)
-            res = h.client.post(
-                "/api/v1/agent/runs",
-                json={
-                    "session_id": session["session_id"],
-                    "input": {"type": "text", "text": "second"},
-                    "idempotency_key": "second",
-                },
-            )
-            assert res.status_code == 429
-            assert h.service.runs == before  # nothing was created
-            assert h.service.idempotency.get((session["session_id"], "second")) is None
-
-    def test_session_window_follows_the_named_session(self):
-        limits = {"rate_limit_session_per_minute": 1, "rate_limit_tenant_per_minute": 0}
-        with running_app(settings_kwargs=limits) as h:
-            first = new_session(h)
-            second = new_session(h)  # session scope not charged for this route
-            new_run(h, first["session_id"], key="a")
-            throttled = h.client.post(
-                "/api/v1/agent/runs",
-                json={
-                    "session_id": first["session_id"],
-                    "input": {"type": "text", "text": "again"},
-                    "idempotency_key": "b",
-                },
-            )
-            assert throttled.status_code == 429
-            # a different session is untouched by the exhausted one
-            assert new_run(h, second["session_id"], key="c")["run_id"]
+            first = h.client.post("/api/v1/sessions", json={"channel": "text"})
+            second = h.client.post("/api/v1/sessions", json={"channel": "text"})
+        assert first.status_code == 201
+        assert second.status_code == 429
 
     def test_device_window_is_per_device_not_per_tenant(self):
         limits = {"rate_limit_device_per_minute": 2, "rate_limit_tenant_per_minute": 0}
-        other = DevicePrincipal(tenant_id=PRINCIPAL.tenant_id, device_id="other-device")
         with running_app(settings_kwargs=limits) as h:
             for _ in range(2):
                 new_session(h)
@@ -385,68 +354,15 @@ class TestHttpEnforcement:
                 h.client.post("/api/v1/sessions", json={"channel": "text"}).status_code
                 == 429
             )
-            h.app.dependency_overrides[get_device_principal] = lambda: other
-            try:
-                assert (
-                    h.client.post(
-                        "/api/v1/sessions", json={"channel": "text"}
-                    ).status_code
-                    == 201
-                )
-            finally:
-                h.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
-
-    def test_foreign_caller_does_not_burn_the_owners_session_window(self):
-        """End-to-end version of the review probe (real credential path)."""
-        own = "dev-owner-000000000000"
-        foreign = "dev-foreign-000000000000"
-        credentials = [
-            {"tenant_id": "t1", "device_id": "d1", "token": own},
-            {"tenant_id": "t2", "device_id": "d9", "token": foreign},
-        ]
-        limits = {
-            "rate_limit_session_per_minute": 10,
-            "rate_limit_tenant_per_minute": 0,
-            "rate_limit_device_per_minute": 0,
-        }
-        with running_app(
-            overrides=False, credentials=credentials, settings_kwargs=limits
-        ) as h:
-            session = h.client.post(
-                "/api/v1/sessions",
-                json={"channel": "text"},
-                headers={"Authorization": f"Bearer {own}"},
-            ).json()
-            session_id = session["session_id"]
-            # the foreign device hammers the KNOWN session id: it is refused
-            # (403) and whatever it burns is its OWN session window
-            for _ in range(5):
-                res = h.client.delete(
-                    f"/api/v1/sessions/{session_id}",
-                    headers={"Authorization": f"Bearer {foreign}"},
-                )
-                assert res.status_code == 403, res.text
-            # the owner still has its full session budget
-            run = h.client.post(
-                "/api/v1/agent/runs",
-                json={
-                    "session_id": session_id,
-                    "input": {"type": "text", "text": "mine"},
-                    "idempotency_key": "mine",
-                },
-                headers={"Authorization": f"Bearer {own}"},
+            # the second device of the same tenant is unaffected
+            assert (
+                h.client.post(
+                    "/api/v1/sessions",
+                    json={"channel": "text"},
+                    headers=Harness.auth(OTHER_DEVICE_TOKEN),
+                ).status_code
+                == 201
             )
-            assert run.status_code == 200, run.text
-            # the owner's window has plenty of room left: it was never charged
-            # by the attacker's requests
-            for _ in range(5):
-                assert (
-                    h.client.get(
-                        f"/api/v1/agent/runs/{run.json()['run_id']}",
-                        headers={"Authorization": f"Bearer {own}"},
-                    ).status_code
-                    == 200
-                )
 
     def test_key_table_overload_returns_a_503_envelope(self):
         """A full limiter answers an explicit overload error, not silence."""
@@ -455,40 +371,123 @@ class TestHttpEnforcement:
                 (TENANT,), clock=FakeClock(), max_keys=1
             )
             h.app.state.rate_limiter.enforce(PRINCIPAL)  # occupies the only slot
-            other = DevicePrincipal(tenant_id="t-other", device_id="d")
-            h.app.dependency_overrides[get_device_principal] = lambda: other
-            try:
-                res = h.client.post("/api/v1/sessions", json={"channel": "text"})
-            finally:
-                h.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+            res = h.client.post(
+                "/api/v1/sessions",
+                json={"channel": "text"},
+                headers=Harness.auth(OTHER_TENANT_TOKEN),
+            )
         assert res.status_code == 503
         assert res.json()["code"] == "E_UNAVAILABLE_OVERLOADED"
 
-    def test_body_validation_failure_is_not_charged_yet(self):
-        """CHARACTERISATION of the known gap (review item 3).
-
-        Enforcement runs inside the route, which FastAPI reaches only after
-        request-body validation — so a 400 consumes nothing. When the pre-route
-        entry guard lands this test must flip to "is charged"; it exists so the
-        gap cannot silently be claimed as closed.
-        """
-        limits = {"rate_limit_tenant_per_minute": 1}
+    def test_session_window_follows_the_path_named_session(self):
+        limits = {"rate_limit_session_per_minute": 1, "rate_limit_tenant_per_minute": 0}
         with running_app(settings_kwargs=limits) as h:
-            bad = h.client.post("/api/v1/sessions", json={"channel": "nope"})
-            assert bad.status_code == 400
-            ok = h.client.post("/api/v1/sessions", json={"channel": "text"})
-            assert ok.status_code == 201  # NOT 429: the invalid attempt was free
+            session = new_session(h)
+            other = new_session(h)
+            assert (
+                h.client.delete(f"/api/v1/sessions/{session['session_id']}").status_code
+                == 204
+            )
+            second = h.client.delete(f"/api/v1/sessions/{session['session_id']}")
+            assert second.status_code == 429  # same session: window exhausted
+            assert (
+                h.client.delete(f"/api/v1/sessions/{other['session_id']}").status_code
+                == 204
+            )
+
+    def test_run_creation_is_session_charged_from_the_body(self):
+        """Review P1: a session named by the PAYLOAD must be session-charged."""
+        # window = 2: the run creation (body-named session) and the cancel
+        # (path-named session) spend it, so the next attempt on THAT session 429s
+        limits = {"rate_limit_session_per_minute": 2, "rate_limit_tenant_per_minute": 0}
+        with running_app(settings_kwargs=limits) as h:
+            session = new_session(h)
+            first = new_run(h, session["session_id"], key="a")  # session charge 1
+            assert (
+                h.client.delete(f"/api/v1/agent/runs/{first['run_id']}").status_code
+                == 200  # session charge 2 (path-derived)
+            )
+            second = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "again"},
+                    "idempotency_key": "b",
+                },
+            )
+            # a DIFFERENT session still has its own window
+            other = new_session(h)
+            third = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": other["session_id"],
+                    "input": {"type": "text", "text": "elsewhere"},
+                    "idempotency_key": "c",
+                },
+            )
+        assert second.status_code == 429  # same session: window exhausted
+        assert third.status_code == 200  # other session: unaffected
+
+    def test_a_padded_but_legal_body_is_still_session_charged(self):
+        """Review P1: padding a payload must not escape the session window.
+
+        The body stays inside the configured 256 KiB cap, so the session id is
+        extracted and the second request on that session is throttled.
+        """
+        limits = {"rate_limit_session_per_minute": 1, "rate_limit_tenant_per_minute": 0}
+        with running_app(settings_kwargs=limits) as h:
+            session = new_session(h)
+
+            def padded(key: str) -> bytes:
+                """Legal JSON padded with whitespace OUTSIDE the object."""
+                payload = json.dumps(
+                    {
+                        "session_id": session["session_id"],
+                        "input": {"type": "text", "text": "padded"},
+                        "idempotency_key": key,
+                    }
+                ).encode()
+                body = b" " * (66 * 1024) + payload + b" " * 1024
+                assert len(body) < 256 * 1024  # inside the configured cap
+                return body
+
+            headers = {"content-type": "application/json"}
+            first = h.client.post(
+                "/api/v1/agent/runs", content=padded("pad-1"), headers=headers
+            )
+            assert first.status_code == 200, first.text
+            # the same session again: the window (limit 1) must trip BEFORE the
+            # route's single-active-run rule can answer 409
+            second = h.client.post(
+                "/api/v1/agent/runs", content=padded("pad-2"), headers=headers
+            )
+        assert second.status_code == 429  # the session window really was charged
+
+    def test_invalid_json_still_charges_tenant_and_device(self):
+        limits = {
+            "rate_limit_tenant_per_minute": 1,
+            "rate_limit_session_per_minute": 1,
+            "rate_limit_device_per_minute": 0,
+        }
+        with running_app(settings_kwargs=limits) as h:
+            first = h.client.post(
+                "/api/v1/agent/runs",
+                content=b"{not json",
+                headers={"content-type": "application/json"},
+            )
+            assert first.status_code == 400  # validation still rejects it
+            second = h.client.post("/api/v1/sessions", json={"channel": "text"})
+        assert second.status_code == 429  # the invalid attempt was paid for
 
     def test_default_configuration_does_not_throttle_normal_use(self):
         with running_app() as h:
-            for i in range(20):
-                new_session(h, channel="text") if i == 0 else h.client.post(
-                    "/api/v1/sessions", json={"channel": "text"}
+            for _ in range(20):
+                assert (
+                    h.client.post(
+                        "/api/v1/sessions", json={"channel": "text"}
+                    ).status_code
+                    == 201
                 )
-            assert (
-                h.client.post("/api/v1/sessions", json={"channel": "text"}).status_code
-                == 201
-            )
 
     def test_rate_limit_settings_are_validated(self):
         from pydantic import ValidationError

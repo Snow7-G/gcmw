@@ -14,12 +14,13 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from app.api.v1.auth import DevicePrincipal, get_device_principal
+from app.api.v1.auth import DevicePrincipal
 from app.config import Settings
 from app.contracts.errors import ErrorEnvelope
 from app.main import create_app
@@ -32,6 +33,41 @@ from app.storage.run_repository import (
 PRINCIPAL = DevicePrincipal(tenant_id="t1", device_id="d1")
 OTHER_DEVICE = DevicePrincipal(tenant_id="t1", device_id="OTHER")
 OTHER_TENANT = DevicePrincipal(tenant_id="t2", device_id="d1")
+
+#: deterministic low-entropy test credentials (never real secrets)
+PRIMARY_TOKEN = "dev-primary-000000000"
+OTHER_DEVICE_TOKEN = "dev-other-device-00000000"
+OTHER_TENANT_TOKEN = "dev-other-tenant-00000000"
+
+_HARNESS_PRINCIPALS = {
+    PRIMARY_TOKEN: PRINCIPAL,
+    OTHER_DEVICE_TOKEN: OTHER_DEVICE,
+    OTHER_TENANT_TOKEN: OTHER_TENANT,
+}
+
+
+class HarnessCredentialStore:
+    """Test double for the credential store: token -> fixed principal.
+
+    The entry guard authenticates BEFORE routing, so tests authenticate the way
+    production does — with an ``Authorization: Bearer`` header — instead of
+    overriding a dependency that the guard has already satisfied.
+    """
+
+    def resolve(self, presented: str):
+        principal = _HARNESS_PRINCIPALS.get(presented)
+        if principal is None:
+            return None
+        return SimpleNamespace(
+            tenant_id=principal.tenant_id, device_id=principal.device_id
+        )
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    def __len__(self) -> int:
+        return len(_HARNESS_PRINCIPALS)
 
 
 class FakeClock:
@@ -61,22 +97,47 @@ class Harness:
     def env(self, response) -> ErrorEnvelope:
         return ErrorEnvelope.model_validate(response.json())
 
+    @staticmethod
+    def auth(token: str) -> dict[str, str]:
+        """Header for one of the harness identities."""
+        return {"Authorization": f"Bearer {token}"}
+
+    @contextmanager
+    def as_token(self, token: str) -> Iterator[None]:
+        """Act as another harness identity for the duration of the block.
+
+        The client's default Authorization header is swapped (a per-request
+        header does not reliably override it in this TestClient), so the entry
+        guard really authenticates that credential.
+        """
+        headers = self.client.headers
+        previous = headers.get("Authorization")
+        headers["Authorization"] = f"Bearer {token}"
+        try:
+            yield
+        finally:
+            if previous is None:
+                headers.pop("Authorization", None)
+            else:
+                headers["Authorization"] = previous
+
 
 @contextmanager
 def running_app(
     repository: Any | None = None,
     environment: str = "test",
     *,
-    overrides: bool = True,
     credentials: list[dict] | None = None,
     settings_kwargs: dict | None = None,
+    default_credential: str | None = PRIMARY_TOKEN,
 ) -> Iterator[Harness]:
     """Run the application under test.
 
-    ``overrides=False`` exercises the REAL auth boundary; ``credentials`` seeds
-    the credential store the way an operator would (through the environment
-    variable named by ``Settings.auth_credentials_env``), so the authentication
-    tests never bypass the production path.
+    Authentication is NEVER bypassed: the entry guard resolves the credential
+    before routing, so the client carries a real ``Authorization`` header (the
+    harness identities by default, ``default_credential=None`` for anonymous
+    tests) and ``credentials`` seeds the store from the environment exactly as
+    an operator would.
     """
     repository = repository if repository is not None else MemoryRunRepository()
     settings = Settings(environment=environment, **(settings_kwargs or {}))
@@ -89,13 +150,20 @@ def running_app(
             settings=settings,
             repository_factory=lambda _settings: repository,
         )
-        if overrides:
-            app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
         clock = FakeClock()
-        with TestClient(app, raise_server_exceptions=False) as client:
+        headers = (
+            {"Authorization": f"Bearer {default_credential}"}
+            if default_credential
+            else None
+        )
+        with TestClient(app, raise_server_exceptions=False, headers=headers) as client:
             # install the clock once the lifespan has built the service
             if app.state.agent_service is not None:
                 app.state.agent_service._clock = clock
+            if credentials is None:
+                # the guard authenticates before routing: give it the harness
+                # identities unless the test brought its own credential store
+                app.state.credentials = HarnessCredentialStore()
             yield Harness(client=client, app=app, clock=clock, repository=repository)
         app.dependency_overrides.clear()
     finally:

@@ -117,7 +117,6 @@ async def _open_stream(
         last_event_id=None,
         service=harness.service,
         leases=harness.app.state.stream_leases,
-        limiter=harness.app.state.rate_limiter,
     )
 
 
@@ -146,7 +145,7 @@ class TestStreamAuthBoundary:
     """Nothing streams for an unauthenticated, foreign or unknown run."""
 
     def test_anonymous_is_rejected_with_json_envelope(self):
-        with running_app(overrides=False) as h:
+        with running_app(default_credential=None) as h:
             res = h.client.get(_events_url("whatever"))
         assert res.status_code == 401
         assert res.json()["code"] == "E_AUTH_MISSING_CREDENTIALS"
@@ -328,7 +327,6 @@ class TestOpenStreams:
             "last_event_id",
             "service",
             "leases",
-            "limiter",
         }
         assert agent_api.SSE_HEARTBEAT_S == 15.0
 

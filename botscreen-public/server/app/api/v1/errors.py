@@ -6,6 +6,7 @@ import re
 import uuid
 
 from fastapi import Request
+from fastapi.responses import JSONResponse
 
 from app.contracts.errors import ErrorCode, ErrorEnvelope, http_status_for
 
@@ -67,3 +68,33 @@ def error_responses(*codes: ErrorCode) -> dict[int, dict]:
         }
         for status, values in sorted(grouped.items())
     }
+
+
+def envelope_response(
+    request: Request,
+    code: ErrorCode,
+    status_override: int | None = None,
+    retry_after_ms: int | None = None,
+) -> JSONResponse:
+    """The ONE error response shape of this API.
+
+    Used by the exception handlers, the entry guard (which answers before any
+    route runs) and anything else that must fail with a stable code — the
+    message always comes from the error registry, never from the caller.
+    """
+    request_id, trace_id = request_ids(request)
+    envelope = ErrorEnvelope.build(
+        code=code,
+        request_id=request_id,
+        trace_id=trace_id,
+        retry_after_ms=retry_after_ms,
+    )
+    headers = {"X-Request-ID": request_id, "X-Trace-ID": trace_id}
+    if retry_after_ms is not None:
+        # standard hint for intermediaries/clients, rounded up to whole seconds
+        headers["Retry-After"] = str(max(1, -(-retry_after_ms // 1000)))
+    return JSONResponse(
+        status_code=status_override or http_status_for(code),
+        content=envelope.model_dump(mode="json"),
+        headers=headers,
+    )
