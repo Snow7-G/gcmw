@@ -125,9 +125,9 @@ class TestWindowCounting:
         limiter.enforce(PRINCIPAL, session_id="s2")  # separate window
         limiter.enforce(PRINCIPAL)  # names no session: never session-charged
 
-    def test_every_attempt_is_charged_including_rejected_ones(self):
-        """A tenant/device budget counts ATTEMPTS, so a hammered session cannot
-        hide behind its own narrower window."""
+    def test_narrower_scope_rejection_still_charges_the_outer_windows(self):
+        """Within one request, a tenant/device budget counts attempts, so a
+        hammered session cannot hide behind its own narrower window."""
         limiter, _clock, _audit = _limiter((TENANT, SESSION))
         limiter.enforce(PRINCIPAL, session_id="s1")  # tenant 1/2, session 1/1
         with pytest.raises(AppError):
@@ -157,6 +157,79 @@ class TestWindowCounting:
             limiter.enforce(DevicePrincipal(tenant_id=f"t{i}", device_id="d"))
             clock.advance(61.0)  # each window is expired by the next call
         assert limiter.tracked_keys() <= 10
+
+
+class TestKeyScoping:
+    """Review P1: keys must carry the AUTHENTICATED identity, not a bare id."""
+
+    def test_a_foreign_device_cannot_exhaust_another_devices_session_window(self):
+        rule = RateLimitRule(scope=SCOPE_SESSION, limit=2, window_s=60.0)
+        limiter, _clock, _audit = _limiter((rule,))
+        owner = DevicePrincipal(tenant_id="t1", device_id="d1")
+        foreign_same_tenant = DevicePrincipal(tenant_id="t1", device_id="d2")
+        foreign_tenant = DevicePrincipal(tenant_id="t2", device_id="d9")
+
+        limiter.enforce(owner, session_id="shared-session")  # owner 1/2
+        # both foreign callers name the SAME session id: they only charge themselves
+        limiter.enforce(foreign_same_tenant, session_id="shared-session")  # 1/2
+        limiter.enforce(foreign_tenant, session_id="shared-session")  # 1/2
+        limiter.enforce(foreign_tenant, session_id="shared-session")  # 2/2
+
+        limiter.enforce(owner, session_id="shared-session")  # owner 2/2, no trip
+        with pytest.raises(AppError):  # only the owner's OWN window trips
+            limiter.enforce(owner, session_id="shared-session")
+
+    def test_identifiers_containing_separators_do_not_collide(self):
+        """Joined strings could collide; structured tuples cannot."""
+        limiter, _clock, _audit = _limiter((DEVICE,))
+        a = DevicePrincipal(tenant_id="t\x1f1", device_id="d")
+        b = DevicePrincipal(tenant_id="t", device_id="1\x1fd")
+        for _ in range(3):  # DEVICE limit is 3
+            limiter.enforce(a)
+        with pytest.raises(AppError):
+            limiter.enforce(a)
+        limiter.enforce(b)  # a different identity, never the same window
+
+    def test_session_key_carries_scope_tenant_and_device(self):
+        limiter, _clock, _audit = _limiter((SESSION,))
+        limiter.enforce(PRINCIPAL, session_id="s")
+        assert limiter.tracked_keys() == 1
+        # inspecting the table shape: (scope, tenant, device, session) as fields
+        (entry_key,) = limiter._windows
+        assert entry_key == (SCOPE_SESSION, "t1", "d1", "s")
+
+
+class TestHardKeyCap:
+    """Review P1: ``max_keys`` is a HARD cap (a probe saw 3 keys for max_keys=2)."""
+
+    def test_new_keys_are_refused_once_the_table_is_full(self):
+        limiter, _clock, audit = _limiter(max_keys=2)
+        limiter.enforce(DevicePrincipal(tenant_id="t1", device_id="d"))
+        limiter.enforce(DevicePrincipal(tenant_id="t2", device_id="d"))
+        assert limiter.tracked_keys() == 2
+        with pytest.raises(AppError) as excinfo:
+            limiter.enforce(DevicePrincipal(tenant_id="t3", device_id="d"))
+        assert excinfo.value.code is ErrorCode.UNAVAILABLE_OVERLOADED
+        assert limiter.tracked_keys() == 2  # never grows past the cap
+        assert len(audit) == 1
+        assert audit[0].result == "overloaded"
+        assert audit[0].error_code is ErrorCode.UNAVAILABLE_OVERLOADED
+
+    def test_existing_keys_are_still_charged_when_the_table_is_full(self):
+        limiter, _clock, _audit = _limiter(max_keys=1)
+        limiter.enforce(DevicePrincipal(tenant_id="t1", device_id="d"))  # 1/2
+        limiter.enforce(DevicePrincipal(tenant_id="t1", device_id="d"))  # 2/2
+        with pytest.raises(AppError) as excinfo:
+            limiter.enforce(DevicePrincipal(tenant_id="t1", device_id="d"))
+        assert excinfo.value.code is ErrorCode.RATE_LIMIT_EXCEEDED  # not overload
+
+    def test_expired_windows_are_reclaimed_before_refusing(self):
+        limiter, clock, _audit = _limiter(max_keys=1)
+        limiter.enforce(DevicePrincipal(tenant_id="t1", device_id="d"))
+        clock.advance(61.0)
+        # the old window is expired: the new key is admitted, table stays at 1
+        limiter.enforce(DevicePrincipal(tenant_id="t2", device_id="d"))
+        assert limiter.tracked_keys() == 1
 
 
 class TestAudit:
@@ -308,6 +381,89 @@ class TestHttpEnforcement:
                 )
             finally:
                 h.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+
+    def test_foreign_caller_does_not_burn_the_owners_session_window(self):
+        """End-to-end version of the review probe (real credential path)."""
+        own = "dev-owner-000000000000"
+        foreign = "dev-foreign-000000000000"
+        credentials = [
+            {"tenant_id": "t1", "device_id": "d1", "token": own},
+            {"tenant_id": "t2", "device_id": "d9", "token": foreign},
+        ]
+        limits = {
+            "rate_limit_session_per_minute": 10,
+            "rate_limit_tenant_per_minute": 0,
+            "rate_limit_device_per_minute": 0,
+        }
+        with running_app(
+            overrides=False, credentials=credentials, settings_kwargs=limits
+        ) as h:
+            session = h.client.post(
+                "/api/v1/sessions",
+                json={"channel": "text"},
+                headers={"Authorization": f"Bearer {own}"},
+            ).json()
+            session_id = session["session_id"]
+            # the foreign device hammers the KNOWN session id: it is refused
+            # (403) and whatever it burns is its OWN session window
+            for _ in range(5):
+                res = h.client.delete(
+                    f"/api/v1/sessions/{session_id}",
+                    headers={"Authorization": f"Bearer {foreign}"},
+                )
+                assert res.status_code == 403, res.text
+            # the owner still has its full session budget
+            run = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session_id,
+                    "input": {"type": "text", "text": "mine"},
+                    "idempotency_key": "mine",
+                },
+                headers={"Authorization": f"Bearer {own}"},
+            )
+            assert run.status_code == 200, run.text
+            # the owner's window has plenty of room left: it was never charged
+            # by the attacker's requests
+            for _ in range(5):
+                assert (
+                    h.client.get(
+                        f"/api/v1/agent/runs/{run.json()['run_id']}",
+                        headers={"Authorization": f"Bearer {own}"},
+                    ).status_code
+                    == 200
+                )
+
+    def test_key_table_overload_returns_a_503_envelope(self):
+        """A full limiter answers an explicit overload error, not silence."""
+        with running_app() as h:
+            h.app.state.rate_limiter = RateLimiter(
+                (TENANT,), clock=FakeClock(), max_keys=1
+            )
+            h.app.state.rate_limiter.enforce(PRINCIPAL)  # occupies the only slot
+            other = DevicePrincipal(tenant_id="t-other", device_id="d")
+            h.app.dependency_overrides[get_device_principal] = lambda: other
+            try:
+                res = h.client.post("/api/v1/sessions", json={"channel": "text"})
+            finally:
+                h.app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
+        assert res.status_code == 503
+        assert res.json()["code"] == "E_UNAVAILABLE_OVERLOADED"
+
+    def test_body_validation_failure_is_not_charged_yet(self):
+        """CHARACTERISATION of the known gap (review item 3).
+
+        Enforcement runs inside the route, which FastAPI reaches only after
+        request-body validation — so a 400 consumes nothing. When the pre-route
+        entry guard lands this test must flip to "is charged"; it exists so the
+        gap cannot silently be claimed as closed.
+        """
+        limits = {"rate_limit_tenant_per_minute": 1}
+        with running_app(settings_kwargs=limits) as h:
+            bad = h.client.post("/api/v1/sessions", json={"channel": "nope"})
+            assert bad.status_code == 400
+            ok = h.client.post("/api/v1/sessions", json={"channel": "text"})
+            assert ok.status_code == 201  # NOT 429: the invalid attempt was free
 
     def test_default_configuration_does_not_throttle_normal_use(self):
         with running_app() as h:
