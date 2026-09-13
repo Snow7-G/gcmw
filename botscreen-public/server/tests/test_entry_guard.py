@@ -12,17 +12,41 @@ refused with 413 instead of being read into memory.
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 from api_harness import (
     OTHER_DEVICE_TOKEN,
+    OTHER_TENANT_TOKEN,
     PRIMARY_TOKEN,
+    PRINCIPAL,
     new_run,
     new_session,
     running_app,
 )
 
+from app.api.v1.rate_limit import (
+    SCOPE_TENANT,
+    RateLimiter,
+    RateLimitRule,
+    rules_from_settings,
+)
+from app.config import Settings
 from app.contracts.errors import ErrorCode
 from app.main import PUBLIC_PATHS
+
+TENANT_RULE = RateLimitRule(scope=SCOPE_TENANT, limit=1, window_s=60.0)
+
+
+class MonotonicClock:
+    """Float clock for the limiter (the session clock returns datetimes)."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def __call__(self) -> float:
+        return self.now
+
 
 SESSION_ONLY = {
     "rate_limit_session_per_minute": 1,
@@ -195,6 +219,75 @@ class TestBodyHandling:
         with running_app() as h:
             assert h.client.get("/api/v1/health/live").status_code == 200
             assert h.client.get("/api/v1/agent/runs/ghost").status_code == 404
+
+
+class TestAuditCorrelatesWithTheResponse:
+    """Review P1: the rate-limit audit record must carry the response's ids."""
+
+    LIMITS: ClassVar[dict] = {"rate_limit_tenant_per_minute": 1}
+
+    def _recording_limiter(self, h):
+        records: list = []
+
+        async def noop(_run_id: str) -> None:  # pragma: no cover - unused
+            return None
+
+        limiter = RateLimiter(
+            rules_from_settings(Settings(environment="test", **self.LIMITS)),
+            clock=MonotonicClock(),
+            audit=records.append,
+        )
+        h.app.state.rate_limiter = limiter
+        return records
+
+    def test_429_audit_id_equals_the_envelope_id(self):
+        with running_app(settings_kwargs=self.LIMITS) as h:
+            records = self._recording_limiter(h)
+            new_session(h)  # spends the single token
+            res = h.client.post(
+                "/api/v1/sessions",
+                json={"channel": "text"},
+                headers={"X-Request-ID": "probe-123"},
+            )
+        assert res.status_code == 429
+        assert res.json()["request_id"] == "probe-123"
+        assert [r.request_id for r in records] == ["probe-123"]
+        assert records[0].error_code is ErrorCode.RATE_LIMIT_EXCEEDED
+
+    def test_malformed_client_id_is_replaced_in_both_places(self):
+        with running_app(settings_kwargs=self.LIMITS) as h:
+            records = self._recording_limiter(h)
+            new_session(h)
+            res = h.client.post(
+                "/api/v1/sessions",
+                json={"channel": "text"},
+                headers={"X-Request-ID": "bad id <x>"},
+            )
+        assert res.status_code == 429
+        echoed = res.json()["request_id"]
+        assert "<x>" not in echoed and echoed
+        assert [r.request_id for r in records] == [echoed]
+        assert res.headers["x-request-id"] == echoed
+
+    def test_overload_503_audit_id_also_matches(self):
+        with running_app() as h:
+            records: list = []
+            limiter = RateLimiter(
+                (TENANT_RULE,), clock=MonotonicClock(), audit=records.append, max_keys=1
+            )
+            h.app.state.rate_limiter = limiter
+            limiter.enforce(PRINCIPAL)  # occupies the only slot
+            with h.as_token(OTHER_TENANT_TOKEN):
+                res = h.client.post(
+                    "/api/v1/sessions",
+                    json={"channel": "text"},
+                    headers={"X-Request-ID": "overload-1"},
+                )
+        assert res.status_code == 503
+        assert res.json()["request_id"] == "overload-1"
+        assert [r.request_id for r in records] == ["overload-1"]
+        assert records[0].error_code is ErrorCode.UNAVAILABLE_OVERLOADED
+        assert records[0].result == "overloaded"
 
 
 class TestGuardResponses:

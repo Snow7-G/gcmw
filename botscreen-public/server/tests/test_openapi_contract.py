@@ -148,6 +148,15 @@ class TestDocumentedContract:
                     ]
                     assert ref.endswith("/ErrorEnvelope"), (method, path, code)
 
+    def test_body_carrying_routes_document_the_entry_guard_codes(self, schema):
+        """413 (too large) and 408 (slow upload) are real wire answers."""
+        for path in ("/api/v1/sessions", "/api/v1/agent/runs"):
+            responses = _operation(schema, path, "post")["responses"]
+            assert "413" in responses, path
+            assert "408" in responses, path
+            assert "E_VALIDATION_PAYLOAD_TOO_LARGE" in responses["413"]["description"]
+            assert "E_UNAVAILABLE_CLIENT_TIMEOUT" in responses["408"]["description"]
+
     def test_key_table_overload_is_declared_on_every_limited_route(self, schema):
         """503 documents the OVERLOAD reason explicitly, not just any 503."""
         for path, path_item in schema["paths"].items():

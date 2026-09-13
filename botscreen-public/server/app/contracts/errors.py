@@ -59,6 +59,7 @@ class ErrorCode(str, Enum):
     NOT_FOUND_KNOWLEDGE = "E_NOT_FOUND_KNOWLEDGE"
     NOT_FOUND_AGENT = "E_NOT_FOUND_AGENT"
     # timeouts / availability
+    UNAVAILABLE_CLIENT_TIMEOUT = "E_UNAVAILABLE_CLIENT_TIMEOUT"
     TIMEOUT_AGENT = "E_TIMEOUT_AGENT"
     TIMEOUT_PROVIDER = "E_TIMEOUT_PROVIDER"
     UNAVAILABLE_OVERLOADED = "E_UNAVAILABLE_OVERLOADED"
@@ -243,6 +244,14 @@ _register(
     False,
     True,
     "Agent 不存在或已停用",
+)
+_register(
+    ErrorCode.UNAVAILABLE_CLIENT_TIMEOUT,
+    ErrorCategory.TIMEOUT,
+    408,
+    True,
+    False,
+    "请求体传输超时",
 )
 _register(
     ErrorCode.TIMEOUT_AGENT, ErrorCategory.TIMEOUT, 504, True, True, "处理超时，请重试"

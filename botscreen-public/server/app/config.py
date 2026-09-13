@@ -129,6 +129,9 @@ class Settings(BaseModel):
     # hard cap for a buffered request body (#66 entry guard): larger requests
     # are refused with 413 instead of being read into memory
     max_request_body_bytes: int = Field(262_144, gt=0)
+    # bounded upload: a client that cannot deliver the body within this window is
+    # answered with 408 instead of holding a worker hostage
+    request_body_timeout_s: float = Field(10.0, gt=0)
 
     # request rate limits (#66): requests per minute per tenant/device/session.
     # 0 disables that scope. Process-local counters (see app.api.v1.rate_limit).
@@ -253,6 +256,9 @@ class Settings(BaseModel):
             max_agent_handoffs=_int("GCMW_MAX_AGENT_HANDOFFS", 2),
             max_revisions=_int("GCMW_MAX_REVISIONS", 1),
             max_request_body_bytes=_int("GCMW_MAX_REQUEST_BODY_BYTES", 262_144),
+            request_body_timeout_s=float(
+                os.getenv("GCMW_REQUEST_BODY_TIMEOUT_S", "10")
+            ),
             rate_limit_tenant_per_minute=_int("GCMW_RATE_LIMIT_TENANT_PER_MINUTE", 600),
             rate_limit_device_per_minute=_int("GCMW_RATE_LIMIT_DEVICE_PER_MINUTE", 300),
             rate_limit_session_per_minute=_int(

@@ -394,21 +394,38 @@ class TestHttpEnforcement:
                 == 204
             )
 
-    def test_post_agent_runs_is_not_session_charged_from_the_body(self):
-        """Documented limitation: only a PATH-named session is session-charged."""
-        limits = {"rate_limit_session_per_minute": 1, "rate_limit_tenant_per_minute": 0}
+    def test_run_creation_is_session_charged_from_the_body(self):
+        """Review P1: a session named by the PAYLOAD must be session-charged."""
+        # window = 2: the run creation (body-named session) and the cancel
+        # (path-named session) spend it, so the next attempt on THAT session 429s
+        limits = {"rate_limit_session_per_minute": 2, "rate_limit_tenant_per_minute": 0}
         with running_app(settings_kwargs=limits) as h:
             session = new_session(h)
-            first = new_run(h, session["session_id"], key="a")
-            # cancel so the single-active-run rule does not mask the point
+            first = new_run(h, session["session_id"], key="a")  # session charge 1
             assert (
                 h.client.delete(f"/api/v1/agent/runs/{first['run_id']}").status_code
-                == 200
+                == 200  # session charge 2 (path-derived)
             )
-            # the body named a session, but the guard cannot see it (no body
-            # parsing before routing): the attempt is not session-charged, so
-            # the session window (limit 1) never tripped
-            assert new_run(h, session["session_id"], key="b")["run_id"]
+            second = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "again"},
+                    "idempotency_key": "b",
+                },
+            )
+            # a DIFFERENT session still has its own window
+            other = new_session(h)
+            third = h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": other["session_id"],
+                    "input": {"type": "text", "text": "elsewhere"},
+                    "idempotency_key": "c",
+                },
+            )
+        assert second.status_code == 429  # same session: window exhausted
+        assert third.status_code == 200  # other session: unaffected
 
     def test_default_configuration_does_not_throttle_normal_use(self):
         with running_app() as h:

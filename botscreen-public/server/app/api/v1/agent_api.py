@@ -688,6 +688,8 @@ async def _stream_with_lease(
         ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,
+        ErrorCode.VALIDATION_PAYLOAD_TOO_LARGE,
+        ErrorCode.UNAVAILABLE_CLIENT_TIMEOUT,
     ),
 )
 async def create_session(
@@ -735,6 +737,8 @@ async def delete_session(
         ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,
+        ErrorCode.VALIDATION_PAYLOAD_TOO_LARGE,
+        ErrorCode.UNAVAILABLE_CLIENT_TIMEOUT,
     ),
 )
 async def create_run(

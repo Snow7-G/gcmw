@@ -228,6 +228,7 @@ def create_app(
         EntryGuardMiddleware,
         public_paths=PUBLIC_PATHS,
         max_body_bytes=settings.max_request_body_bytes,
+        body_timeout_s=settings.request_body_timeout_s,
     )
 
     # -- published contract ----------------------------------------------------
