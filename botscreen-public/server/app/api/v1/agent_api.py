@@ -44,7 +44,6 @@ from fastapi.responses import JSONResponse
 
 from app.api.v1.auth import DevicePrincipal, PrincipalDep, require_owner
 from app.api.v1.errors import AppError, error_responses, request_ids
-from app.api.v1.rate_limit import RateLimiter
 from app.api.v1.sse_stream import (
     DEFAULT_HEARTBEAT_MS,
     SnapshotReader,
@@ -617,29 +616,6 @@ def get_leases(request: Request) -> RunLeaseRegistry:
 LeasesDep = Depends(get_leases)
 
 
-def get_rate_limiter(request: Request) -> RateLimiter:
-    """The lifespan-scoped rate limiter (one per application run)."""
-    limiter = getattr(request.app.state, "rate_limiter", None)
-    if limiter is None:  # pragma: no cover - the server always runs the lifespan
-        raise AppError(ErrorCode.UNAVAILABLE_MAINTENANCE)
-    return limiter
-
-
-RateLimiterDep = Depends(get_rate_limiter)
-
-
-def _enforce_limits(
-    limiter: RateLimiter,
-    principal: DevicePrincipal,
-    request: Request,
-    *,
-    session_id: str | None = None,
-) -> None:
-    """Charge the tenant/device/session windows before any work is done."""
-    request_id, _trace_id = request_ids(request)
-    limiter.enforce(principal, session_id=session_id, request_id=request_id)
-
-
 def _snapshot_response(snap: RunStatusSnapshot) -> RunStatusResponse:
     return RunStatusResponse(
         run_id=snap.run_id,
@@ -719,9 +695,7 @@ async def create_session(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
     service: RunAdmissionService = ServiceDep,
-    limiter: RateLimiter = RateLimiterDep,
 ) -> SessionResponse:
-    _enforce_limits(limiter, principal, request)
     return service.create_session(principal, req)
 
 
@@ -743,9 +717,7 @@ async def delete_session(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
     service: RunAdmissionService = ServiceDep,
-    limiter: RateLimiter = RateLimiterDep,
 ) -> None:
-    _enforce_limits(limiter, principal, request, session_id=session_id)
     await service.delete_session(principal, session_id)
 
 
@@ -770,9 +742,7 @@ async def create_run(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
     service: RunAdmissionService = ServiceDep,
-    limiter: RateLimiter = RateLimiterDep,
 ) -> RunStatusResponse:
-    _enforce_limits(limiter, principal, request, session_id=req.session_id)
     request_id, trace_id = request_ids(request)
     snap = await service.create_run(
         principal, req, request_id=request_id, trace_id=trace_id
@@ -798,11 +768,7 @@ async def get_run(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
     service: RunAdmissionService = ServiceDep,
-    limiter: RateLimiter = RateLimiterDep,
 ) -> RunStatusResponse:
-    _enforce_limits(
-        limiter, principal, request, session_id=service.session_id_for(run_id)
-    )
     return _snapshot_response(await service.get_run(principal, run_id))
 
 
@@ -825,11 +791,7 @@ async def cancel_run(
     request: Request,
     principal: DevicePrincipal = PrincipalDep,
     service: RunAdmissionService = ServiceDep,
-    limiter: RateLimiter = RateLimiterDep,
 ) -> RunStatusResponse:
-    _enforce_limits(
-        limiter, principal, request, session_id=service.session_id_for(run_id)
-    )
     return _snapshot_response(await service.cancel_run(principal, run_id))
 
 
@@ -880,7 +842,6 @@ async def stream_run_events(
     ),
     service: RunAdmissionService = ServiceDep,
     leases: RunLeaseRegistry = LeasesDep,
-    limiter: RateLimiter = RateLimiterDep,
 ) -> SSEStreamingResponse:
     """Public SSE route: one atomic read stream per authenticated run.
 
@@ -889,9 +850,6 @@ async def stream_run_events(
     failures are plain JSON envelopes. Resume state comes from ``Last-Event-ID``
     and/or ``after_seq`` (max wins); the heartbeat window is a server constant.
     """
-    _enforce_limits(
-        limiter, principal, request, session_id=service.session_id_for(run_id)
-    )
     identity, _state = await service.authorize_stream(principal, run_id)
     cursor = effective_after_seq(after_seq, last_event_id)
     request_id, trace_id = request_ids(request)

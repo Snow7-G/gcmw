@@ -126,6 +126,10 @@ class Settings(BaseModel):
     max_agent_handoffs: int = Field(2, ge=0)
     max_revisions: int = Field(1, ge=0)
 
+    # hard cap for a buffered request body (#66 entry guard): larger requests
+    # are refused with 413 instead of being read into memory
+    max_request_body_bytes: int = Field(262_144, gt=0)
+
     # request rate limits (#66): requests per minute per tenant/device/session.
     # 0 disables that scope. Process-local counters (see app.api.v1.rate_limit).
     rate_limit_tenant_per_minute: int = Field(600, ge=0)
@@ -248,6 +252,7 @@ class Settings(BaseModel):
             max_tool_calls=_int("GCMW_MAX_TOOL_CALLS", 4),
             max_agent_handoffs=_int("GCMW_MAX_AGENT_HANDOFFS", 2),
             max_revisions=_int("GCMW_MAX_REVISIONS", 1),
+            max_request_body_bytes=_int("GCMW_MAX_REQUEST_BODY_BYTES", 262_144),
             rate_limit_tenant_per_minute=_int("GCMW_RATE_LIMIT_TENANT_PER_MINUTE", 600),
             rate_limit_device_per_minute=_int("GCMW_RATE_LIMIT_DEVICE_PER_MINUTE", 300),
             rate_limit_session_per_minute=_int(

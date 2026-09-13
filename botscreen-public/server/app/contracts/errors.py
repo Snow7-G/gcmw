@@ -41,6 +41,7 @@ class ErrorCategory(str, Enum):
 class ErrorCode(str, Enum):
     # validation
     VALIDATION_INVALID_INPUT = "E_VALIDATION_INVALID_INPUT"
+    VALIDATION_PAYLOAD_TOO_LARGE = "E_VALIDATION_PAYLOAD_TOO_LARGE"
     VALIDATION_UNSUPPORTED_MODALITY = "E_VALIDATION_UNSUPPORTED_MODALITY"
     VALIDATION_UNSUPPORTED_FORMAT = "E_VALIDATION_UNSUPPORTED_FORMAT"
     # authentication / authorization
@@ -138,6 +139,14 @@ _register(
     False,
     True,
     "不支持的输入类型",
+)
+_register(
+    ErrorCode.VALIDATION_PAYLOAD_TOO_LARGE,
+    ErrorCategory.VALIDATION,
+    413,
+    False,
+    True,
+    "请求体过大",
 )
 _register(
     ErrorCode.VALIDATION_UNSUPPORTED_FORMAT,

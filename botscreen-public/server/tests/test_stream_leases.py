@@ -420,7 +420,6 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             assert registry.subscribers(run["run_id"]) == 0  # not started yet
             chunks = []
@@ -451,7 +450,6 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             async for _chunk in response.body_iterator:
                 break
@@ -484,7 +482,6 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             async for _chunk in first.body_iterator:
                 break
@@ -498,7 +495,6 @@ class TestRouteLeases:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             async for _chunk in second.body_iterator:
                 break
@@ -514,7 +510,7 @@ class TestRouteLeases:
         assert expired == []  # ... and it never fired
 
     def test_unauthorised_requests_never_take_a_lease(self):
-        with running_app(overrides=False) as h:
+        with running_app(default_credential=None) as h:
             res = h.client.get("/api/v1/agent/runs/whatever/events")
             assert res.status_code == 401
             leases = h.app.state.stream_leases
@@ -552,7 +548,6 @@ class TestServerSideEndIsNotADisconnect:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             body = [chunk async for chunk in response.body_iterator]  # consumed
             state = await harness.service.repository.state(run["identity"])
@@ -587,7 +582,6 @@ class TestServerSideEndIsNotADisconnect:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             body = [chunk async for chunk in response.body_iterator]
             return (
@@ -630,7 +624,6 @@ class TestServerSideEndIsNotADisconnect:
                 last_event_id=None,
                 service=harness.service,
                 leases=registry,
-                limiter=harness.app.state.rate_limiter,
             )
             chunks = []
             async for chunk in response.body_iterator:

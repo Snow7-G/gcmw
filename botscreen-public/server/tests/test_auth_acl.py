@@ -1,6 +1,6 @@
 """Device authentication + Session/Run ACL (#66, minimal slice).
 
-Everything here runs against the REAL auth boundary (``overrides=False``): the
+Everything here runs against the REAL auth boundary (entry guard + header): the
 credential store is seeded through the environment variable named by
 ``Settings.auth_credentials_env``, exactly as an operator would, so no test
 bypasses the production path.
@@ -297,7 +297,7 @@ class TestIdentityBoundsAtLoadTime:
     def test_a_padded_credential_authenticates_end_to_end(self):
         padded = "ZGV2LXRva2VuLXRlc3Q" + "=="  # ≥ MIN_CREDENTIAL_LENGTH
         entries = [{"tenant_id": "t1", "device_id": "d1", "token": padded}]
-        with running_app(overrides=False, credentials=entries) as h:
+        with running_app(credentials=entries, default_credential=None) as h:
             res = h.client.post(
                 "/api/v1/sessions",
                 json={"channel": "text"},
@@ -322,7 +322,7 @@ class TestIdentityBoundsAtLoadTime:
         ]
         with (  # startup must fail before the app can serve anything
             pytest.raises((TypeError, ValueError)),
-            running_app(overrides=False, credentials=bad),
+            running_app(credentials=bad, default_credential=None),
         ):
             pass  # pragma: no cover - unreachable when startup fails
 
@@ -368,7 +368,7 @@ class TestSessionWriteOrdering:
 class TestAuthenticationMatrix:
     @pytest.mark.parametrize(("method", "route"), ALL_ROUTES)
     def test_missing_credential_is_401(self, method, route):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS, default_credential=None) as h:
             res = _call_with_headers(h, method, route, None)
             assert res.status_code == 401
             assert _envelope(res).code == "E_AUTH_MISSING_CREDENTIALS"
@@ -376,34 +376,34 @@ class TestAuthenticationMatrix:
 
     @pytest.mark.parametrize(("method", "route"), ALL_ROUTES)
     def test_malformed_scheme_is_401(self, method, route):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS, default_credential=None) as h:
             res = _call_with_headers(h, method, route, {"Authorization": "Basic abc"})
             assert res.status_code == 401
             assert _envelope(res).code == "E_AUTH_MISSING_CREDENTIALS"
 
     @pytest.mark.parametrize(("method", "route"), ALL_ROUTES)
     def test_empty_bearer_is_401(self, method, route):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS, default_credential=None) as h:
             res = _call_with_headers(h, method, route, {"Authorization": "Bearer  "})
             assert res.status_code == 401
             assert _envelope(res).code == "E_AUTH_MISSING_CREDENTIALS"
 
     @pytest.mark.parametrize(("method", "route"), ALL_ROUTES)
     def test_unknown_credential_is_401(self, method, route):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS, default_credential=None) as h:
             res = _call_with_headers(h, method, route, _auth(UNKNOWN))
             assert res.status_code == 401
             assert _envelope(res).code == "E_AUTH_INVALID_CREDENTIALS"
 
     def test_health_endpoints_stay_public(self):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             assert h.client.get("/api/v1/health/live").status_code == 200
             ready = h.client.get("/api/v1/health/ready")
             assert ready.status_code == 200
             assert ready.json()["checks"]["device_credentials"] == "configured"
 
     def test_success_path_with_real_credential(self):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             session = h.client.post(
                 "/api/v1/sessions", json={"channel": "text"}, headers=_auth(OWN)
             )
@@ -436,7 +436,7 @@ class TestAuthenticationMatrix:
             assert "event: run.completed" in stream.text
 
     def test_credentials_never_appear_in_any_response(self):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             responses = [
                 h.client.get("/api/v1/health/ready"),
                 h.client.get("/api/v1/agent/runs/ghost"),
@@ -457,7 +457,7 @@ class TestAclMatrix:
         "credential", [OTHER_DEVICE, OTHER_TENANT], ids=["other-device", "other-tenant"]
     )
     def test_foreign_credential_cannot_read_or_cancel(self, credential):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             session = h.client.post(
                 "/api/v1/sessions", json={"channel": "text"}, headers=_auth(OWN)
             ).json()
@@ -487,7 +487,7 @@ class TestAclMatrix:
                 assert "data:" not in res.text  # never a streamed byte
 
     def test_foreign_credential_cannot_create_a_run_in_a_foreign_session(self):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             session = h.client.post(
                 "/api/v1/sessions", json={"channel": "text"}, headers=_auth(OWN)
             ).json()
@@ -505,13 +505,13 @@ class TestAclMatrix:
 
     def test_foreign_credential_gets_403_not_404_leakage(self):
         """A foreign caller learns nothing about whether the run exists."""
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             res = h.client.get("/api/v1/agent/runs/ghost", headers=_auth(OTHER_TENANT))
             assert res.status_code == 404  # unknown run stays "not found"
             assert _envelope(res).code == "E_NOT_FOUND_RUN"
 
     def test_each_credential_only_sees_its_own_sessions(self):
-        with running_app(overrides=False, credentials=CREDENTIALS) as h:
+        with running_app(credentials=CREDENTIALS) as h:
             mine = h.client.post(
                 "/api/v1/sessions", json={"channel": "text"}, headers=_auth(OWN)
             ).json()
@@ -544,7 +544,7 @@ class TestAclMatrix:
 
 class TestFailClosedWithoutCredentials:
     def test_empty_store_denies_every_route(self):
-        with running_app(overrides=False) as h:
+        with running_app(default_credential=None) as h:
             for method, route in ALL_ROUTES:
                 res = _call_with_headers(h, method, route, _auth(OWN))
                 assert res.status_code == 401
@@ -553,7 +553,7 @@ class TestFailClosedWithoutCredentials:
     def test_repository_untouched_by_denied_requests(self):
         repository = MemoryRunRepository()
         with running_app(
-            repository=repository, overrides=False, credentials=CREDENTIALS
+            repository=repository, credentials=CREDENTIALS, default_credential=None
         ) as h:
             assert (
                 h.client.post("/api/v1/sessions", json={"channel": "text"}).status_code

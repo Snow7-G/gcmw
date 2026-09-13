@@ -186,7 +186,7 @@ class TestWireParity:
         assert res.json()["code"] == "E_VALIDATION_INVALID_INPUT"
 
     def test_401_without_credentials(self):
-        with running_app(overrides=False) as h:
+        with running_app(default_credential=None) as h:
             res = h.client.get("/api/v1/agent/runs/whatever/events")
         assert res.status_code == 401
         assert res.json()["code"] == "E_AUTH_MISSING_CREDENTIALS"

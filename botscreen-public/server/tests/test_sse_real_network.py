@@ -9,6 +9,8 @@ cancel. The server runs once per module on an ephemeral port.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 from types import SimpleNamespace
@@ -25,13 +27,22 @@ RECONNECT_GRACE_S = 0.5
 POLL_DEADLINE_S = 15.0
 
 PRINCIPAL = DevicePrincipal(tenant_id="t1", device_id="d1")
+#: deterministic low-entropy credential for the real-server fixture
+TOKEN = "dev-realserver-000000000"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
 
 
 @pytest.fixture(scope="module")
 def server():
     uvicorn = pytest.importorskip("uvicorn")
+    settings = Settings(environment="test")
+    env_name = settings.auth_credentials_env
+    previous = os.environ.get(env_name)
+    os.environ[env_name] = json.dumps(
+        [{"tenant_id": "t1", "device_id": "d1", "token": TOKEN}]
+    )
     app = create_app(
-        settings=Settings(environment="test"),
+        settings=settings,
         reconnect_grace_s=RECONNECT_GRACE_S,
     )
     app.dependency_overrides[get_device_principal] = lambda: PRINCIPAL
@@ -53,10 +64,16 @@ def server():
     finally:
         instance.should_exit = True
         thread.join(timeout=15)
+        if previous is None:
+            os.environ.pop(env_name, None)
+        else:
+            os.environ[env_name] = previous
 
 
 def _new_run(client: httpx.Client, base: str, key: str) -> dict:
-    session = client.post(f"{base}/sessions", json={"channel": "text"}).json()
+    session = client.post(
+        f"{base}/sessions", json={"channel": "text"}, headers=AUTH
+    ).json()
     res = client.post(
         f"{base}/agent/runs",
         json={
@@ -64,13 +81,14 @@ def _new_run(client: httpx.Client, base: str, key: str) -> dict:
             "input": {"type": "text", "text": "real network"},
             "idempotency_key": key,
         },
+        headers=AUTH,
     )
     assert res.status_code == 200, res.text
     return res.json()
 
 
 def _state(client: httpx.Client, base: str, run_id: str) -> str:
-    res = client.get(f"{base}/agent/runs/{run_id}")
+    res = client.get(f"{base}/agent/runs/{run_id}", headers=AUTH)
     assert res.status_code == 200, res.text
     return res.json()["state"]
 
@@ -92,7 +110,9 @@ def _connect_and_drop(base: str, run_id: str) -> str:
     disconnect. A subscriber that must STAY connected therefore simply does not
     consume frames while it holds the socket open.
     """
-    with httpx.stream("GET", f"{base}/agent/runs/{run_id}/events", timeout=30) as res:
+    with httpx.stream(
+        "GET", f"{base}/agent/runs/{run_id}/events", timeout=30, headers=AUTH
+    ) as res:
         assert res.status_code == 200
         assert res.headers["content-type"].startswith("text/event-stream")
         first = next(res.iter_lines())
@@ -116,7 +136,10 @@ class TestRealDisconnect:
             run = _new_run(client, server.base, "real-hold")
             # hold the socket WITHOUT consuming frames: the lease stays open
             with httpx.stream(
-                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=30
+                "GET",
+                f"{server.base}/agent/runs/{run['run_id']}/events",
+                timeout=30,
+                headers=AUTH,
             ) as res:
                 assert res.status_code == 200
                 time.sleep(RECONNECT_GRACE_S * 2)  # well past the grace
@@ -133,7 +156,10 @@ class TestRealDisconnect:
 
             # reconnect immediately, inside the grace window, and hold it
             with httpx.stream(
-                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=30
+                "GET",
+                f"{server.base}/agent/runs/{run['run_id']}/events",
+                timeout=30,
+                headers=AUTH,
             ) as res:
                 assert res.status_code == 200
                 time.sleep(RECONNECT_GRACE_S * 2)
@@ -146,18 +172,26 @@ class TestRealDisconnect:
         with httpx.Client(timeout=10) as client:
             run = _new_run(client, server.base, "real-terminal")
             assert (
-                client.delete(f"{server.base}/agent/runs/{run['run_id']}").status_code
+                client.delete(
+                    f"{server.base}/agent/runs/{run['run_id']}", headers=AUTH
+                ).status_code
                 == 200
             )
             with httpx.stream(
-                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=10
+                "GET",
+                f"{server.base}/agent/runs/{run['run_id']}/events",
+                timeout=10,
+                headers=AUTH,
             ) as res:
                 body = "".join(res.iter_text())
             assert body.count("event: run.completed") == 1
             time.sleep(RECONNECT_GRACE_S * 2)  # the lease expiry must be a no-op
             assert _state(client, server.base, run["run_id"]) == "CANCELLED"
             with httpx.stream(
-                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=10
+                "GET",
+                f"{server.base}/agent/runs/{run['run_id']}/events",
+                timeout=10,
+                headers=AUTH,
             ) as res:
                 assert "".join(res.iter_text()).count("event: run.completed") == 1
 
@@ -172,7 +206,10 @@ class TestRealDisconnect:
             run = _new_run(client, server.base, "real-rapid")
             _connect_and_drop(server.base, run["run_id"])  # first link drops
             with httpx.stream(
-                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=30
+                "GET",
+                f"{server.base}/agent/runs/{run['run_id']}/events",
+                timeout=30,
+                headers=AUTH,
             ) as res:
                 assert res.status_code == 200  # reconnect, inside the grace
                 time.sleep(RECONNECT_GRACE_S / 2)
@@ -182,7 +219,10 @@ class TestRealDisconnect:
                 "CANCELLED"
             )
             with httpx.stream(
-                "GET", f"{server.base}/agent/runs/{run['run_id']}/events", timeout=30
+                "GET",
+                f"{server.base}/agent/runs/{run['run_id']}/events",
+                timeout=30,
+                headers=AUTH,
             ) as res:
                 body = "".join(res.iter_text())
             assert body.count("event: run.completed") == 1
@@ -217,6 +257,7 @@ class TestRealDisconnect:
                     "GET",
                     f"{server.base}/agent/runs/{run['run_id']}/events",
                     timeout=30,
+                    headers=AUTH,
                 ) as res:
                     body = "".join(res.iter_text())
                 assert "stream.error" in body
@@ -227,7 +268,7 @@ class TestRealDisconnect:
                 # and the run is still streamable/cancellable normally
                 assert (
                     client.delete(
-                        f"{server.base}/agent/runs/{run['run_id']}"
+                        f"{server.base}/agent/runs/{run['run_id']}", headers=AUTH
                     ).status_code
                     == 200
                 )
@@ -250,7 +291,7 @@ class TestRealDisconnect:
         server.app.dependency_overrides.clear()
         try:
             with httpx.Client(timeout=10) as client:
-                res = client.get(f"{server.base}/agent/runs/ghost/events")
+                res = client.get(f"{server.base}/agent/runs/ghost/events")  # no header
                 assert res.status_code == 401
                 assert res.json()["code"] == "E_AUTH_MISSING_CREDENTIALS"
                 assert server.leases.tracked() == 0
