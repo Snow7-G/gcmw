@@ -15,12 +15,19 @@ events without re-deriving semantics:
                 rule miss never downgrades MEDIUM/CRITICAL to LOW. Then
                 deterministic intent classification and registry routing; hard
                 budgets: ≤ max_handoffs engagements (checked BEFORE each
-                engagement), ≤ max_tool_calls tool calls (reported by the
-                executed agent, POST-HOC), ≤ max_revisions verifier-driven
+                engagement), ≤ max_tool_calls tool calls **summed over the whole
+                run** from the sub-agent's own report (POST-HOC: the count is
+                only known after it returns; a call-time quota arrives with the
+                ToolGateway path in #55A), ≤ max_revisions verifier-driven
                 revisions — the V2.3 numbers are CEILINGS that cannot be
                 configured upward;
 3. execute    — the routed agent runs (its own ModelGateway/ToolGateway usage
-                arrives with #53) under the remaining deadline;
+                arrives with #53) under the remaining deadline. Its return value
+                is UNTRUSTED: it is validated and deep-copied by
+                :meth:`ManagerAgent._trusted_snapshot` before anything else sees
+                it (identity bound to the routing decision, only
+                COMPLETED/FAILED/CANCELLED reportable, strict types), and the
+                verifier receives an isolated copy of that snapshot;
 4. verify     — optional Verifier handoff (runner arrives with #54) with
                 at-most-one controlled revision when the verdict is reject;
 5. finalize   — AgentResult with evidence and safe public trace markers. ONE
@@ -122,6 +129,10 @@ SAFE_MARKER_KEYS: frozenset[str] = frozenset(
 # below, once the enums they pin exist).
 _MARKER_TOKEN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:@+-]{0,63}\Z")
 _MARKER_INT_MAX = 10_000
+
+
+#: the ONE text an invalid sub-agent result is ever allowed to produce
+_INVALID_EXECUTION = "routed agent returned an invalid execution result"
 
 
 def desensitize(text: str) -> str:
@@ -247,14 +258,18 @@ class ManagerLimits:
     configured above them, so a caller cannot amplify a hard safety budget
     (``max_revisions=3`` would permit three revisions / four sub-agent executions
     and break the "≤1 controlled revision" rule). A budget may be tightened
-    (disabled) but never raised.
+    (disabled) but never raised. All four fields must be STRICT ints — ``bool``,
+    ``float``, ``str``, ``NaN`` and ``Infinity`` raise ``TypeError``, because
+    ``NaN > ceiling`` is False and would silently disable the ceiling.
 
     IMPORTANT (honest scope): the handoff budget is enforced BEFORE each
     engagement (a tightened ``max_handoffs`` forbids the call rather than
-    reporting it afterwards), but ``max_tool_calls`` is a **POST-HOC check** — tool calls are
-    read from the sub-agent's own report after it returns. Call-time hard
-    counting requires the ToolGateway quota path and lands with #55A; until
-    then this PR must not claim the tool budget is preemptively enforced.
+    reporting it afterwards), but ``max_tool_calls`` is a **POST-HOC,
+    RUN-CUMULATIVE check** — the counts are read from the sub-agent's own reports
+    after each engagement and SUMMED over the whole run (first execution plus
+    every revision). Call-time hard counting requires the ToolGateway quota path
+    and lands with #55A; until then this PR must not claim the tool budget is
+    preemptively enforced.
     """
 
     max_input_chars: int = 2000
@@ -263,6 +278,18 @@ class ManagerLimits:
     max_revisions: int = 1
 
     def __post_init__(self) -> None:
+        # STRICT ints: bool is an int subclass, and float/str/NaN/Infinity would
+        # silently defeat every ceiling comparison below (`value > ceiling` is
+        # False for NaN), so a non-int budget is refused outright.
+        fields = ("max_input_chars", "max_handoffs", "max_tool_calls", "max_revisions")
+        for name in fields:
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                # wrong TYPE (bool/float/str/NaN/Infinity) -> TypeError; a
+                # well-typed but out-of-range value raises ValueError below
+                raise TypeError(
+                    f"{name} must be a strict int, not {type(value).__name__}"
+                )
         if self.max_input_chars <= 0:
             raise ValueError("max_input_chars must be positive")
         ceilings = {"max_handoffs": 2, "max_tool_calls": 4, "max_revisions": 1}
@@ -484,15 +511,105 @@ class ManagerAgent:
                 f"handoff budget exceeded ({handoffs} > {self._limits.max_handoffs})",
             )
 
-    def _raise_if_tool_over_budget(self, tool_calls: int) -> None:
-        """POST-HOC check (honest scope): the count is the sub-agent's own
-        report, read after it returned. Call-time hard counting arrives with the
+    def _raise_if_tool_over_budget(self, run_tool_calls: int) -> None:
+        """POST-HOC, RUN-CUMULATIVE check (honest scope).
+
+        The count is the sub-agent's own report, read after it returned, and it
+        is accumulated over the WHOLE run — the first execution plus every
+        revision — so ``3 + 3`` against a budget of 4 is refused instead of being
+        compared per engagement. Call-time hard counting still arrives with the
         ToolGateway quota path (#55A)."""
-        if tool_calls > self._limits.max_tool_calls:
+        if run_tool_calls > self._limits.max_tool_calls:
             raise ManagerAgentError(
                 ErrorCode.TOOL_OVER_LIMIT,
-                f"tool budget exceeded ({tool_calls} > {self._limits.max_tool_calls})",
+                f"tool budget exceeded ({run_tool_calls} > {self._limits.max_tool_calls})",
             )
+
+    # -- trusted sub-agent output boundary ---------------------------------------
+
+    #: the ONLY statuses a routed agent may report back to the Manager. PENDING
+    #: and RUNNING are states of a run in flight, never a result.
+    _REPORTABLE_STATUSES = frozenset(
+        {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.CANCELLED}
+    )
+
+    def _trusted_snapshot(self, raw: Any, *, agent_id: str) -> AgentExecution:
+        """Validate a routed agent's return value and isolate a COPY of it.
+
+        The sub-agent's output is untrusted input to this module: it may claim a
+        different identity, report an impossible status, carry a non-integer tool
+        count or an ``answer_candidate`` that is not a string. Each of those used
+        to reach the verifier, the markers or the delivered ``AgentResult``
+        (forged identity, ``AttributeError``/pydantic ``ValidationError`` leaks,
+        mutable evidence shared with the runner).
+
+        Every violation maps to the SAME public error code with a FIXED message —
+        the offending value is never echoed, and no original exception text is
+        carried — so an invalid result cannot smuggle content back out through
+        the error channel. The returned value is a fresh ``AgentExecution`` whose
+        evidence is deep-copied: later mutation by the runner (or of the copy
+        handed to the verifier) cannot change what was validated here.
+        """
+        if not isinstance(raw, AgentExecution):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        if raw.agent_id != agent_id:
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        # isinstance first: a plain string ("completed") compares equal to a
+        # str-enum member and would otherwise reach ``status.value`` later
+        if not isinstance(raw.status, AgentStatus) or raw.status not in (
+            self._REPORTABLE_STATUSES
+        ):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        tool_calls = raw.tool_calls
+        if isinstance(tool_calls, bool) or not isinstance(tool_calls, int):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        if tool_calls < 0:
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        if not isinstance(raw.answer_candidate, str):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        if not isinstance(raw.evidence, tuple):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        if not all(isinstance(item, Evidence) for item in raw.evidence):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        if not all(
+            isinstance(value, str)
+            for value in (
+                raw.safety_status,
+                raw.provider_id,
+                raw.model_id,
+                raw.model_version,
+            )
+        ):
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        return AgentExecution(
+            agent_id=agent_id,
+            status=raw.status,
+            answer_candidate=raw.answer_candidate,
+            evidence=tuple(item.model_copy(deep=True) for item in raw.evidence),
+            tool_calls=tool_calls,
+            provider_id=raw.provider_id,
+            model_id=raw.model_id,
+            model_version=raw.model_version,
+            safety_status=raw.safety_status,
+        )
 
     # -- execute ----------------------------------------------------------------
 
@@ -515,7 +632,6 @@ class ManagerAgent:
         """Run one guarded, routed, verified turn. Returns the Manager's final
         AgentResult (safe markers only — no chain-of-thought)."""
         actions: list[dict[str, Any]] = []
-        evidence: list[Evidence] = []
         self._mark(actions, "manager.guard")
         cleaned = self._guard(ctx, text)
 
@@ -558,11 +674,16 @@ class ManagerAgent:
             deep=True,
             update={"normalized_input": cleaned, "risk_level": risk},
         )
-        execution = await self._run_with_deadline(
-            self._runners[agent_id](sub_ctx), self._remaining_ms(ctx)
+        runner = self._runners[agent_id]
+        run_tool_calls = 0  # whole-run total: first execution + every revision
+        raw = await self._run_with_deadline(
+            lambda: runner(sub_ctx), self._remaining_ms(ctx)
         )
-        self._raise_if_tool_over_budget(execution.tool_calls)
-        evidence = list(execution.evidence)
+        # untrusted output -> validated, isolated snapshot (identity bound to the
+        # trusted routing decision, impossible statuses and bad types refused)
+        execution = self._trusted_snapshot(raw, agent_id=agent_id)
+        run_tool_calls += execution.tool_calls
+        self._raise_if_tool_over_budget(run_tool_calls)
         self._mark(
             actions,
             "agent.done",
@@ -587,8 +708,13 @@ class ManagerAgent:
             self._mark(
                 actions, "verify.handoff", agent_id="verifier", handoffs=handoffs
             )
+            verifier = self._verifier
+            # the verifier only ever sees its OWN deep copy: whatever it does to
+            # that object cannot change what this module validated
+            verifier_view = self._trusted_snapshot(execution, agent_id=agent_id)
             verdict = await self._run_with_deadline(
-                self._verifier(sub_ctx, execution), self._remaining_ms(ctx)
+                lambda view=verifier_view: verifier(sub_ctx, view),
+                self._remaining_ms(ctx),
             )
             self._mark(actions, "verify.verdict", outcome=verdict.outcome.value)
             # ONLY "revise" retries, exactly once. BLOCK stops immediately and
@@ -600,17 +726,20 @@ class ManagerAgent:
             ):
                 revisions += 1
                 self._mark(actions, "verify.revise", revision=revisions)
-                execution = await self._run_with_deadline(
-                    self._runners[agent_id](sub_ctx), self._remaining_ms(ctx)
+                raw = await self._run_with_deadline(
+                    lambda: runner(sub_ctx), self._remaining_ms(ctx)
                 )
-                self._raise_if_tool_over_budget(execution.tool_calls)
-                evidence = list(execution.evidence)
+                execution = self._trusted_snapshot(raw, agent_id=agent_id)
+                run_tool_calls += execution.tool_calls
+                self._raise_if_tool_over_budget(run_tool_calls)
                 if execution.status is not AgentStatus.COMPLETED:
                     # a revision that did not complete is not verifiable: stop
                     # here and let the single delivery decision below refuse it
                     break
+                verifier_view = self._trusted_snapshot(execution, agent_id=agent_id)
                 verdict = await self._run_with_deadline(
-                    self._verifier(sub_ctx, execution), self._remaining_ms(ctx)
+                    lambda view=verifier_view: verifier(sub_ctx, view),
+                    self._remaining_ms(ctx),
                 )
                 self._mark(actions, "verify.verdict", outcome=verdict.outcome.value)
 
@@ -662,24 +791,36 @@ class ManagerAgent:
                 ctx, actions, status=AgentStatus.FAILED, safety="unverified"
             )
 
-        # only COMPLETED + PASS reach this point (see _may_deliver)
+        # only COMPLETED + PASS reach this point (see _may_deliver). A FRESH
+        # validation + snapshot is taken here so nothing the runner or the
+        # verifier still holds a reference to can alter the delivered result.
+        delivered = self._trusted_snapshot(execution, agent_id=agent_id)
         return self._finalize(
             ctx,
             actions,
-            evidence,
-            status=execution.status,
-            answer=execution.answer_candidate,
+            list(delivered.evidence),
+            status=delivered.status,
+            answer=delivered.answer_candidate,
             safety="verified",
             confidence="high",
         )
 
     # -- helpers ---------------------------------------------------------------
 
-    async def _run_with_deadline(self, awaitable: Awaitable, remaining_ms: int) -> Any:
+    async def _run_with_deadline(
+        self, factory: Callable[[], Awaitable[Any]], remaining_ms: int
+    ) -> Any:
+        """Await ``factory()`` under the remaining deadline.
+
+        The argument is a FACTORY, not a ready coroutine: the budget is checked
+        first, so an expired deadline refuses the call *before* a coroutine
+        object exists. Passing an already-created coroutine here leaked it
+        ("coroutine was never awaited") whenever the remaining time was zero.
+        """
         if remaining_ms <= 0:
             raise ManagerAgentError(ErrorCode.TIMEOUT_AGENT, "deadline expired")
         try:
-            return await asyncio.wait_for(awaitable, timeout=remaining_ms / 1000)
+            return await asyncio.wait_for(factory(), timeout=remaining_ms / 1000)
         except asyncio.TimeoutError as exc:
             raise ManagerAgentError(ErrorCode.TIMEOUT_AGENT, "agent timed out") from exc
 
