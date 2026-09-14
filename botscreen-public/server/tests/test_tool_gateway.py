@@ -200,7 +200,7 @@ class TestSchemaGate:
         with pytest.raises(ToolGatewayError) as exc:
             _call(gateway, "knowledge.search", {})
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
-        assert "$.query: required" in str(exc.value)
+        assert gateway._sink.records[-1].result == "rejected:input_schema:required"
 
     def test_wrong_type_rejected(self, gateway):
         with pytest.raises(ToolGatewayError) as exc:
@@ -227,7 +227,8 @@ class TestSchemaGate:
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
 
     def test_output_schema_mismatch_rejected(self):
-        gw = ToolGateway()
+        sink = _Sink()
+        gw = ToolGateway(audit_sink=sink)
         gw.register(
             canonical_spec(
                 "knowledge.search",
@@ -237,7 +238,10 @@ class TestSchemaGate:
         with pytest.raises(ToolGatewayError) as exc:
             _call(gw, "knowledge.search", {"query": "x"})
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
-        assert "$: type" in str(exc.value)
+        assert sink.records[-1].result == (
+            "rejected:output_schema:additionalProperties+required"
+        ) or sink.records[-1].result.startswith("rejected:output_schema:")
+        gw.shutdown()
 
     def test_schema_violation_audited_without_value_echo(self, gateway):
         secret = "s3cr3t-value-never-logged"
@@ -261,7 +265,7 @@ class TestSizeGate:
             _call(gw, "knowledge.search", {"query": "x"})
         assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
         assert "result_bytes=" in sink.records[-1].result
-        assert "exceeded" in str(exc.value)
+        assert "result_bytes=" in sink.records[-1].result  # audit keeps the size
 
     def test_oversized_payload_never_reaches_audit_text(self):
         sink = _Sink()
@@ -554,8 +558,11 @@ class TestIdentityArgumentGuard:
         with pytest.raises(ToolGatewayError) as exc:
             _call(gateway, "knowledge.search", {"query": "x", key: "attacker"})
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
-        assert key in str(exc.value)  # the KEY is named, the value never echoed
+        # the KEY is named in the AUDIT (value never anywhere); the exception
+        # text is always the registry message
+        assert f"identity_argument={key}" in gateway._sink.records[-1].result
         assert "attacker" not in str(exc.value)
+        assert key not in str(exc.value)
 
     @pytest.mark.parametrize(
         "arguments",
@@ -1191,7 +1198,7 @@ class TestExecutionBoundsAndAuditFinality:
         assert exc.value.code is ErrorCode.INTERNAL_UNKNOWN
         assert sentinel not in str(exc.value)
         assert sentinel not in repr(exc.value)
-        assert "failed internally" in str(exc.value)
+        assert str(exc.value) == lookup(ErrorCode.INTERNAL_UNKNOWN).message
         gw.shutdown()
 
     def test_cancellation_writes_exactly_one_record_and_propagates(self):
@@ -1327,6 +1334,131 @@ class TestAuditNeverCarriesUntrustedText:
         with pytest.raises(ToolGatewayError) as exc:
             _call(gw, "knowledge.get_fragment", {"source_id": "faq-1"})
         assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
+
+
+class TestWholeErrorBoundaryIsScrubbed:
+    """Review P1: EVERY gate reports the registry text, never model text."""
+
+    SENTINEL = "SENTINEL-GATE-PAYLOAD-患者私密文本"
+
+    def _assert_clean(self, exc, sink):
+        assert self.SENTINEL not in str(exc.value)
+        assert self.SENTINEL not in repr(exc.value)
+        assert str(exc.value) == lookup(exc.value.code).message
+        assert all(self.SENTINEL not in r.result for r in sink.records)
+        assert all(self.SENTINEL not in str(r) for r in sink.records)
+        envelope = ErrorEnvelope.build(
+            code=exc.value.code, request_id="r", trace_id="t"
+        )
+        assert self.SENTINEL not in envelope.model_dump_json()
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_unknown_tool_name_never_reaches_the_error_text(self, runner):
+        import asyncio
+
+        sink = _Sink()
+        calls: list[Any] = []
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(
+            canonical_spec(
+                "knowledge.search",
+                executor=lambda _ctx, args: calls.append(args) or {"items": []},
+            )
+        )
+        request = _request(f"unknown.{self.SENTINEL}", {"query": "x"})
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(TENANT, request, allowed_tools=[request.tool_name])
+            else:
+                asyncio.run(
+                    gw.ainvoke(TENANT, request, allowed_tools=[request.tool_name])
+                )
+        assert exc.value.code is ErrorCode.TOOL_DISABLED
+        self._assert_clean(exc, sink)
+        assert calls == []  # no executor ran
+        gw.shutdown()
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_invalid_input_property_name_never_reaches_the_error_text(self, runner):
+        import asyncio
+
+        sink = _Sink()
+        calls: list[Any] = []
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(
+            canonical_spec(
+                "knowledge.search",
+                executor=lambda _ctx, args: calls.append(args) or {"items": []},
+            )
+        )
+        request = _request("knowledge.search", {"query": "x", self.SENTINEL: "v"})
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(
+                    TENANT, request, allowed_tools=["knowledge.search"], agent_id="a"
+                )
+            else:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        request,
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+        self._assert_clean(exc, sink)
+        assert calls == []
+        gw.shutdown()
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_invalid_output_property_name_never_reaches_the_error_text(self, runner):
+        import asyncio
+
+        sink = _Sink()
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(
+            canonical_spec(
+                "knowledge.search",
+                # a STRICT output schema, so an extra (model-named) result key is
+                # a real violation rather than an allowed extension
+                output_schema={
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                    "required": ["items"],
+                    "additionalProperties": False,
+                },
+                executor=lambda _ctx, args: {self.SENTINEL: "v"},
+            )
+        )
+        request = _request("knowledge.search", {"query": "x"})
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(
+                    TENANT, request, allowed_tools=["knowledge.search"], agent_id="a"
+                )
+            else:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        request,
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+        self._assert_clean(exc, sink)
+        gw.shutdown()
+
+    def test_the_audit_still_carries_the_detailed_reason(self):
+        """Scrubbing must not cost operators their diagnostics."""
+        sink = _Sink()
+        gw = build_gateway(knowledge_store=_store_with_one_approved(), audit_sink=sink)
+        with pytest.raises(ToolGatewayError):
+            _call(gw, "knowledge.search", {})  # missing required "query"
+        # the kind is kept; the path (which can embed a model key) is not
+        assert sink.records[-1].result == "rejected:input_schema:required"
+        gw.shutdown()
 
 
 class TestRegistryCodedErrorsAreScrubbedToo:

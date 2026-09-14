@@ -89,6 +89,18 @@ IDENTITY_ARGUMENT_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _violation_kinds(violations: list[str]) -> str:
+    """Classification of schema violations, WITHOUT any path or value.
+
+    A violation path can embed a MODEL-SUPPLIED key (an extra argument or a
+    result field name), so the audit records only the developer-authored kinds
+    (``required``/``type``/``additionalProperties`` …). Operators keep a
+    useful signal; no untrusted text reaches a durable record.
+    """
+    kinds = sorted({item.split(": ", 1)[-1] for item in violations})
+    return "+".join(kinds) if kinds else "unspecified"
+
+
 def _validate_timeout_s(timeout_s: float) -> float:
     """A caller-supplied budget must be a positive finite number."""
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
@@ -214,11 +226,24 @@ def identity_from_context(context: Any) -> TrustedIdentity:
 
 
 class ToolGatewayError(RuntimeError):
-    """Tool failure carrying a stable ErrorCode (mapped to envelopes by #36)."""
+    """Tool failure carrying a stable ErrorCode (mapped to envelopes by #36).
+
+    The text presented to callers is ALWAYS the registry message: this is the
+    single construction boundary that enforces it, so no ``raise`` site — the
+    whitelist gate, the permission gate, the schema gates or an executor — can
+    leak a tool name, an argument/result key or payload text into a string that
+    a future Agent or log handler might record.
+
+    Detailed, VALUE-FREE reason markers belong in the audit record's ``result``
+    field (``denied:not_whitelisted``, ``rejected:output_schema`` …) and in
+    :attr:`reason`, which is diagnostic only and never part of ``str()``.
+    """
 
     def __init__(self, code: ErrorCode, message: str = "") -> None:
-        super().__init__(message or code.value)
         self.code = code
+        #: diagnostic marker for tests/tracing — NEVER rendered by str()/repr()
+        self.reason = message
+        super().__init__(lookup(code).message)
 
 
 def _default_runner(fn: Callable[[], Any], timeout_seconds: float) -> Any:
@@ -398,7 +423,12 @@ class ToolGateway:
         # 3. input schema gate (no executor side effects before this point).
         violations = validate(spec.input_schema, request.arguments)
         if violations:
-            audit(result="rejected:input_schema", code=ErrorCode.TOOL_SCHEMA_REJECTED)
+            # the audit carries the DETAILED, value-free reason (schema paths and
+            # expected types only), while the exception text stays registry-only
+            audit(
+                result=f"rejected:input_schema:{_violation_kinds(violations)}",
+                code=ErrorCode.TOOL_SCHEMA_REJECTED,
+            )
             raise ToolGatewayError(
                 ErrorCode.TOOL_SCHEMA_REJECTED,
                 f"input schema violations at {', '.join(violations)}",
@@ -447,7 +477,7 @@ class ToolGateway:
         violations = validate(prepared.spec.output_schema, payload)
         if violations:
             raise _ToolFault(
-                "rejected:output_schema",
+                f"rejected:output_schema:{_violation_kinds(violations)}",
                 ErrorCode.TOOL_SCHEMA_REJECTED,
                 f"output schema violations at {', '.join(violations)}",
             )
