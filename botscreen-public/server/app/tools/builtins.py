@@ -44,6 +44,18 @@ def _attr(item: Any, name: str, default: Any = "") -> Any:
     return getattr(item, name, default)
 
 
+def _require_dependency(tool_name: str) -> None:
+    """Fail CLOSED when a tool's server-side dependency is not configured.
+
+    Returning an empty result would silently look like "no data"; an
+    unconfigured dependency is a deployment fault and must be visible.
+    """
+    raise ToolGatewayError(
+        ErrorCode.UNAVAILABLE_MAINTENANCE,
+        f"tool {tool_name!r} has no dependency configured on this server",
+    )
+
+
 def _arg(args: dict[str, Any], name: str, default: Any) -> Any:
     return args.get(name, default)
 
@@ -66,18 +78,18 @@ def _item_summary(item: Any) -> dict[str, Any]:
     }
 
 
-def make_knowledge_search(store: Any | None) -> Callable[[dict], Any]:
+def make_knowledge_search(store: Any | None) -> Callable[[Any, dict], Any]:
     """Deterministic relevance search over a production-view source."""
 
-    def search(args: dict[str, Any]) -> dict[str, Any]:
+    def search(context: Any, args: dict[str, Any]) -> dict[str, Any]:
         query = _arg(args, "query", "")
         top_k = _arg(args, "top_k", 5)
-        tenant_id = _arg(args, "tenant_id", None)
         if store is None:
-            return {"items": [], "total": 0}
+            _require_dependency("knowledge.search")
         tokens = set(_tokens(query))
         scored: list[tuple[int, int, Any]] = []
-        for index, item in enumerate(store.production_items(tenant_id)):
+        # identity ALWAYS comes from the injected context, never from arguments
+        for index, item in enumerate(store.production_items(context)):
             haystack = f"{_attr(item, 'title')} {_attr(item, 'content')}".lower()
             score = sum(1 for t in tokens if t in haystack)
             if score:
@@ -92,8 +104,8 @@ def make_knowledge_search(store: Any | None) -> Callable[[dict], Any]:
     return search
 
 
-def make_knowledge_get_fragment(store: Any | None) -> Callable[[dict], Any]:
-    def get_fragment(args: dict[str, Any]) -> dict[str, Any]:
+def make_knowledge_get_fragment(store: Any | None) -> Callable[[Any, dict], Any]:
+    def get_fragment(context: Any, args: dict[str, Any]) -> dict[str, Any]:
         source_id = args["source_id"]
         fragment_index = _arg(args, "fragment_index", 0)
         fragment_chars = _arg(args, "fragment_chars", 2000)
@@ -102,7 +114,7 @@ def make_knowledge_get_fragment(store: Any | None) -> Callable[[dict], Any]:
             item = next(
                 (
                     it
-                    for it in store.production_items(_arg(args, "tenant_id", None))
+                    for it in store.production_items(context)
                     if getattr(it, "source_id", None) == source_id
                 ),
                 None,
@@ -138,14 +150,20 @@ def make_knowledge_get_fragment(store: Any | None) -> Callable[[dict], Any]:
 
 def make_directory_search(
     domain: str, directories: Directories | None
-) -> Callable[[dict], Any]:
-    def search(args: dict[str, Any]) -> dict[str, Any]:
+) -> Callable[[Any, dict], Any]:
+    def search(context: Any, args: dict[str, Any]) -> dict[str, Any]:
         query = _arg(args, "query", "")
         top_k = _arg(args, "top_k", 5)
-        tenant_id = _arg(args, "tenant_id", None)
-        records = list((directories or {}).get(domain, []))
-        if tenant_id is not None:
-            records = [r for r in records if r.get("tenant_id", tenant_id) == tenant_id]
+        if directories is None:
+            _require_dependency(f"{domain}.search")
+        # scoping follows the INJECTED context; the caller's tenant can never
+        # be widened or redirected through arguments
+        tenant_id = getattr(context, "tenant_id", "")
+        records = [
+            r
+            for r in (directories or {}).get(domain, [])
+            if r.get("tenant_id", tenant_id) == tenant_id
+        ]
         tokens = _tokens(query)
         scored: list[tuple[int, int, dict[str, Any]]] = []
         for index, record in enumerate(records):
@@ -160,12 +178,18 @@ def make_directory_search(
     return search
 
 
-def make_memory_read_short(reader: MemoryReader | None) -> Callable[[dict], Any]:
-    def read_short(args: dict[str, Any]) -> dict[str, Any]:
-        session_id = _arg(args, "session_id", None)
+def make_memory_read_short(reader: MemoryReader | None) -> Callable[[Any, dict], Any]:
+    def read_short(context: Any, args: dict[str, Any]) -> dict[str, Any]:
+        # the session comes from the trusted context, never from arguments
+        session_id = getattr(context, "session_id", "") or None
+        max_chars = _arg(args, "max_chars", 2000)
         if reader is None:
+            _require_dependency("memory.read_short")
+        if session_id is None:
             return {"summary": "", "available": False}
         summary = reader(session_id)
+        if isinstance(summary, str) and max_chars:
+            summary = summary[: int(max_chars)]
         if not summary:
             return {"summary": "", "available": False}
         return {"summary": summary, "available": True}
@@ -184,7 +208,11 @@ def build_gateway(
     default_max_result_bytes: int = 64 * 1024,
 ) -> ToolGateway:
     """Assemble a gateway with the six canonical read-only tools bound to the
-    given (read-only) sources. Sources default to empty, deterministic stubs."""
+    given (read-only) sources.
+
+    A missing source is NOT silently empty: calls to that tool fail closed with
+    ``E_UNAVAILABLE_MAINTENANCE`` (see ``_require_dependency``)."""
+
     gateway = ToolGateway(
         audit_sink=audit_sink,
         clock=clock,

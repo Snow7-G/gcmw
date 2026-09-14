@@ -12,7 +12,15 @@ Hard constraints (V2.3 §6.2):
 - arguments and results never reach logs or audit text verbatim — audit
   records carry identifiers, tool names, outcome markers and sizes only;
 - every gate failure raises :class:`ToolGatewayError` with a stable ErrorCode
-  (mapped to envelopes by the #36 boundary) and writes an audit record.
+  (mapped to envelopes by the #36 boundary) and writes an audit record;
+- IDENTITY IS SERVER-INJECTED: ``invoke``/``ainvoke`` take a trusted
+  :class:`~app.contracts.common.TenantContext` as their first argument (the
+  same authority the knowledge store uses) and derive tenant/session/run from
+  it. Tool ARGUMENTS may never carry an identity — such keys are rejected
+  structurally before any executor can run (``IDENTITY_ARGUMENT_KEYS``), so a
+  model can neither widen nor redirect its own scope;
+- ``ainvoke`` runs the gate + executor OFF the event loop with a hard
+  ``asyncio.wait_for`` bound, so a slow tool cannot stall the server.
 
 Executor side effects are strictly read-only by construction: specs carry no
 write capability. On timeout the call returns TOOL_TIMEOUT immediately; a
@@ -21,6 +29,7 @@ runaway executor thread is daemon and cannot block process shutdown.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -28,16 +37,87 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from app.contracts.agent import ToolRequest, ToolResult
 from app.contracts.audit import AuditRecord
+from app.contracts.common import TenantContext
 from app.contracts.errors import ErrorCode
 from app.tools.specs import ToolSpec
 from app.tools.validation import validate
 
 _LOGGER = logging.getLogger(__name__)
+
+#: argument keys a model must never supply: identity belongs to the injected
+#: context. Checked RECURSIVELY (nested objects are exactly how a smuggled
+#: identity would try to ride through), and only the key NAME is ever reported.
+IDENTITY_ARGUMENT_KEYS: frozenset[str] = frozenset(
+    {
+        "tenant",
+        "tenant_id",
+        "device",
+        "device_id",
+        "session",
+        "session_id",
+        "run",
+        "run_id",
+        "request_id",
+        "principal",
+        "actor",
+        "user",
+        "user_id",
+        "reviewer",
+        "reviewer_id",
+        "tenant_context",
+    }
+)
+
+
+def find_identity_argument(node: Any) -> str | None:
+    """Return the first identity key found at ANY depth (values never echoed)."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(key, str) and key.lower() in IDENTITY_ARGUMENT_KEYS:
+                return key
+            found = find_identity_argument(value)
+            if found is not None:
+                return found
+    elif isinstance(node, (list, tuple, set, frozenset)):
+        for item in node:
+            found = find_identity_argument(item)
+            if found is not None:
+                return found
+    return None
+
+
+@dataclass(frozen=True)
+class TrustedIdentity:
+    """Identity derived ONLY from the server-injected context."""
+
+    tenant_id: str
+    session_id_hash: str = ""
+    run_id: str = ""
+    request_id: str = ""
+
+
+def identity_from_context(context: Any) -> TrustedIdentity:
+    """Extract the identity the server vouches for (duck-typed on purpose)."""
+
+    def _field(name: str) -> str:
+        value = getattr(context, name, "")
+        return value if isinstance(value, str) else ""
+
+    session_id = _field("session_id")
+    return TrustedIdentity(
+        tenant_id=_field("tenant_id"),
+        session_id_hash=(
+            hashlib.sha256(session_id.encode("utf-8")).hexdigest() if session_id else ""
+        ),
+        run_id=_field("run_id"),
+        request_id=_field("request_id"),
+    )
 
 
 class ToolGatewayError(RuntimeError):
@@ -144,20 +224,19 @@ class ToolGateway:
 
     def invoke(
         self,
+        context: TenantContext | Any,
         request: ToolRequest,
         *,
         allowed_tools: Sequence[str] | None = (),
         agent_id: str = "",
-        tenant_id: str = "",
-        session_id_hash: str = "",
-        run_id: str = "",
-        request_id: str,
     ) -> ToolResult:
         """Authorized, schema-checked, timed and capped tool execution.
 
-        Every failure raises :class:`ToolGatewayError` after an audit record;
-        the executor never runs for rejected or unauthorized calls.
+        ``context`` is the TRUSTED identity injected by the server (never by the
+        model); every failure raises :class:`ToolGatewayError` after an audit
+        record, and the executor never runs for rejected calls.
         """
+        identity = identity_from_context(context)
         name = request.tool_name
         with self._lock:
             spec = self._specs.get(name)
@@ -166,11 +245,23 @@ class ToolGateway:
         audit = self._audit(
             tool_name=name,
             agent_id=agent_id,
-            tenant_id=tenant_id,
-            session_id_hash=session_id_hash,
-            run_id=run_id,
-            request_id=request_id,
+            tenant_id=identity.tenant_id,
+            session_id_hash=identity.session_id_hash,
+            run_id=identity.run_id,
+            request_id=identity.request_id,
         )
+
+        # 0. identity gate: the model may never supply tenant/session/reviewer.
+        smuggled = find_identity_argument(request.arguments)
+        if smuggled is not None:
+            audit(
+                result=f"denied:identity_argument={smuggled}",
+                code=ErrorCode.TOOL_SCHEMA_REJECTED,
+            )
+            raise ToolGatewayError(
+                ErrorCode.TOOL_SCHEMA_REJECTED,
+                f"tool {name!r} may not receive an identity argument ({smuggled!r})",
+            )
 
         # 1. whitelist gate: unknown/disabled tools never reach an executor.
         if spec is None or disabled:
@@ -210,7 +301,7 @@ class ToolGateway:
         # 5. executor under timeout.
         try:
             payload = self._runner(
-                lambda: spec.executor(request.arguments), timeout_ms / 1000
+                lambda: spec.executor(context, request.arguments), timeout_ms / 1000
             )
         except ToolGatewayError as exc:
             audit(result="executor:" + exc.code.value, code=exc.code)
@@ -259,6 +350,55 @@ class ToolGateway:
         audit(result=f"ok:result_bytes={size_bytes}", latency_ms=latency_ms)
         return ToolResult(tool_name=name, ok=True, data=payload)
 
+    async def ainvoke(
+        self,
+        context: TenantContext | Any,
+        request: ToolRequest,
+        *,
+        allowed_tools: Sequence[str] | None = (),
+        agent_id: str = "",
+        timeout_s: float | None = None,
+    ) -> ToolResult:
+        """Async entry point: the whole gated call runs OFF the event loop.
+
+        The same gates as :meth:`invoke` apply (the sync path runs in a worker
+        thread), and ``asyncio.wait_for`` adds a hard upper bound so a slow or
+        hung tool cannot stall the loop. Cancellation propagates unchanged —
+        a cancelled call applies no side effects (executors are read-only, and
+        the gateway itself never writes).
+        """
+        budget = (
+            self._default_timeout_ms / 1000 if timeout_s is None else float(timeout_s)
+        )
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.invoke,
+                    context,
+                    request,
+                    allowed_tools=allowed_tools,
+                    agent_id=agent_id,
+                ),
+                timeout=budget,
+            )
+        except TimeoutError:
+            identity = identity_from_context(context)
+            self._audit(
+                tool_name=request.tool_name,
+                agent_id=agent_id,
+                tenant_id=identity.tenant_id,
+                session_id_hash=identity.session_id_hash,
+                run_id=identity.run_id,
+                request_id=identity.request_id,
+            )(
+                result=f"rejected:async_timeout={budget:g}s",
+                code=ErrorCode.TOOL_TIMEOUT,
+            )
+            raise ToolGatewayError(
+                ErrorCode.TOOL_TIMEOUT,
+                f"tool {request.tool_name!r} exceeded the async budget",
+            ) from None
+
     # -- helpers ----------------------------------------------------------------
 
     def _effective_timeout_ms(self, request: ToolRequest) -> int:
@@ -300,7 +440,10 @@ class ToolGateway:
                             agent_id.encode("utf-8")
                         ).hexdigest(),
                         session_id_hash=session_id_hash,
-                        request_id=request_id,
+                        # a bare TenantContext carries no request id; the field
+                        # is required by the audit contract, so an explicit
+                        # placeholder is used rather than fabricating an id
+                        request_id=request_id or "unattributed",
                         run_id=run_id,
                         tenant_id=tenant_id or "unknown",
                         action="tool.invoke",
@@ -310,7 +453,9 @@ class ToolGateway:
                         result=result,
                     )
                 )
-            except Exception:  # audit must never break the call
-                _LOGGER.debug("audit sink failed", exc_info=True)
+            except Exception:  # audit must never break the call…
+                # …but a broken audit sink is a SECURITY fault: make it loud
+                # instead of silently dropping records.
+                _LOGGER.warning("tool audit record dropped", exc_info=True)
 
         return close

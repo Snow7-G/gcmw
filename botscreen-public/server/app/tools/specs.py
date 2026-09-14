@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from typing import Any
 
 # Sealed read-only whitelist (ordered — first registration wins ordering).
+#
+# No schema below declares tenant/device/session/run/reviewer: identity is
+# injected by the server (a trusted context travels with the call), so a model
+# can never widen or redirect its own scope through tool arguments. The gateway
+# additionally rejects such keys structurally (see IDENTITY_ARGUMENT_KEYS).
 READONLY_TOOL_NAMES: tuple[str, ...] = (
     "knowledge.search",
     "knowledge.get_fragment",
@@ -27,12 +32,11 @@ READONLY_TOOL_NAMES: tuple[str, ...] = (
 # name -> (description, input_schema)
 TOOL_INPUT_SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
     "knowledge.search": (
-        "Search approved in-window knowledge items (tenant-scoped when tenant_id is given); returns titles + snippets.",
+        "Search approved in-window knowledge items of the CALLER'S tenant (identity is injected by the server); returns titles + snippets.",
         {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 500},
-                "tenant_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["query"],
@@ -45,7 +49,6 @@ TOOL_INPUT_SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
             "type": "object",
             "properties": {
                 "source_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                "tenant_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "fragment_index": {"type": "integer", "minimum": 0},
                 "fragment_chars": {
                     "type": "integer",
@@ -63,7 +66,6 @@ TOOL_INPUT_SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
-                "tenant_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["query"],
@@ -76,7 +78,6 @@ TOOL_INPUT_SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
-                "tenant_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["query"],
@@ -89,7 +90,6 @@ TOOL_INPUT_SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "minLength": 1, "maxLength": 200},
-                "tenant_id": {"type": "string", "minLength": 1, "maxLength": 64},
                 "top_k": {"type": "integer", "minimum": 1, "maximum": 20},
             },
             "required": ["query"],
@@ -97,11 +97,19 @@ TOOL_INPUT_SCHEMAS: dict[str, tuple[str, dict[str, Any]]] = {
         },
     ),
     "memory.read_short": (
-        "Read the caller's short-term memory summary (writes are orchestrated outside the gateway).",
+        (
+            "Read the caller's short-term memory summary for the authenticated "
+            "session (identity is injected by the server; writes are "
+            "orchestrated outside the gateway)."
+        ),
         {
             "type": "object",
             "properties": {
-                "session_id": {"type": "string", "minLength": 1, "maxLength": 128}
+                "max_chars": {
+                    "type": "integer",
+                    "minimum": 64,
+                    "maximum": 8192,
+                }
             },
             "additionalProperties": False,
         },
@@ -121,9 +129,10 @@ class WhitelistError(ValueError):
 class ToolSpec:
     """Declarative spec of one whitelisted read-only tool.
 
-    ``executor`` receives the validated arguments and returns a JSON-ready
-    value; it must not mutate shared state. Domain-level failures are raised
-    as :class:`~app.tools.gateway.ToolGatewayError` with a registry ErrorCode.
+    ``executor`` receives ``(context, arguments)`` — the trusted tenant context
+    injected by the server plus the validated arguments — and returns a
+    JSON-ready value; it must not mutate shared state. Domain-level failures are
+    raised as :class:`~app.tools.gateway.ToolGatewayError` with a registry code.
     """
 
     name: str
@@ -131,7 +140,7 @@ class ToolSpec:
     input_schema: dict[str, Any] | None = None
     output_schema: dict[str, Any] | None = None
     max_result_bytes: int | None = None  # None -> gateway default
-    executor: Callable[[dict[str, Any]], Any] | None = None
+    executor: Callable[[Any, dict[str, Any]], Any] | None = None
 
     def __post_init__(self) -> None:
         if self.name not in READONLY_TOOL_NAMES:
@@ -143,7 +152,7 @@ class ToolSpec:
 
 def canonical_spec(
     name: str,
-    executor: Callable[[dict[str, Any]], Any] | None = None,
+    executor: Callable[[Any, dict[str, Any]], Any] | None = None,
     *,
     output_schema: dict[str, Any] | None = None,
 ) -> ToolSpec:

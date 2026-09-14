@@ -12,14 +12,20 @@ Acceptance coverage:
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
 from app.contracts.agent import ToolRequest
+from app.contracts.common import SessionContext, TenantContext
 from app.contracts.errors import ErrorCode
 from app.tools.builtins import build_gateway
 from app.tools.gateway import ToolGateway, ToolGatewayError
 from app.tools.specs import READONLY_TOOL_NAMES, WhitelistError, canonical_spec
+
+TENANT = TenantContext(tenant_id="t1")
+OTHER_TENANT = TenantContext(tenant_id="t2")
+SESSION = SessionContext(tenant_id="t1", device_id="d1", session_id="sess-1")
 
 
 class _Item:
@@ -50,10 +56,9 @@ class _KnowledgeSource:
     def __init__(self, items) -> None:
         self._items = list(items)
 
-    def production_items(self, tenant_id: str | None = None):
-        if tenant_id is None:
-            return list(self._items)
-        return [it for it in self._items if it.tenant_id == tenant_id]
+    def production_items(self, context):
+        """The #56A signature: the store scopes by the TRUSTED context."""
+        return [it for it in self._items if it.tenant_id == context.tenant_id]
 
 
 def _store_with_one_approved(content: str = "内容"):
@@ -86,15 +91,13 @@ def gateway():
     return gw
 
 
-def _call(gw, name, arguments=None, allowed=READONLY_TOOL_NAMES, **overrides):
+def _call(gw, name, arguments=None, allowed=READONLY_TOOL_NAMES, context=TENANT, **kw):
+    """Invoke through the trusted-context entry point (identity is injected)."""
     return gw.invoke(
-        _request(name, arguments),
+        context,
+        _request(name, arguments, **kw),
         allowed_tools=list(allowed),
         agent_id="agent-x",
-        tenant_id="t1",
-        run_id="run-1",
-        request_id=overrides.pop("request_id", "req-1"),
-        **overrides,
     )
 
 
@@ -110,7 +113,7 @@ class TestWhitelistIsSealed:
             gw.register(canonical_spec("knowledge.search"))
 
     def test_duplicate_registration_rejected(self, gateway):
-        spec = canonical_spec("memory.read_short", executor=lambda args: {})
+        spec = canonical_spec("memory.read_short", executor=lambda _ctx, args: {})
         with pytest.raises(ToolGatewayError) as exc:
             gateway.register(spec)
         assert exc.value.code is ErrorCode.CONFLICT_IDEMPOTENCY
@@ -175,10 +178,10 @@ class TestPermissionGate:
     def test_none_declaration_denies_everything(self, gateway):
         with pytest.raises(ToolGatewayError) as exc:
             gateway.invoke(
+                TENANT,
                 _request("knowledge.search", {"query": "x"}),
                 allowed_tools=None,
                 agent_id="agent-x",
-                request_id="req-1",
             )
         assert exc.value.code is ErrorCode.AUTHZ_FORBIDDEN
 
@@ -226,7 +229,7 @@ class TestSchemaGate:
         gw.register(
             canonical_spec(
                 "knowledge.search",
-                executor=lambda args: ["not", "an", "object"],
+                executor=lambda _ctx, args: ["not", "an", "object"],
             )
         )
         with pytest.raises(ToolGatewayError) as exc:
@@ -282,7 +285,7 @@ class TestTimeoutGate:
         release = threading.Event()
         ran = {"done": False}
 
-        def slow(args):
+        def slow(_context, args):
             release.wait(timeout=10)
             ran["done"] = True
             return {"summary": "late"}
@@ -304,15 +307,17 @@ class TestTimeoutGate:
         # gateway defaults to a real UTC clock, so deadlines always apply
         gw = ToolGateway()  # no clock injected
         gw.register(
-            canonical_spec("memory.read_short", executor=lambda args: {"summary": "s"})
+            canonical_spec(
+                "memory.read_short", executor=lambda _ctx, args: {"summary": "s"}
+            )
         )
         past = datetime.now(timezone.utc) - timedelta(seconds=5)
         with pytest.raises(ToolGatewayError) as exc:
             gw.invoke(
+                SESSION,
                 _request("memory.read_short", deadline=past),
                 allowed_tools=["memory.read_short"],
                 agent_id="a",
-                request_id="r",
             )
         assert exc.value.code is ErrorCode.TOOL_TIMEOUT
 
@@ -324,7 +329,9 @@ class TestTimeoutGate:
 
         gw = ToolGateway(audit_sink=sink, runner=always_times_out)
         gw.register(
-            canonical_spec("memory.read_short", executor=lambda args: {"summary": "s"})
+            canonical_spec(
+                "memory.read_short", executor=lambda _ctx, args: {"summary": "s"}
+            )
         )
         with pytest.raises(ToolGatewayError) as exc:
             _call(gw, "memory.read_short")
@@ -335,10 +342,10 @@ class TestTimeoutGate:
         past = datetime.now(timezone.utc) - timedelta(seconds=5)
         with pytest.raises(ToolGatewayError) as exc:
             gateway.invoke(
+                TENANT,
                 _request("knowledge.search", {"query": "x"}, deadline=past),
                 allowed_tools=["knowledge.search"],
                 agent_id="agent-x",
-                request_id="req-1",
             )
         assert exc.value.code is ErrorCode.TOOL_TIMEOUT
         assert gateway._sink.records[-1].error_code is ErrorCode.TOOL_TIMEOUT
@@ -392,18 +399,43 @@ class TestDomainAndSuccessPaths:
         assert result.data["items"] == [
             {"tenant_id": "t1", "name": "呼吸内科", "location": "1号楼"}
         ]
-        # tenant isolation applies when requested
-        result = _call(gw, "department.search", {"query": "内科", "tenant_id": "t2"})
+        # tenant isolation follows the INJECTED context, never the arguments
+        result = _call(gw, "department.search", {"query": "内科"}, context=OTHER_TENANT)
         assert [i["name"] for i in result.data["items"]] == ["心内科"]
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "department.search", {"query": "内科", "tenant_id": "t2"})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
 
     def test_memory_read_short_with_reader(self):
         sink = _Sink()
-        gw = build_gateway(audit_sink=sink, memory_reader=lambda session: "摘要A")
-        result = _call(gw, "memory.read_short", {"session_id": "s1"})
-        assert result.data == {"summary": "摘要A", "available": True}
+        seen: list[str | None] = []
 
-    def test_memory_read_short_default_empty(self, gateway):
-        result = _call(gateway, "memory.read_short")
+        def reader(session_id):
+            seen.append(session_id)
+            return "摘要A"
+
+        gw = build_gateway(audit_sink=sink, memory_reader=reader)
+        result = _call(gw, "memory.read_short", {}, context=SESSION)
+        assert result.data == {"summary": "摘要A", "available": True}
+        assert seen == ["sess-1"]  # the session came from the trusted context
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "memory.read_short", {"session_id": "other"})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+
+    def test_memory_read_short_without_a_configured_reader_fails_closed(self, gateway):
+        """The fixture has no memory reader: that is a deployment fault."""
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gateway, "memory.read_short", {}, context=SESSION)
+        assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
+
+    def test_memory_read_short_with_an_empty_reader_is_an_empty_summary(self):
+        gw = build_gateway(audit_sink=_Sink(), memory_reader=lambda _sid: "")
+        result = _call(gw, "memory.read_short", {}, context=SESSION)
+        assert result.data == {"summary": "", "available": False}
+
+    def test_memory_read_short_without_context_session_is_empty(self):
+        gw = build_gateway(audit_sink=_Sink(), memory_reader=lambda _sid: "泄漏")
+        result = _call(gw, "memory.read_short", {}, context=TENANT)
         assert result.data == {"summary": "", "available": False}
 
     def test_success_audit_never_echoes_results(self, gateway):
@@ -432,35 +464,293 @@ class TestDomainAndSuccessPaths:
 
 class TestRealStoreIntegration:
     def test_builtins_work_with_the_governance_store_when_available(self):
-        """Active once #56 lands; skipped while the store is off-branch."""
+        """The REAL #56A store drives the knowledge tools end to end."""
         ks = pytest.importorskip("app.knowledge.store")
         kc = pytest.importorskip("app.contracts.knowledge")
         store = ks.KnowledgeStore()
         store.add_candidate(
-            kc.KnowledgeItem(
+            TENANT,
+            kc.CandidateInput(
                 source_id="faq-1",
-                tenant_id="t1",
                 source_type=kc.KnowledgeSourceType.FAQ,
                 title="发热指南",
                 content="发热咳嗽请挂呼吸内科门诊",
                 source_uri="kbase://faq/1",
-            )
+            ),
+            actor="content-owner",
         )
-        store.approve("faq-1", reviewer="dr-li")
+        store.mark_in_review(TENANT, "faq-1", actor="content-owner")
+        store.approve(
+            TENANT,
+            "faq-1",
+            kc.ApprovalDecision(
+                reviewer="dr-li",
+                valid_from=datetime.now(timezone.utc) - timedelta(days=1),
+            ),
+        )
         sink = _Sink()
         gw = build_gateway(knowledge_store=store, audit_sink=sink)
+
         result = _call(gw, "knowledge.search", {"query": "发热"})
         assert result.ok is True
         assert result.data["items"][0]["source_id"] == "faq-1"
-        assert result.data["items"][0]["knowledge_version"] == "faq-1-v1"
         fragment = _call(gw, "knowledge.get_fragment", {"source_id": "faq-1"})
-        assert fragment.data["total_fragments"] == 1
+        assert fragment.data["total_fragments"] >= 1
+
+        # CROSS-TENANT ISOLATION: another tenant's context sees nothing, and it
+        # cannot be overridden from the arguments either
+        other = _call(gw, "knowledge.search", {"query": "发热"}, context=OTHER_TENANT)
+        assert other.data == {"items": [], "total": 0}
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.search", {"query": "发热", "tenant_id": "t1"})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+
+    def test_missing_dependency_fails_closed(self):
+        """No configured source is a deployment fault, not an empty result."""
+        gw = build_gateway()  # nothing injected
+        for name, args in (
+            ("knowledge.search", {"query": "x"}),
+            ("department.search", {"query": "x"}),
+            ("memory.read_short", {}),
+        ):
+            with pytest.raises(ToolGatewayError) as exc:
+                _call(gw, name, args, context=SESSION)
+            assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
+
+
+class TestIdentityArgumentGuard:
+    """Review (#69): identity is server-injected and never model-supplied."""
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "tenant_id",
+            "tenant",
+            "session_id",
+            "device_id",
+            "run_id",
+            "request_id",
+            "reviewer",
+            "reviewer_id",
+            "actor",
+            "user_id",
+            "principal",
+            "tenant_context",
+        ],
+    )
+    def test_identity_arguments_are_rejected(self, gateway, key):
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gateway, "knowledge.search", {"query": "x", key: "attacker"})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+        assert key in str(exc.value)  # the KEY is named, the value never echoed
+        assert "attacker" not in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "arguments",
+        [
+            {"query": "x", "filter": {"tenant_id": "t2"}},  # nested in an object
+            {"query": "x", "filters": [{"session_id": "s9"}]},  # nested in a list
+            {"query": "x", "opts": ({"reviewer": "me"},)},  # nested in a tuple
+        ],
+    )
+    def test_nested_identity_arguments_are_rejected(self, gateway, arguments):
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gateway, "knowledge.search", arguments)
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+
+    def test_the_executor_never_runs_for_an_identity_argument(self):
+        calls: list[Any] = []
+
+        def spy(_context, args):
+            calls.append(args)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway()
+        gw.register(canonical_spec("knowledge.search", executor=spy))
+        with pytest.raises(ToolGatewayError):
+            _call(gw, "knowledge.search", {"query": "x", "tenant_id": "t2"})
+        assert calls == []
+
+    def test_no_whitelisted_schema_declares_an_identity_property(self):
+        from app.tools.gateway import IDENTITY_ARGUMENT_KEYS
+        from app.tools.specs import TOOL_INPUT_SCHEMAS
+
+        def keys_of(node: Any) -> set[str]:
+            found: set[str] = set()
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    found.add(str(key).lower())
+                    found |= keys_of(value)
+            elif isinstance(node, (list, tuple, set, frozenset)):
+                for item in node:
+                    found |= keys_of(item)
+            return found
+
+        for name, (_description, schema) in TOOL_INPUT_SCHEMAS.items():
+            declared = keys_of(schema)
+            if "$ref" in declared:  # pragma: no cover - no refs in the whitelist
+                continue
+            leaked = {
+                key
+                for key in declared
+                if key in IDENTITY_ARGUMENT_KEYS and key != "type"
+            }
+            assert not leaked, f"{name} declares identity properties: {sorted(leaked)}"
+
+    def test_identity_comes_only_from_the_context(self, gateway):
+        captured: list[Any] = []
+        gw = gateway
+        original = gw.spec("knowledge.search")
+        assert original is not None
+
+        def spy(context, args):
+            captured.append(context)
+            return {"items": [], "total": 0}
+
+        gw.register_error: Any = None
+        gw._specs["knowledge.search"] = original.__class__(
+            name=original.name,
+            description=original.description,
+            input_schema=original.input_schema,
+            output_schema=original.output_schema,
+            executor=spy,
+        )
+        _call(gw, "knowledge.search", {"query": "x"}, context=OTHER_TENANT)
+        assert captured and captured[0].tenant_id == "t2"
+
+
+class TestAsyncEntryPoint:
+    """``ainvoke`` keeps the gate AND gets the tool off the event loop (#69)."""
+
+    def test_async_call_succeeds(self):
+        import asyncio
+
+        gw = build_gateway(
+            knowledge_store=_store_with_one_approved(content="发热咳嗽挂呼吸内科")
+        )
+        result = asyncio.run(
+            gw.ainvoke(
+                TENANT,
+                _request("knowledge.search", {"query": "发热"}),
+                allowed_tools=["knowledge.search"],
+                agent_id="agent-x",
+            )
+        )
+        assert result.ok is True
+        assert result.data["items"]
+
+    def test_async_timeout_is_structured_and_audited(self):
+        import asyncio
+
+        release = threading.Event()
+        sink = _Sink()
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        try:
+            with pytest.raises(ToolGatewayError) as exc:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "x"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                        timeout_s=0.05,
+                    )
+                )
+            assert exc.value.code is ErrorCode.TOOL_TIMEOUT
+            async_records = [
+                r for r in sink.records if r.result.startswith("rejected:async_timeout")
+            ]
+            assert async_records, [r.result for r in sink.records]
+            assert async_records[0].error_code is ErrorCode.TOOL_TIMEOUT
+        finally:
+            release.set()
+
+    def test_the_event_loop_is_not_blocked_by_a_slow_tool(self):
+        """Proof that the sync gate + executor run OFF the loop."""
+        import asyncio
+
+        release = threading.Event()
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway()
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+
+        async def main():
+            task = asyncio.create_task(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "x"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                    timeout_s=5,
+                )
+            )
+            ticks = 0
+            for _ in range(20):  # the loop must keep running while the tool waits
+                await asyncio.sleep(0.01)
+                ticks += 1
+            release.set()
+            await task
+            return ticks
+
+        assert asyncio.run(main()) == 20
+
+    def test_async_cancellation_propagates_without_running_the_executor(self):
+        import asyncio
+
+        ran: list[str] = []
+
+        def executor(_context, args):
+            ran.append("ran")
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway()
+        gw.register(canonical_spec("knowledge.search", executor=executor))
+
+        async def main():
+            task = asyncio.create_task(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "x"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                )
+            )
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(main())
+
+    def test_async_path_enforces_the_same_identity_gate(self):
+        import asyncio
+
+        gw = build_gateway(knowledge_store=_store_with_one_approved())
+        with pytest.raises(ToolGatewayError) as exc:
+            asyncio.run(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "x", "tenant_id": "t2"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                )
+            )
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
 
 
 class TestAliasSafety:
     def test_canonical_specs_own_their_schemas(self):
-        a = canonical_spec("knowledge.search", executor=lambda args: {})
-        b = canonical_spec("knowledge.search", executor=lambda args: {})
+        a = canonical_spec("knowledge.search", executor=lambda _ctx, args: {})
+        b = canonical_spec("knowledge.search", executor=lambda _ctx, args: {})
         a.input_schema["required"] = []
         assert b.input_schema["required"] == ["query"]  # decl uncorrupted
         from app.tools.specs import TOOL_INPUT_SCHEMAS
@@ -469,7 +759,7 @@ class TestAliasSafety:
 
     def test_registered_spec_is_isolated_from_caller_mutation(self):
         gw = ToolGateway()
-        spec = canonical_spec("knowledge.search", executor=lambda args: {})
+        spec = canonical_spec("knowledge.search", executor=lambda _ctx, args: {})
         gw.register(spec)
         spec.input_schema["required"] = []  # caller mutates its own copy
         with pytest.raises(ToolGatewayError) as exc:
@@ -478,7 +768,7 @@ class TestAliasSafety:
 
     def test_spec_returns_deep_copy(self):
         gw = ToolGateway()
-        gw.register(canonical_spec("knowledge.search", executor=lambda args: {}))
+        gw.register(canonical_spec("knowledge.search", executor=lambda _ctx, args: {}))
         got = gw.spec("knowledge.search")
         got.input_schema["required"] = []
         assert gw.spec("knowledge.search").input_schema["required"] == ["query"]
@@ -489,7 +779,7 @@ class TestDomainExecutorSpy:
     def test_executor_never_runs_on_rejected_or_unauthorized_calls(self):
         calls = []
 
-        def spy(args):
+        def spy(_context, args):
             calls.append(args)
             return {"summary": "x"}
 
@@ -499,28 +789,28 @@ class TestDomainExecutorSpy:
         # schema violation
         with pytest.raises(ToolGatewayError) as exc:
             gw.invoke(
-                _request("memory.read_short", {"session_id": 9}),
+                SESSION,
+                _request("memory.read_short", {"max_chars": "not-an-int"}),
                 allowed_tools=["memory.read_short"],
                 agent_id="a",
-                request_id="r",
             )
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
         # permission violation
         with pytest.raises(ToolGatewayError) as exc:
             gw.invoke(
+                SESSION,
                 _request("memory.read_short"),
                 allowed_tools=[],
                 agent_id="a",
-                request_id="r",
             )
         assert exc.value.code is ErrorCode.AUTHZ_FORBIDDEN
         # whitelist violation
         with pytest.raises(ToolGatewayError) as exc:
             gw.invoke(
+                SESSION,
                 _request("shell.exec"),
                 allowed_tools=["shell.exec"],
                 agent_id="a",
-                request_id="r",
             )
         assert exc.value.code is ErrorCode.TOOL_DISABLED
         assert calls == []  # unauthorized tool invocations succeeded 0 times
