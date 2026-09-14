@@ -823,9 +823,9 @@ class TestMarkerValuesAreConstrained:
 
     PRIVATE = "患者自述：三天前开始发热咳嗽，住址朝阳区"
 
-    @mark.parametrize("field", ["provider_id", "model_id", "model_version"])
+    @mark.parametrize("field", ["provider_id", "model_id"])
     @mark.asyncio
-    async def test_untrusted_model_metadata_is_not_published(self, registry, field):
+    async def test_untrusted_model_identity_is_not_published(self, registry, field):
         values = {
             "provider_id": "mock",
             "model_id": "mock-model",
@@ -847,6 +847,38 @@ class TestMarkerValuesAreConstrained:
         # not hashed, not echoed
         assert not any(a["type"] == "model.call" for a in result.actions)
         assert self.PRIVATE not in json.dumps(result.actions, ensure_ascii=False)
+
+    @mark.asyncio
+    async def test_untrusted_model_version_is_dropped_not_the_whole_marker(
+        self, registry
+    ):
+        """Provenance is worth keeping: only the unsafe version key goes away."""
+        runner = _Runner(
+            result=_agent_execution(provider_id="mock", model_version=self.PRIVATE)
+        )
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        marker = next(a for a in result.actions if a["type"] == "model.call")
+        assert marker["provider_id"] == "mock"
+        assert marker["model_id"] == "mock-model"
+        assert "model_version" not in marker
+        assert self.PRIVATE not in json.dumps(result.actions, ensure_ascii=False)
+
+    @mark.asyncio
+    async def test_an_empty_model_version_is_simply_absent(self, registry):
+        runner = _Runner(result=_agent_execution(model_version=""))
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        marker = next(a for a in result.actions if a["type"] == "model.call")
+        assert "model_version" not in marker
 
     @mark.asyncio
     async def test_internal_markers_refuse_a_private_value(self, registry):

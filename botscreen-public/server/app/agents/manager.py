@@ -654,19 +654,26 @@ class ManagerAgent:
         outside this module's trusted core. They are therefore treated as
         UNTRUSTED: a value that is not a short ASCII token is simply not
         published — never truncated, never hashed, never echoed — so the public
-        ``actions`` list cannot be used as a text channel. A run whose metadata
-        fails this check publishes no ``model.call`` marker at all.
+        ``actions`` list cannot be used as a text channel.
+
+        * provider/model id unsafe (or empty) → no ``model.call`` marker at all;
+        * only the version unsafe (or empty) → provenance is still recorded,
+          the version key is dropped.
         """
-        fields = {
-            "provider_id": execution.provider_id,
-            "model_id": execution.model_id,
-            "model_version": execution.model_version,
-        }
-        if not fields["provider_id"] or not fields["model_id"]:
+        provider_id = execution.provider_id
+        model_id = execution.model_id
+        if not provider_id or not model_id:
             return
-        if not all(is_safe_marker_value(key, value) for key, value in fields.items()):
+        if not (
+            is_safe_marker_value("provider_id", provider_id)
+            and is_safe_marker_value("model_id", model_id)
+        ):
             return
-        self._mark(actions, "model.call", **fields)
+        details: dict[str, Any] = {"provider_id": provider_id, "model_id": model_id}
+        version = execution.model_version
+        if version and is_safe_marker_value("model_version", version):
+            details["model_version"] = version
+        self._mark(actions, "model.call", **details)
 
     def _mark(
         self,
