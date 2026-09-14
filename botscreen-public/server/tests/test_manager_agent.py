@@ -15,6 +15,7 @@ Acceptance coverage (V2.3 §6.1 subset):
 """
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -32,9 +33,10 @@ from app.agents.manager import (
     Verdict,
     VerifierOutcome,
     desensitize,
+    is_safe_marker_value,
 )
 from app.agents.registry import AgentManifest, AgentRegistry
-from app.contracts.agent import AgentContext, AgentStatus, Evidence
+from app.contracts.agent import AgentContext, AgentStatus, Evidence, RiskLevel
 from app.contracts.common import Channel
 from app.contracts.errors import ErrorCode
 
@@ -88,10 +90,12 @@ class _Runner:
     def __init__(self, result=None, sleep_ms=0):
         self._result = result if result is not None else _agent_execution()
         self.calls = []
+        self.risks = []
         self.sleep_ms = sleep_ms
 
     async def __call__(self, ctx: AgentContext) -> AgentExecution:
         self.calls.append(ctx.normalized_input)
+        self.risks.append(ctx.risk_level)
         if self.sleep_ms:
             await asyncio.sleep(self.sleep_ms / 1000)
         return self._result
@@ -101,9 +105,11 @@ class _Verifier:
     def __init__(self, verdicts):
         self.verdicts = list(verdicts)
         self.seen = []
+        self.risks = []
 
     async def __call__(self, ctx, execution: AgentExecution) -> Verdict:
         self.seen.append(execution.answer_candidate)
+        self.risks.append(ctx.risk_level)
         return self.verdicts.pop(0)
 
 
@@ -673,6 +679,263 @@ class TestBudgetScopeIsHonest:
 
     def test_limits_docstring_states_the_scope(self):
         assert "POST-HOC" in (ManagerLimits.__doc__ or "")
+
+
+class TestRiskReachesTheExecutionChain:
+    """Review P1: the Manager's risk decision must reach the runner/verifier.
+
+    The marker said ``high`` while ``AgentContext.risk_level`` stayed ``low``, so
+    a downstream fast path that reads only the context saw a low-risk question.
+    """
+
+    @mark.asyncio
+    async def test_high_risk_is_written_into_the_context(self, registry):
+        runner = _Runner(result=_agent_execution())
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+            risk_rules=approved_risk_rules("剧烈"),
+        )
+        result = await m.execute(_context(), "剧烈头痛需要急诊吗")
+        risk_marker = next(a for a in result.actions if a["type"] == "manager.risk")
+        assert risk_marker["level"] == "high"
+        assert runner.risks == [RiskLevel.HIGH]  # what the routed agent saw
+        assert verifier.risks == [RiskLevel.HIGH]  # and what the verifier saw
+        assert result.status is AgentStatus.COMPLETED
+
+    @mark.asyncio
+    async def test_the_context_risk_is_the_contract_enum(self, registry):
+        """The value must be the shared contract type, not a look-alike enum."""
+        runner = _Runner(result=_agent_execution())
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+            risk_rules=approved_risk_rules("剧烈"),
+        )
+        await m.execute(_context(), "剧烈头痛需要急诊吗")
+        assert isinstance(runner.risks[0], RiskLevel)
+        assert runner.risks[0] is RiskLevel.HIGH
+
+    @mark.asyncio
+    async def test_low_risk_stays_low_and_is_not_upgraded(self, registry):
+        runner = _Runner(result=_agent_execution())
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+            risk_rules=approved_risk_rules("剧烈"),
+        )
+        result = await m.execute(_context(), "孩子近视后需要复查吗")
+        risk_marker = next(a for a in result.actions if a["type"] == "manager.risk")
+        assert risk_marker["level"] == "low"
+        assert runner.risks == [RiskLevel.LOW]
+
+    @mark.asyncio
+    async def test_a_revision_also_carries_the_risk(self, registry):
+        runner = _Runner(result=_agent_execution())
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier(
+                [Verdict(VerifierOutcome.REVISE), Verdict(VerifierOutcome.PASS)]
+            ),
+            risk_rules=approved_risk_rules("剧烈"),
+        )
+        await m.execute(_context(), "剧烈头痛需要急诊吗")
+        assert runner.risks == [RiskLevel.HIGH, RiskLevel.HIGH]
+
+
+class TestNonCompletedRunNeverDelivers:
+    """Review P1: a failed run's draft must not leak out as ``passed``."""
+
+    DRAFT = "疑似脑膜炎，请立即服用抗生素"  # a draft nobody verified
+
+    @mark.asyncio
+    async def test_failed_run_with_a_draft_delivers_nothing(self, registry):
+        runner = _Runner(
+            result=_agent_execution(answer=self.DRAFT, status=AgentStatus.FAILED)
+        )
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry, agent_runners={"qa": runner}, verifier=verifier
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.FAILED
+        assert result.answer_candidate == ""  # the draft never leaves
+        assert result.safety_status == "failed"  # and is never called "passed"
+        assert verifier.seen == []  # a failed run is not verified
+        assert any(a["type"] == "verify.not_run" for a in result.actions)
+        assert self.DRAFT not in json.dumps(result.actions, ensure_ascii=False)
+        assert self.DRAFT not in json.dumps(result.public_trace, ensure_ascii=False)
+
+    @mark.asyncio
+    async def test_cancelled_run_delivers_nothing(self, registry):
+        runner = _Runner(
+            result=_agent_execution(answer=self.DRAFT, status=AgentStatus.CANCELLED)
+        )
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.CANCELLED
+        assert result.answer_candidate == ""
+        assert result.safety_status == "failed"
+
+    @mark.asyncio
+    async def test_a_failed_revision_delivers_nothing(self, registry):
+        drafts = [
+            _agent_execution(answer="第一版草稿"),
+            _agent_execution(answer=self.DRAFT, status=AgentStatus.FAILED),
+        ]
+
+        class _TwoStep:
+            def __init__(self):
+                self.calls = []
+                self.risks = []
+
+            async def __call__(self, ctx):
+                self.calls.append(ctx.normalized_input)
+                self.risks.append(ctx.risk_level)
+                return drafts[len(self.calls) - 1]
+
+        runner = _TwoStep()
+        verifier = _Verifier([Verdict(VerifierOutcome.REVISE)])
+        m = build_manager(
+            registry=registry, agent_runners={"qa": runner}, verifier=verifier
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.FAILED
+        assert result.answer_candidate == ""
+        assert result.safety_status == "failed"
+        assert len(runner.calls) == 2  # original + the one revision
+        assert len(verifier.seen) == 1  # the failed revision is not re-verified
+        assert any(a["type"] == "verify.not_run" for a in result.actions)
+        assert self.DRAFT not in json.dumps(result.actions, ensure_ascii=False)
+
+
+class TestMarkerValuesAreConstrained:
+    """Review P1: key allowlisting alone still let text out under a good key."""
+
+    PRIVATE = "患者自述：三天前开始发热咳嗽，住址朝阳区"
+
+    @mark.parametrize("field", ["provider_id", "model_id", "model_version"])
+    @mark.asyncio
+    async def test_untrusted_model_metadata_is_not_published(self, registry, field):
+        values = {
+            "provider_id": "mock",
+            "model_id": "mock-model",
+            "model_version": "1.0.0",
+        }
+        values[field] = self.PRIVATE
+        runner = _Runner(result=_agent_execution(**values))
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        # the run itself still works and its answer is still verified...
+        assert result.status is AgentStatus.COMPLETED
+        assert result.safety_status == "verified"
+        assert result.answer_candidate != ""
+        # ...but the untrusted metadata is not published at all: not truncated,
+        # not hashed, not echoed
+        assert not any(a["type"] == "model.call" for a in result.actions)
+        assert self.PRIVATE not in json.dumps(result.actions, ensure_ascii=False)
+
+    @mark.asyncio
+    async def test_internal_markers_refuse_a_private_value(self, registry):
+        m = build_manager(registry=registry, agent_runners={})
+        with pytest.raises(ValueError):
+            m._mark([], "manager.risk", level=self.PRIVATE)
+        with pytest.raises(ValueError):
+            m._mark([], "manager.route", intent=self.PRIVATE)
+        with pytest.raises(ValueError):
+            m._mark([], "agent.done", status="patient said fever")
+        with pytest.raises(ValueError):
+            m._mark([], "route.handoff", agent_id=self.PRIVATE, handoffs=1)
+        with pytest.raises(ValueError):
+            m._mark([], "route.handoff", handoffs=10_000_000)
+        with pytest.raises(ValueError):
+            m._mark([], "route.handoff", handoffs=True)
+
+    def test_value_guard_accepts_only_tokens_and_bounded_ints(self):
+        assert is_safe_marker_value("agent_id", "qa")
+        assert is_safe_marker_value("model_id", "mock-model-1.0")
+        assert is_safe_marker_value("handoffs", 2)
+        assert not is_safe_marker_value("agent_id", self.PRIVATE)
+        assert not is_safe_marker_value("agent_id", "line\nbreak")
+        assert not is_safe_marker_value("agent_id", "a" * 65)
+        assert not is_safe_marker_value("handoffs", -1)
+        assert not is_safe_marker_value("handoffs", True)
+        assert not is_safe_marker_value("level", "medium")  # not a Manager level
+
+
+class TestRevisionCeilingIsLocked:
+    """Review: a hard revision budget must not be an amplifiable config."""
+
+    def test_revisions_cannot_be_raised(self):
+        with pytest.raises(ValueError) as exc:
+            ManagerLimits(max_revisions=3)
+        assert "max_revisions" in str(exc.value)
+
+    @mark.parametrize(
+        "kwargs",
+        [
+            {"max_handoffs": 3},
+            {"max_tool_calls": 5},
+            {"max_revisions": 2},
+            {"max_handoffs": -1},
+            {"max_input_chars": 0},
+        ],
+    )
+    def test_every_ceiling_is_enforced(self, kwargs):
+        with pytest.raises(ValueError):
+            ManagerLimits(**kwargs)
+
+    def test_defaults_are_the_v23_numbers(self):
+        limits = ManagerLimits()
+        assert (limits.max_handoffs, limits.max_tool_calls, limits.max_revisions) == (
+            2,
+            4,
+            1,
+        )
+
+    @mark.asyncio
+    async def test_revisions_can_be_tightened_to_zero(self, registry):
+        """Lowering the budget is allowed (stricter); it just forbids retries."""
+        runner = _Runner(result=_agent_execution())
+        verifier = _Verifier([Verdict(VerifierOutcome.REVISE)])
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+            limits=ManagerLimits(max_revisions=0),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.FAILED
+        assert result.answer_candidate == ""
+        assert len(runner.calls) == 1  # no retry at all
+        assert len(verifier.seen) == 1
+        assert any(a["type"] == "verify.reject_final" for a in result.actions)
+
+    @mark.asyncio
+    async def test_the_one_revision_budget_is_not_exceeded(self, registry):
+        """Even with a verifier that always says REVISE: 1 revision, 2 runs."""
+        runner = _Runner(result=_agent_execution())
+        verifier = _Verifier([Verdict(VerifierOutcome.REVISE)] * 5)
+        m = build_manager(
+            registry=registry, agent_runners={"qa": runner}, verifier=verifier
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert len(runner.calls) == 2
+        assert len(verifier.seen) == 2
+        assert result.answer_candidate == ""
 
 
 class TestCancellation:

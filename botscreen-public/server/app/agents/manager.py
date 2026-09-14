@@ -8,22 +8,32 @@ events without re-deriving semantics:
 1. guard      — context/deadline validation, input length cap, PII
                 desensitization, pre-model red-flag gate (escalate: no model,
                 no tools, no runner);
-2. route      — deterministic intent classification, then registry routing;
-                hard budgets: ≤ max_handoffs engagements, ≤ max_tool_calls
-                tool calls (reported by the executed agent), ≤ max_revisions
-                verifier-driven revisions;
+2. route      — risk decided BEFORE routing and written into the context the
+                routed agent and the verifier receive (``AgentContext.risk_level``,
+                the shared contract enum), then deterministic intent
+                classification and registry routing; hard budgets: ≤ max_handoffs
+                engagements, ≤ max_tool_calls tool calls (reported by the
+                executed agent), ≤ max_revisions verifier-driven revisions —
+                the V2.3 numbers are CEILINGS that cannot be configured upward;
 3. execute    — the routed agent runs (its own ModelGateway/ToolGateway usage
                 arrives with #53) under the remaining deadline;
 4. verify     — optional Verifier handoff (runner arrives with #54) with
                 at-most-one controlled revision when the verdict is reject;
 5. finalize   — AgentResult with evidence, safe public trace markers and the
-                actual provider/model ids for run records.
+                actual provider/model ids for run records. ONE delivery
+                predicate decides whether an answer may leave this module
+                (``_may_deliver``: the run COMPLETED *and* the verifier returned
+                PASS); every other combination — failed or cancelled run, missing
+                verdict, blocked/escalated/rejected verdict, revision that never
+                completed — delivers an empty answer.
 
 No free multi-agent chat: agents only reach models through ModelGateway and
 tools through ToolGateway; the Manager itself never calls the model for
 "thinking" — routing is rule-based and lightweight, and no chain-of-thought,
 prompt or raw input ever leaves this module except as the desensitized text
-that the routed agent is allowed to see.
+that the routed agent is allowed to see. Public trace markers are allowlisted on
+THREE axes (type, key, value — see :func:`is_safe_marker_value`), so
+sub-agent-supplied metadata that is not a safe token is simply not published.
 """
 
 from __future__ import annotations
@@ -38,7 +48,13 @@ from typing import Any, Protocol
 
 from pydantic import AwareDatetime
 
-from app.contracts.agent import AgentContext, AgentResult, AgentStatus, Evidence
+from app.contracts.agent import (
+    AgentContext,
+    AgentResult,
+    AgentStatus,
+    Evidence,
+    RiskLevel,
+)
 from app.contracts.errors import ErrorCode
 
 # PII-ish patterns removed before any model/runner sees the text. The
@@ -70,6 +86,7 @@ SAFE_MARKER_TYPES: frozenset[str] = frozenset(
         "verify.verdict",
         "verify.revise",
         "verify.missing",
+        "verify.not_run",
         "verify.blocked",
         "verify.escalated",
         "verify.reject_final",
@@ -92,6 +109,13 @@ SAFE_MARKER_KEYS: frozenset[str] = frozenset(
         "model_version",
     }
 )
+
+# VALUES are constrained too — key allowlisting alone would still let arbitrary
+# text ride out under an allowed key. A marker value is a short ASCII token or a
+# bounded integer; enumerated markers carry only their known value sets (defined
+# below, once the enums they pin exist).
+_MARKER_TOKEN = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._:@+-]{0,63}\Z")
+_MARKER_INT_MAX = 10_000
 
 
 def desensitize(text: str) -> str:
@@ -139,19 +163,16 @@ class RedFlagRules:
         return any(rule.lower() in lowered for rule in self.patterns)
 
 
-class RiskLevel(str, Enum):
-    """Question risk as decided by the Manager BEFORE routing."""
-
-    LOW = "low"
-    HIGH = "high"
-
-
 @dataclass(frozen=True)
 class RiskRules:
     """Clinically APPROVED high-risk question markers.
 
     Same fail-closed contract as :class:`RedFlagRules`: without an approved
-    marker set the Manager cannot claim a question is low risk.
+    marker set the Manager cannot claim a question is low risk. The verdict uses
+    the CONTRACT enum :class:`app.contracts.agent.RiskLevel` — the same type the
+    routed agent and the verifier read from ``AgentContext.risk_level``, so a
+    high-risk decision cannot be lost in translation between two look-alike
+    enums.
     """
 
     patterns: tuple[str, ...]
@@ -176,6 +197,12 @@ class RiskRules:
 class ManagerLimits:
     """Per-run budgets (V2.3 §6.1: ≤2 handoffs, ≤4 tools, ≤1 revision).
 
+    The V2.3 numbers are CEILINGS, not tunable defaults: this class refuses to be
+    configured above them, so a caller cannot amplify a hard safety budget
+    (``max_revisions=3`` would permit three revisions / four sub-agent executions
+    and break the "≤1 controlled revision" rule). A budget may be tightened
+    (disabled) but never raised.
+
     IMPORTANT (honest scope): the handoff budget is enforced by this module at
     call time, but ``max_tool_calls`` is a **POST-HOC check** — tool calls are
     read from the sub-agent's own report after it returns. Call-time hard
@@ -187,6 +214,17 @@ class ManagerLimits:
     max_handoffs: int = 2
     max_tool_calls: int = 4
     max_revisions: int = 1
+
+    def __post_init__(self) -> None:
+        if self.max_input_chars <= 0:
+            raise ValueError("max_input_chars must be positive")
+        ceilings = {"max_handoffs": 2, "max_tool_calls": 4, "max_revisions": 1}
+        for name, ceiling in ceilings.items():
+            value = getattr(self, name)
+            if value < 0 or value > ceiling:
+                raise ValueError(
+                    f"{name} must be within 0..{ceiling} (V2.3 hard ceiling)"
+                )
 
 
 @dataclass(frozen=True)
@@ -217,6 +255,36 @@ class VerifierOutcome(str, Enum):
     REVISE = "revise"
     BLOCK = "block"
     ESCALATE = "escalate"
+
+
+#: Enumerated marker keys may only carry their known values (value-level guard
+#: companion to :data:`SAFE_MARKER_KEYS`); all other keys accept bounded ints or
+#: short ASCII tokens (see :func:`is_safe_marker_value`).
+SAFE_MARKER_VALUE_SETS: dict[str, frozenset[str]] = {
+    "level": frozenset({RiskLevel.LOW.value, RiskLevel.HIGH.value}),
+    "outcome": frozenset(item.value for item in VerifierOutcome),
+    "status": frozenset(item.value for item in AgentStatus),
+}
+
+
+def is_safe_marker_value(key: str, value: Any) -> bool:
+    """True when ``value`` may be published under ``key`` (VALUE-level guard).
+
+    Allowlisting keys alone would still let arbitrary text ride out under an
+    allowed key (a synthetic private string in ``provider_id``, say). So values
+    are constrained too: enumerated keys are pinned to their known value sets,
+    and every other key accepts only a bounded integer or a short ASCII token.
+    Free text — CJK, whitespace, quotes, newlines, prompts, patient statements —
+    never qualifies, so a marker can carry a decision but never prose.
+    """
+    allowed = SAFE_MARKER_VALUE_SETS.get(key)
+    if allowed is not None:
+        return isinstance(value, str) and value in allowed
+    if isinstance(value, bool):  # bool is an int subclass: never a marker value
+        return False
+    if isinstance(value, int):
+        return 0 <= value <= _MARKER_INT_MAX
+    return isinstance(value, str) and _MARKER_TOKEN.match(value) is not None
 
 
 @dataclass(frozen=True)
@@ -354,6 +422,21 @@ class ManagerAgent:
 
     # -- execute ----------------------------------------------------------------
 
+    @staticmethod
+    def _may_deliver(execution: AgentExecution, verdict: Verdict | None) -> bool:
+        """THE single delivery predicate: a completed run AND an explicit PASS.
+
+        Everything else — a failed or cancelled run, a missing verdict, a
+        revision that never completed — delivers an empty answer. Keeping this
+        in one place is what makes "非 COMPLETED 或未获 PASS 时答案为空" hold for
+        the first execution and for every revision alike.
+        """
+        return (
+            execution.status is AgentStatus.COMPLETED
+            and verdict is not None
+            and verdict.outcome is VerifierOutcome.PASS
+        )
+
     async def execute(self, ctx: AgentContext, text: str) -> AgentResult:
         """Run one guarded, routed, verified turn. Returns the Manager's final
         AgentResult (safe markers only — no chain-of-thought)."""
@@ -390,7 +473,14 @@ class ManagerAgent:
             )
         self._mark(actions, "route.handoff", agent_id=agent_id, handoffs=handoffs)
 
-        sub_ctx = ctx.model_copy(deep=True, update={"normalized_input": cleaned})
+        # The declared risk travels WITH the run: the routed agent and the
+        # verifier both read it from ``AgentContext.risk_level`` (the same
+        # contract enum), so a high-risk decision cannot be downgraded silently
+        # by a downstream fast path that only inspects the context.
+        sub_ctx = ctx.model_copy(
+            deep=True,
+            update={"normalized_input": cleaned, "risk_level": risk},
+        )
         execution = await self._run_with_deadline(
             self._runners[agent_id](sub_ctx), self._remaining_ms(ctx)
         )
@@ -445,10 +535,31 @@ class ManagerAgent:
                 self._raise_if_over_budget(handoffs, execution.tool_calls)
                 evidence = list(execution.evidence)
                 self._record_model(actions, execution)
+                if execution.status is not AgentStatus.COMPLETED:
+                    # a revision that did not complete is not verifiable: stop
+                    # here and let the single delivery decision below refuse it
+                    break
                 verdict = await self._run_with_deadline(
                     self._verifier(sub_ctx, execution), self._remaining_ms(ctx)
                 )
                 self._mark(actions, "verify.verdict", outcome=verdict.outcome.value)
+
+        # ---- NOT COMPLETED: nothing was verified, nothing may be delivered ---
+        # This covers the first execution AND every revision, so a draft that
+        # never completed can never be handed out (it used to be returned with
+        # safety="passed").
+        if execution.status is not AgentStatus.COMPLETED:
+            self._mark(actions, "verify.not_run")
+            if revisions:
+                self._mark(actions, "manager.revised", count=revisions)
+            return self._finalize(
+                ctx,
+                actions,
+                evidence,
+                status=execution.status,
+                answer="",
+                safety="failed",
+            )
 
         if verdict is not None and verdict.outcome is VerifierOutcome.BLOCK:
             # BLOCK: stop now, no retry, no answer
@@ -490,24 +601,33 @@ class ManagerAgent:
                 safety="revised",
             )
 
-        # only a PASS verdict reaches this point
-        safety = (
-            "passed"
-            if execution.safety_status in ("", "unknown")
-            else execution.safety_status
-        )
-        if verdict is not None:
-            safety = "verified" if verdict.approved else safety
+        # ---- THE single delivery decision ----------------------------------
+        # The execution COMPLETED, so the only question left is the verdict: a
+        # missing or non-PASS verdict delivers NOTHING. `_may_deliver` is the one
+        # predicate that decides this, for the first execution and revisions.
+        deliverable = self._may_deliver(execution, verdict)
         if revisions:
             self._mark(actions, "manager.revised", count=revisions)
+        if not deliverable:
+            self._mark(actions, "verify.not_run")
+            return self._finalize(
+                ctx,
+                actions,
+                evidence,
+                status=AgentStatus.FAILED,
+                answer="",
+                safety="unverified",
+            )
+
+        # only COMPLETED + PASS reach this point (see _may_deliver)
         return self._finalize(
             ctx,
             actions,
             evidence,
             status=execution.status,
             answer=execution.answer_candidate,
-            safety=safety,
-            confidence=("high" if (verdict and verdict.approved) else None),
+            safety="verified",
+            confidence="high",
         )
 
     # -- helpers ---------------------------------------------------------------
@@ -528,14 +648,25 @@ class ManagerAgent:
     def _record_model(
         self, actions: list[dict[str, Any]], execution: AgentExecution
     ) -> None:
-        if execution.provider_id and execution.model_id:
-            self._mark(
-                actions,
-                "model.call",
-                provider_id=execution.provider_id,
-                model_id=execution.model_id,
-                model_version=execution.model_version,
-            )
+        """Publish provider/model provenance ONLY when it is a safe token.
+
+        These three fields come from the sub-agent's own report, i.e. from
+        outside this module's trusted core. They are therefore treated as
+        UNTRUSTED: a value that is not a short ASCII token is simply not
+        published — never truncated, never hashed, never echoed — so the public
+        ``actions`` list cannot be used as a text channel. A run whose metadata
+        fails this check publishes no ``model.call`` marker at all.
+        """
+        fields = {
+            "provider_id": execution.provider_id,
+            "model_id": execution.model_id,
+            "model_version": execution.model_version,
+        }
+        if not fields["provider_id"] or not fields["model_id"]:
+            return
+        if not all(is_safe_marker_value(key, value) for key, value in fields.items()):
+            return
+        self._mark(actions, "model.call", **fields)
 
     def _mark(
         self,
@@ -543,16 +674,26 @@ class ManagerAgent:
         marker: str,
         **details: Any,
     ) -> None:
-        """Append one SAFE public trace marker (allowlisted on both axes).
+        """Append one SAFE public trace marker (allowlisted on all three axes).
 
-        An unknown marker name or key is a programming error: the run fails
-        loudly rather than publishing something the allowlist did not sanction.
+        Marker TYPE, KEY and VALUE are each constrained: an unknown marker name,
+        an unknown key, or a value that is not a bounded integer / short ASCII
+        token (or not in an enumerated key's value set) is a programming error
+        and fails the run loudly rather than publishing something the allowlist
+        did not sanction.
         """
         if marker not in SAFE_MARKER_TYPES:
             raise ValueError(f"unknown marker type {marker!r}")
         unknown = set(details) - SAFE_MARKER_KEYS
         if unknown:
             raise ValueError(f"unsafe marker keys for {marker!r}: {sorted(unknown)}")
+        unsafe = sorted(
+            key
+            for key, value in details.items()
+            if not is_safe_marker_value(key, value)
+        )
+        if unsafe:
+            raise ValueError(f"unsafe marker values for {marker!r}: {unsafe}")
         entry: dict[str, Any] = {"type": marker}
         entry.update(details)
         actions.append(entry)
