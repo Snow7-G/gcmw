@@ -60,6 +60,9 @@ class FakeTools:
         """Same surface as the #57 ToolGateway: (trusted context, request)."""
         self.contexts.append(context)
         self.calls.append(request)
+        before = getattr(self, "before_call", None)
+        if before is not None:
+            before(request)  # lets a test mutate state mid-run (TOCTOU)
         if request.tool_name == "knowledge.search":
             if not self.search_ok:
                 return _result(ok=False)
@@ -72,11 +75,15 @@ class FakeTools:
                             "source_type": "faq",
                             "title": it["title"],
                             "snippet": it["content"][:240],
-                            "content_hash": f"hash-{it['source_id']}",
+                            "content_hash": ""
+                            if getattr(self, "blank_provenance", False)
+                            else f"hash-{it['source_id']}",
                             "source_uri": f"kbase://{it['source_id']}",
                             "medical_domain": "general",
                             "audience": "public",
-                            "knowledge_version": f"{it['source_id']}-v1",
+                            "knowledge_version": ""
+                            if getattr(self, "blank_provenance", False)
+                            else f"{it['source_id']}-v1",
                         }
                         for it in self.items
                     ],
@@ -87,6 +94,8 @@ class FakeTools:
             source_id = request.arguments["source_id"]
             if source_id not in self.fragments:
                 return _result(ok=False)
+            if hasattr(self, "fragment_ok"):  # test-controlled response
+                return _result(ok=self.fragment_ok, data=self.fragment_data)
             return _result(
                 ok=True,
                 data={
@@ -203,15 +212,19 @@ class TestEvidenceGrounding:
         assert result.answer_candidate == ""
 
     @mark.asyncio
-    async def test_fragment_miss_falls_back_to_snippet(self):
+    async def test_fragment_miss_is_dropped_not_filled_from_the_snippet(self):
+        """Review P1: an unverifiable read must NOT be replaced by the snippet."""
         tools = FakeTools(
             items=[{"source_id": "only", "title": "唯一", "content": "片段文本A"}],
-            fragments={},  # fragment lookup misses
+            fragments={},  # the fragment read fails
         )
-        models = FakeModels(content="ok")
+        models = FakeModels()
+        models.raise_on_call = True  # no evidence -> the model is never asked
         result = await _agent(tools, models).run(_context())
-        assert result.evidence[0].content == "片段文本A"  # snippet fallback
-        assert result.answer_candidate == "ok"
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "no_evidence"
+        assert result.evidence == ()
+        assert result.answer_candidate == ""
 
     @mark.asyncio
     async def test_tool_budget_caps_fragment_reads(self):
@@ -229,6 +242,103 @@ class TestEvidenceGrounding:
         assert result.tool_calls <= 2
         assert len(result.evidence) == 1
         assert result.answer_candidate == "ok"
+
+
+class TestFragmentReadIsVerified:
+    """Review P1: content and citation version may never disagree.
+
+    The fragment response must agree with the search hit on source_id /
+    knowledge_version / content_hash and carry a real first fragment; anything
+    else drops the candidate (no snippet fallback). When every candidate is
+    dropped the run fails with no_evidence and the model is never called.
+    """
+
+    ITEM: ClassVar[dict[str, str]] = {
+        "source_id": "faq-fever",
+        "title": "发热指南",
+        "content": "合成正文",
+    }
+
+    @staticmethod
+    def _tools(data=None, ok=True, fragments=None, **overrides):
+        tools = FakeTools(
+            items=[dict(TestFragmentReadIsVerified.ITEM)],
+            fragments=fragments if fragments is not None else {"faq-fever": "合成片段"},
+        )
+        tools.fragment_override = (ok, data, overrides)
+        return tools
+
+    @mark.parametrize(
+        ("label", "ok", "patch"),
+        [
+            ("ok=false", False, {}),
+            ("empty text", True, {"text": ""}),
+            ("whitespace text", True, {"text": "   "}),
+            ("text not a string", True, {"text": {"a": 1}}),
+            ("source_id mismatch", True, {"source_id": "other"}),
+            ("version mismatch", True, {"knowledge_version": "faq-fever-v2"}),
+            ("hash mismatch", True, {"content_hash": "hash-other"}),
+            ("empty version", True, {"knowledge_version": ""}),
+            ("empty hash", True, {"content_hash": ""}),
+            ("fragment_index 1", True, {"fragment_index": 1}),
+            ("total_fragments 0", True, {"total_fragments": 0}),
+            ("total_fragments missing", True, {"total_fragments": None}),
+            ("data missing", True, "NO_DATA"),
+        ],
+    )
+    @mark.asyncio
+    async def test_an_unverifiable_read_is_dropped(self, label, ok, patch):
+        tools = FakeTools(items=[dict(self.ITEM)], fragments={"faq-fever": "合成片段"})
+        tools.fragment_ok = ok
+        if patch == "NO_DATA":
+            tools.fragment_data = None
+        else:
+            tools.fragment_data = {
+                "source_id": "faq-fever",
+                "knowledge_version": "faq-fever-v1",
+                "content_hash": "hash-faq-fever",
+                "fragment_index": 0,
+                "total_fragments": 1,
+                "text": "合成片段正文",
+                **patch,
+            }
+        models = FakeModels()
+        models.raise_on_call = True  # no verified evidence -> no model call
+        result = await _agent(tools, models).run(_context())
+        assert result.status is AgentStatus.FAILED, label
+        assert result.safety_status == "no_evidence", label
+        assert result.evidence == (), label
+        assert result.answer_candidate == "", label
+
+    @mark.asyncio
+    async def test_a_matching_read_still_answers_with_field_by_field_citations(self):
+        tools = FakeTools(
+            items=[dict(self.ITEM)], fragments={"faq-fever": "合成片段正文"}
+        )
+        models = FakeModels(content="建议门诊就诊 [资料1]")
+        result = await _agent(tools, models).run(_context())
+        assert result.safety_status == "grounded"
+        evidence = result.evidence[0]
+        assert evidence.source_id == "faq-fever"
+        assert evidence.knowledge_version == "faq-fever-v1"
+        assert evidence.content_hash == "hash-faq-fever"
+        assert evidence.content == "合成片段正文"
+        assert result.answer_candidate == "建议门诊就诊 [资料1]"
+        # the grounding prompt carries the same verified text
+        assert "合成片段正文" in models.calls[0].messages[0]["content"]
+
+    @mark.asyncio
+    async def test_a_hit_without_provenance_is_never_used(self):
+        """No version/hash on the hit = nothing to verify the read against."""
+        tools = FakeTools(
+            items=[dict(self.ITEM)], fragments={"faq-fever": "合成片段正文"}
+        )
+        tools.blank_provenance = True  # search returns "" version and hash
+        models = FakeModels()
+        models.raise_on_call = True
+        result = await _agent(tools, models).run(_context())
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "no_evidence"
 
 
 class TestIdentityNeverTravelsAsAnArgument:
@@ -501,6 +611,84 @@ class TestRealStoreIntegration:
         assert after.status is AgentStatus.FAILED
         assert after.safety_status == "no_evidence"
         assert after.answer_candidate == ""
+
+    @mark.asyncio
+    async def test_a_version_swap_between_search_and_read_yields_no_answer(self):
+        """Review P1 (TOCTOU): v1 found, then revoked and replaced by v2.
+
+        The fragment read returns v2's text with v2's provenance, which cannot be
+        reconciled with the v1 hit — so the candidate is dropped instead of
+        delivering v2 text under a v1 citation.
+        """
+        from app.contracts.knowledge import RevocationDecision
+
+        store, tools, _models, _ = _store_harness()
+        _publish(store, "faq-fever", content="v1 合成正文：成人发热三天就诊")
+        context = TenantContext(tenant_id="t1")
+
+        def swap_version(request) -> None:
+            """Mutate the store between the search and the fragment read."""
+            if request.tool_name != "knowledge.get_fragment":
+                return
+            store.revoke(
+                context,
+                "faq-fever",
+                RevocationDecision(actor="dr-li", reason="版本更新，撤回旧版"),
+            )
+            _publish(store, "faq-fever", content="v2 合成正文：儿童发热两天就诊")
+
+        original = tools.ainvoke
+
+        async def wrapped(ctx, request, **kwargs):
+            swap_version(request)
+            return await original(ctx, request, **kwargs)
+
+        tools.ainvoke = wrapped  # type: ignore[method-assign]
+
+        class _NoModel:
+            async def chat(self, request):  # pragma: no cover - must not run
+                raise AssertionError("model must not be called without evidence")
+
+        agent = MedicalQAAgent(models=_NoModel(), tools=tools)
+        result = await agent.run(_context("发热怎么办"))
+
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "no_evidence"
+        assert result.evidence == ()
+        assert result.answer_candidate == ""
+        # v2 was published: the version really did change under the run
+        assert store.get(context, "faq-fever").knowledge_version == "faq-fever-v2"
+
+    @mark.asyncio
+    async def test_a_revocation_without_a_new_version_yields_no_answer(self):
+        from app.contracts.knowledge import RevocationDecision
+
+        store, tools, _models, _ = _store_harness()
+        _publish(store, "faq-fever")
+        context = TenantContext(tenant_id="t1")
+
+        async def revoke_before_read(ctx, request, **kwargs):
+            if request.tool_name == "knowledge.get_fragment":
+                store.revoke(
+                    context,
+                    "faq-fever",
+                    RevocationDecision(actor="dr-li", reason="内容过期，先下架"),
+                )
+            return await original_ainvoke(ctx, request, **kwargs)
+
+        original_ainvoke = tools.ainvoke
+        tools.ainvoke = revoke_before_read  # type: ignore[method-assign]
+
+        # a ModelGateway that must never be called: no verified evidence remains
+        class _NoModel:
+            async def chat(self, request):  # pragma: no cover - must not run
+                raise AssertionError("model must not be called without evidence")
+
+        agent = MedicalQAAgent(models=_NoModel(), tools=tools)
+        result = await agent.run(_context("发热怎么办"))
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "no_evidence"
+        assert result.answer_candidate == ""
 
     def test_the_tool_schemas_expose_no_identity_properties(self):
         from app.tools.specs import TOOL_INPUT_SCHEMAS

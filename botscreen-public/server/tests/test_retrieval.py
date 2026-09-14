@@ -8,6 +8,8 @@ receives exactly that context, and the same ``source_id`` in another tenant is
 invisible.
 """
 
+from typing import ClassVar
+
 import pytest
 
 from app.contracts.common import TenantContext
@@ -103,6 +105,56 @@ class TestRanking:
 
     def test_empty_query_returns_empty(self):
         assert rank_items(_FAQ, "  ") == []
+
+
+class TestRelevanceGate:
+    """Review P1: one shared CJK character is not evidence.
+
+    Candidacy needs a CJK bigram, an ASCII/numeric token or the normalized
+    phrase; a lone CJK character may only contribute to the score.
+    """
+
+    _EYE: ClassVar[list] = [
+        _Item("eye-pain", "眼痛就诊指南", "眼痛伴视力下降请及时到眼科就诊。"),
+    ]
+
+    def test_a_single_shared_character_is_not_a_match(self):
+        svc = _service(self._EYE)
+        assert svc.search("腹痛怎么办", context=T1) == []
+
+    def test_a_single_character_query_is_refused_by_default(self):
+        svc = _service(self._EYE)
+        assert svc.search("痛", context=T1) == []  # fail closed
+        assert svc.search("眼", context=T1) == []
+
+    def test_a_shared_bigram_still_matches(self):
+        svc = _service(self._EYE)
+        assert [h.source_id for h in svc.search("眼痛怎么办", context=T1)] == [
+            "eye-pain"
+        ]
+
+    def test_a_natural_question_matches_a_title_term(self):
+        svc = _service(_FAQ)
+        assert [h.source_id for h in svc.search("发热怎么办", context=T1)] == [
+            "faq-fever"
+        ]
+
+    def test_ascii_substring_recall_is_preserved(self):
+        """#57 relies on a short ASCII token finding a long unbroken run."""
+        items = [_Item("long", "标题", "x" * 400)]
+        hits = _service(items).search("x", context=T1)
+        assert [h.source_id for h in hits] == ["long"]
+
+    def test_a_single_character_never_decides_candidacy_but_still_scores(self):
+        """Two eligible docs: the one also sharing the lone character ranks first."""
+        items = [
+            _Item("with-char", "标题", "发热 痛 处理"),
+            _Item("without", "标题", "发热 处理"),
+        ]
+        ranked = rank_items(items, "痛 发热")
+        assert next(item.source_id for _, _, item in ranked) == "with-char"
+        # …and with no eligible token at all, the character alone proves nothing
+        assert rank_items(items, "痛") == []
 
 
 class TestSearchCascade:

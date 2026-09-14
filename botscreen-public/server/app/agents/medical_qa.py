@@ -12,10 +12,13 @@ Hard rules (V2.3 §6.2/§7):
   the run (``status=FAILED``, ``safety="no_evidence"``, empty answer) — it never
   invents content from a model call without approved evidence, and the model is
   not even asked;
-- citations are carried on the evidence itself: every delivered
-  :class:`~app.contracts.agent.Evidence` carries the ``source_id`` /
+- citations are carried on the evidence itself AND verified at read time: every
+  delivered :class:`~app.contracts.agent.Evidence` carries the ``source_id`` /
   ``knowledge_version`` / ``content_hash`` of the approved production record it
-  came from, so a citation can be verified against the store;
+  came from, and the fragment response must agree with the search hit on all
+  three (plus a real ``fragment_index == 0`` and ``total_fragments >= 1``); a
+  failed, malformed or mismatched read is DISCARDED — never downgraded to the
+  search snippet — so text and provenance can never disagree;
 - tenancy comes from the trusted ToolGateway context only: the agent never sends
   a tenant/session/reviewer argument (those are not in the tool schema at all —
   ``additionalProperties: false``), so it cannot ask for another tenant's data;
@@ -39,8 +42,10 @@ from typing import Any, Protocol
 
 from app.agents.manager import AgentExecution
 from app.contracts.agent import AgentContext, AgentStatus, Evidence, ToolRequest
+from app.contracts.errors import ErrorCode
 from app.contracts.model import ModelRequest
 from app.rag.retrieval import RetrievalHit
+from app.tools.gateway import ToolGatewayError
 
 _GROUNDED_HEADER = (
     "请仅依据下方已审核资料作答，不得引用资料外信息；"
@@ -153,23 +158,69 @@ class MedicalQAAgent:
             )
         return hits
 
-    async def _fragment(
+    async def _read_fragment(
         self, ctx: AgentContext, hit: RetrievalHit, budget: dict[str, int]
-    ) -> str:
-        result = await self._tools.ainvoke(
-            ctx,
-            ToolRequest(
-                tool_name="knowledge.get_fragment",
-                arguments={"source_id": hit.source_id},
-            ),
-            allowed_tools=self._allowed_tools,
-            agent_id=self._agent_id,
-        )
+    ) -> Evidence | None:
+        """Read one fragment and build a citation ONLY from a verified response.
+
+        The search hit is a snapshot taken moments ago; between the two calls the
+        record can be revoked, superseded or re-approved (TOCTOU), so the
+        fragment answer must AGREE with the hit on ``source_id``,
+        ``knowledge_version`` and ``content_hash`` — otherwise a delivered
+        citation would pair one version's text with another version's
+        provenance.
+
+        There is deliberately NO fallback to the search snippet: a citation that
+        cannot be tied to the exact version it came from is worse than refusing
+        to answer. Every unusable response (``ok`` false, malformed payload,
+        empty text, index/total out of range, empty hit metadata, any mismatch)
+        discards this candidate; if nothing survives the run fails with
+        ``no_evidence`` and the model is never called.
+        """
+        if not hit.knowledge_version or not hit.content_hash:
+            return None  # no provenance to verify the read against
+        try:
+            result = await self._tools.ainvoke(
+                ctx,
+                ToolRequest(
+                    tool_name="knowledge.get_fragment",
+                    arguments={"source_id": hit.source_id, "fragment_index": 0},
+                ),
+                allowed_tools=self._allowed_tools,
+                agent_id=self._agent_id,
+            )
+        except ToolGatewayError as exc:
+            # the round-trip still happened and was audited, so it counts
+            budget["calls"] += 1
+            if exc.code is ErrorCode.NOT_FOUND_KNOWLEDGE:
+                # the record left production (revoked/superseded) between the
+                # search and this read: drop the candidate, do not answer
+                return None
+            # any other gateway fault is a real fault: surface it loudly
+            raise
         budget["calls"] += 1
-        if not result.ok:
-            return hit.snippet
-        data = result.data or {}
-        return data.get("text") or hit.snippet
+        if not getattr(result, "ok", False):
+            return None
+        data = getattr(result, "data", None)
+        if not isinstance(data, dict):
+            return None
+        text = data.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if data.get("source_id") != hit.source_id:
+            return None
+        if data.get("knowledge_version") != hit.knowledge_version:
+            return None
+        if data.get("content_hash") != hit.content_hash:
+            return None
+        if data.get("fragment_index") != 0:
+            return None
+        total = data.get("total_fragments")
+        if isinstance(total, bool) or not isinstance(total, int) or total < 1:
+            return None
+        # metadata is verified EQUAL to the hit, so the hit's citation fields are
+        # the provenance of exactly this text
+        return _evidence_from(hit, text)
 
     # -- main entry -------------------------------------------------------------
 
@@ -216,11 +267,13 @@ class MedicalQAAgent:
         for hit in hits[: self._max_fragments]:
             if budget["calls"] >= self._max_tool_calls:
                 break
-            text = await self._fragment(context, hit, budget)
-            evidence.append(_evidence_from(hit, text))
+            verified = await self._read_fragment(context, hit, budget)
+            if verified is None:
+                continue  # unusable/unverifiable read: this candidate is dropped
+            evidence.append(verified)
             grounded.append(
                 f"[{len(grounded) + 1}] {hit.title}"
-                f"（来源 {hit.source_id} / {hit.knowledge_version}）\n{text}"
+                f"（来源 {hit.source_id} / {hit.knowledge_version}）\n{verified.content}"
             )
 
         tool_calls = budget["calls"]

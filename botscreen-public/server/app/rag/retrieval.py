@@ -8,6 +8,12 @@ Cascade implemented in v1 (V2.3 §6.2 subset):
 4. lightweight rerank   — title hits and phrase containment boost, stable
                           insertion-order tie-break.
 
+CANDIDACY is gated by relevance, not by scoring: a document enters the result
+set only when a CJK bigram, an ASCII/numeric token or the normalized phrase
+matches. A single shared CJK character ("痛" in 腹痛 vs 眼痛) may contribute to
+the score but can never justify calling the record evidence, so an unrelated
+approved item cannot produce a "grounded" answer.
+
 Only the *production view* of a knowledge source may be queried — the source is
 any object exposing ``production_items(context) -> list`` of items with
 ``source_id/title/content/...`` attributes (the #56 KnowledgeStore satisfies this
@@ -47,6 +53,21 @@ def _attr(item: Any, name: str, default: Any = "") -> Any:
 
 def _is_cjk(ch: str) -> bool:
     return 0x4E00 <= ord(ch) <= 0x9FFF
+
+
+def _token_class(token: str) -> str:
+    """What a matched token is allowed to PROVE.
+
+    ``cjk1`` — a single CJK character. It may contribute to the score but can
+    never make a document a candidate on its own: one shared common character
+    ("痛" in 腹痛 vs 眼痛) would otherwise turn an unrelated approved record into
+    "evidence". ``cjk`` — a CJK bigram or longer. ``word`` — an ASCII/numeric
+    token (any length: #57's substring recall relies on short tokens finding long
+    unbroken runs).
+    """
+    if all(_is_cjk(ch) for ch in token):
+        return "cjk1" if len(token) == 1 else "cjk"
+    return "word"
 
 
 def tokenize(text: str) -> list[str]:
@@ -132,24 +153,29 @@ def rank_items(items: list[Any], query: str) -> list[tuple[int, int, Any]]:
         title_tokens = set(tokenize(_attr(item, "title")))
         document = _document(item)
         score = 0
-        matched_any = False
+        # CANDIDACY (relevance gate) is separate from SCORING: a hit must be
+        # proven by a CJK bigram, an ASCII/numeric token, or the normalized
+        # phrase — never by a lone CJK character.
+        eligible = False
         for token in query_tokens:
             # recall is TOKEN-set membership or plain substring containment: a
             # long unbroken run ("xxxx…") is one ASCII token, so a short query
             # token must still be able to find it inside the text
             if token not in tokens and token not in document:
                 continue
-            matched_any = True
+            if _token_class(token) != "cjk1":
+                eligible = True
             idf = math.log(1 + total / (1 + frequencies.get(token, 0)))
             score += idf
             if token in title_tokens:
                 score += 2 * idf  # lightweight rerank: title hits weigh more
-        if not matched_any:
-            continue
-        if norm_query and norm_query in normalize_text(_document(item)):
+        if len(norm_query) >= 2 and norm_query in document:
+            eligible = True
             score += 10  # phrase containment boost
         if norm_query and norm_query == normalize_text(_attr(item, "content")):
             score += 5  # FAQ exact-match cascade stage
+        if not eligible:
+            continue
         scored.append((-score, index, item))
     return sorted(scored)
 
