@@ -201,18 +201,18 @@ class _RunnerFuture:
 
 
 class _ToolFault(Exception):
-    """Executor/output-gate failure carrying its audit label, code and message.
+    """Internal fault marker: a FIXED audit label plus a stable ErrorCode.
 
-    ``message`` is always a STABLE, caller-safe text: internal exception text
-    (which may embed provider payloads, paths or model output) is never placed
-    inside the error object a caller may log.
+    It deliberately stores NO message, NO schema path and NO executor text: it
+    lives only long enough for the awaiting path to decide, and is dropped
+    before the public error is raised, so nothing it saw can be reached later
+    through ``__context__`` or any attribute.
     """
 
-    def __init__(self, label: str, code: ErrorCode, message: str) -> None:
+    def __init__(self, label: str, code: ErrorCode) -> None:
         super().__init__(label)
         self.label = label
         self.code = code
-        self.message = message
 
 
 @dataclass
@@ -488,24 +488,17 @@ class ToolGateway:
             # NEVER trust executor-provided text — not even from a builtin: the
             # boundary keeps the CODE and the registry's audited message only, so
             # an error embedding model input can never reach a caller's log
-            raise _ToolFault(
-                "executor:" + exc.code.value, exc.code, lookup(exc.code).message
-            ) from None
+            raise _ToolFault("executor:" + exc.code.value, exc.code) from None
         except Exception:  # noqa: BLE001 - executor internals NEVER leak
             # the exception text may carry provider payloads/paths/model output:
             # only the code and a fixed sentence reach the caller
-            raise _ToolFault(
-                "executor:internal",
-                ErrorCode.INTERNAL_UNKNOWN,
-                f"tool {prepared.tool_name!r} failed internally",
-            ) from None
+            raise _ToolFault("executor:internal", ErrorCode.INTERNAL_UNKNOWN) from None
 
         violations = validate(prepared.spec.output_schema, payload)
         if violations:
             raise _ToolFault(
                 f"rejected:output_schema:{_violation_kinds(violations)}",
                 ErrorCode.TOOL_SCHEMA_REJECTED,
-                f"output schema violations at {', '.join(violations)}",
             )
         try:
             encoded = json.dumps(
@@ -513,17 +506,13 @@ class ToolGateway:
             )
         except (TypeError, ValueError):
             raise _ToolFault(
-                "rejected:output_json",
-                ErrorCode.TOOL_SCHEMA_REJECTED,
-                f"tool {prepared.tool_name!r} returned non-JSON data",
+                "rejected:output_json", ErrorCode.TOOL_SCHEMA_REJECTED
             ) from None
         size_bytes = len(encoded.encode("utf-8"))
         cap = prepared.spec.max_result_bytes or self._default_max_result_bytes
         if size_bytes > cap:
             raise _ToolFault(
-                f"rejected:result_bytes={size_bytes}",
-                ErrorCode.TOOL_OVER_LIMIT,
-                f"tool {prepared.tool_name!r} result exceeded {cap} bytes",
+                f"rejected:result_bytes={size_bytes}", ErrorCode.TOOL_OVER_LIMIT
             )
         prepared.size_bytes = size_bytes
         return payload
@@ -556,7 +545,7 @@ class ToolGateway:
 
     def _finalize_failure(self, prepared: _Prepared, fault: _ToolFault) -> None:
         prepared.audit(result=fault.label, code=fault.code)
-        raise ToolGatewayError(fault.code, fault.message)
+        raise ToolGatewayError(fault.code)
 
     def _finalize_cancelled(self, prepared: _Prepared) -> None:
         """The CALLER cancelled: one terminal record, then cancel propagates.
@@ -591,19 +580,16 @@ class ToolGateway:
             state=_state if _state is not None else _CallState(),
         )
         future = self._submit(prepared, context, allow_injected=True)
+        fault: _ToolFault | None = None
+        payload: Any = None
         try:
             payload = future.result(timeout=prepared.timeout_s)
         except concurrent.futures.TimeoutError:
             future.cancel()  # stops a QUEUED task; a running thread finishes
-            self._finalize_failure(
-                prepared,
-                _ToolFault(
-                    "rejected:timeout",
-                    ErrorCode.TOOL_TIMEOUT,
-                    f"tool {prepared.tool_name!r} timed out",
-                ),
-            )
-        except _ToolFault as fault:
+            fault = _ToolFault("rejected:timeout", ErrorCode.TOOL_TIMEOUT)
+        except _ToolFault as exc:
+            fault = exc
+        if fault is not None:  # raised OUTSIDE the except: no __context__
             self._finalize_failure(prepared, fault)
         return self._finalize_success(prepared, payload)
 
@@ -641,23 +627,22 @@ class ToolGateway:
             budget = min(budget, caller_budget)
         future = self._submit(prepared, context, allow_injected=False)
         wrapped = asyncio.wrap_future(future, loop=asyncio.get_running_loop())
+        fault: _ToolFault | None = None
+        payload: Any = None
         try:
             payload = await asyncio.wait_for(wrapped, timeout=budget)
         except asyncio.CancelledError:
+            # the abandoned worker must not append a "success" record later
             future.cancel()
-            self._finalize_cancelled(prepared)
+            prepared.audit(result="cancelled")
             raise
         except TimeoutError:
-            future.cancel()
-            self._finalize_failure(
-                prepared,
-                _ToolFault(
-                    f"rejected:async_timeout={budget:g}s",
-                    ErrorCode.TOOL_TIMEOUT,
-                    f"tool {prepared.tool_name!r} exceeded the async budget",
-                ),
+            fault = _ToolFault(
+                f"rejected:async_timeout={budget:g}s", ErrorCode.TOOL_TIMEOUT
             )
-        except _ToolFault as fault:
+        except _ToolFault as exc:
+            fault = exc
+        if fault is not None:  # raised OUTSIDE the except: no __context__
             self._finalize_failure(prepared, fault)
         return self._finalize_success(prepared, payload)
 

@@ -1336,6 +1336,172 @@ class TestAuditNeverCarriesUntrustedText:
         assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
 
 
+class TestNoInternalExceptionIsReachable:
+    """Review P1: the PUBLIC error must not carry a chain to internals."""
+
+    SENTINEL = "SYNTHETIC-CHAIN-PRIVATE-VALUE"
+
+    @staticmethod
+    def _reachable(exc: BaseException) -> str:
+        """Everything a curious caller can read from the error object."""
+        blobs: list[str] = [str(exc), repr(exc), str(vars(exc))]
+        seen: set[int] = set()
+        node: BaseException | None = exc
+        while node is not None and id(node) not in seen:
+            seen.add(id(node))
+            blobs += [type(node).__name__, str(node), repr(node), str(vars(node))]
+            blobs.append(str(getattr(node, "message", "")))
+            node = node.__context__ or node.__cause__
+        return "\n".join(blobs)
+
+    def _assert_chain_clean(self, exc: pytest.ExceptionInfo, sink: _Sink):
+        assert exc.value.__context__ is None
+        assert exc.value.__cause__ is None
+        assert self.SENTINEL not in self._reachable(exc.value)
+        assert all(self.SENTINEL not in str(r) for r in sink.records)
+        envelope = ErrorEnvelope.build(
+            code=exc.value.code, request_id="r", trace_id="t"
+        )
+        assert self.SENTINEL not in envelope.model_dump_json()
+
+    def _strict_output_gateway(self, sink, executor):
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(
+            canonical_spec(
+                "knowledge.search",
+                output_schema={
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                    "required": ["items"],
+                    "additionalProperties": False,
+                },
+                executor=executor,
+            )
+        )
+        return gw
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_invalid_output_key_never_appears_in_the_chain(self, runner):
+        import asyncio
+
+        sink = _Sink()
+        gw = self._strict_output_gateway(sink, lambda _c, _a: {self.SENTINEL: "v"})
+        request = _request("knowledge.search", {"query": "x"})
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(
+                    TENANT, request, allowed_tools=["knowledge.search"], agent_id="a"
+                )
+            else:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        request,
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+        self._assert_chain_clean(exc, sink)
+        assert sink.records[-1].result.startswith("rejected:output_schema:")
+        gw.shutdown()
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_executor_exception_never_appears_in_the_chain(self, runner):
+        import asyncio
+
+        sink = _Sink()
+
+        def exploding(_context, args):
+            raise RuntimeError(self.SENTINEL)
+
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(canonical_spec("knowledge.search", executor=exploding))
+        request = _request("knowledge.search", {"query": "x"})
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(
+                    TENANT, request, allowed_tools=["knowledge.search"], agent_id="a"
+                )
+            else:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        request,
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+        assert exc.value.code is ErrorCode.INTERNAL_UNKNOWN
+        self._assert_chain_clean(exc, sink)
+        assert sink.records[-1].result == "executor:internal"
+        gw.shutdown()
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_coded_executor_error_never_appears_in_the_chain(self, runner):
+        import asyncio
+
+        sink = _Sink()
+
+        def exploding(_context, args):
+            raise ToolGatewayError(ErrorCode.NOT_FOUND_KNOWLEDGE, self.SENTINEL)
+
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(canonical_spec("knowledge.search", executor=exploding))
+        request = _request("knowledge.search", {"query": "x"})
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(
+                    TENANT, request, allowed_tools=["knowledge.search"], agent_id="a"
+                )
+            else:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        request,
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+        assert exc.value.code is ErrorCode.NOT_FOUND_KNOWLEDGE
+        self._assert_chain_clean(exc, sink)
+        gw.shutdown()
+
+    def test_timeout_paths_have_no_context_either(self):
+        import asyncio
+
+        release = threading.Event()
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=_Sink(), default_timeout_ms=50)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        try:
+            with pytest.raises(ToolGatewayError) as sync_exc:
+                gw.invoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "x"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                )
+            assert sync_exc.value.__context__ is None
+            with pytest.raises(ToolGatewayError) as async_exc:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "x"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+            assert async_exc.value.__context__ is None
+        finally:
+            release.set()
+            gw.shutdown()
+
+
 class TestColonBearingKeysNeverLeakThroughDiagnostics:
     """Review P1: a key containing ": " must not smuggle text anywhere."""
 
