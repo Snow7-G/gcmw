@@ -9,10 +9,11 @@ Acceptance coverage:
 - arguments and results never leak into audit records verbatim.
 """
 
+import hashlib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -396,9 +397,8 @@ class TestDomainAndSuccessPaths:
             },
         )
         result = _call(gw, "department.search", {"query": "呼吸"})
-        assert result.data["items"] == [
-            {"tenant_id": "t1", "name": "呼吸内科", "location": "1号楼"}
-        ]
+        # projected through the FIELD WHITELIST: no tenant_id, no extra columns
+        assert result.data["items"] == [{"name": "呼吸内科", "location": "1号楼"}]
         # tenant isolation follows the INJECTED context, never the arguments
         result = _call(gw, "department.search", {"query": "内科"}, context=OTHER_TENANT)
         assert [i["name"] for i in result.data["items"]] == ["心内科"]
@@ -408,16 +408,21 @@ class TestDomainAndSuccessPaths:
 
     def test_memory_read_short_with_reader(self):
         sink = _Sink()
-        seen: list[str | None] = []
+        seen: list[Any] = []
 
-        def reader(session_id):
-            seen.append(session_id)
+        def reader(key):
+            seen.append(key)
             return "摘要A"
 
         gw = build_gateway(audit_sink=sink, memory_reader=reader)
         result = _call(gw, "memory.read_short", {}, context=SESSION)
         assert result.data == {"summary": "摘要A", "available": True}
-        assert seen == ["sess-1"]  # the session came from the trusted context
+        assert len(seen) == 1
+        assert (seen[0].tenant_id, seen[0].device_id, seen[0].session_id) == (
+            "t1",
+            "d1",
+            "sess-1",
+        )
         with pytest.raises(ToolGatewayError) as exc:
             _call(gw, "memory.read_short", {"session_id": "other"})
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
@@ -433,10 +438,16 @@ class TestDomainAndSuccessPaths:
         result = _call(gw, "memory.read_short", {}, context=SESSION)
         assert result.data == {"summary": "", "available": False}
 
-    def test_memory_read_short_without_context_session_is_empty(self):
-        gw = build_gateway(audit_sink=_Sink(), memory_reader=lambda _sid: "泄漏")
-        result = _call(gw, "memory.read_short", {}, context=TENANT)
-        assert result.data == {"summary": "", "available": False}
+    def test_memory_read_short_without_device_and_session_is_refused(self):
+        """A tenant-only context cannot form the memory key: nothing is read."""
+        called: list[Any] = []
+        gw = build_gateway(
+            audit_sink=_Sink(), memory_reader=lambda key: called.append(key) or "泄漏"
+        )
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "memory.read_short", {}, context=TENANT)
+        assert exc.value.code is ErrorCode.AUTHZ_FORBIDDEN
+        assert called == []
 
     def test_success_audit_never_echoes_results(self, gateway):
         result = _call(gateway, "knowledge.search", {"query": "发热"})
@@ -745,6 +756,257 @@ class TestAsyncEntryPoint:
                 )
             )
         assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+
+
+class TestDirectoryIsolationAndProjection:
+    """Review P1: no adopted records, no private fields, no nested smuggling."""
+
+    RECORDS: ClassVar[dict] = {
+        "department": [
+            {
+                "tenant_id": "t1",
+                "name": "呼吸内科",
+                "location": "1号楼",
+                "internal_note": "主任手机 13800000000",
+            },
+            {"tenant_id": "t2", "name": "心内科", "location": "2号楼"},
+            {"name": "无租户科室", "location": "?"},  # belongs to NOBODY
+            {"name": "公开导医台", "location": "大厅", "visibility": "public"},
+        ]
+    }
+
+    def _gw(self):
+        return build_gateway(audit_sink=_Sink(), directories=self.RECORDS)
+
+    def test_records_without_a_tenant_are_never_adopted(self):
+        gw = self._gw()
+        for context in (TENANT, OTHER_TENANT):
+            names = [
+                item["name"]
+                for item in _call(
+                    gw, "department.search", {"query": "科室"}, context=context
+                ).data["items"]
+            ]
+            assert "无租户科室" not in names
+
+    def test_private_fields_never_reach_the_agent(self):
+        gw = self._gw()
+        result = _call(gw, "department.search", {"query": "呼吸"}, context=TENANT)
+        item = result.data["items"][0]
+        assert set(item) == {"name", "location"}  # field whitelist only
+        assert "internal_note" not in item
+        assert "13800000000" not in str(result.data)
+
+    def test_only_explicitly_public_records_cross_tenants(self):
+        gw = self._gw()
+        names = [
+            item["name"]
+            for item in _call(
+                gw, "department.search", {"query": "导医"}, context=OTHER_TENANT
+            ).data["items"]
+        ]
+        assert names == ["公开导医台"]  # the reviewed marker, not a missing tenant
+
+    def test_nested_values_are_dropped_not_returned(self):
+        gw = build_gateway(
+            audit_sink=_Sink(),
+            directories={
+                "department": [
+                    {
+                        "tenant_id": "t1",
+                        "name": "嵌套科室",
+                        "location": {"tenant_id": "t2", "secret": "x"},
+                        "extra": ["a", "b"],
+                    }
+                ]
+            },
+        )
+        item = _call(gw, "department.search", {"query": "嵌套"}, context=TENANT).data[
+            "items"
+        ][0]
+        assert item == {"name": "嵌套科室"}  # non-scalars are dropped outright
+        assert "secret" not in str(item)
+
+
+class TestMemoryKeySpace:
+    """Review P1: short-term memory is keyed by tenant+device+session."""
+
+    def _gw(self, reader):
+        return build_gateway(audit_sink=_Sink(), memory_reader=reader)
+
+    @staticmethod
+    def _canary_reader(store):
+        def reader(key):
+            return store.get((key.tenant_id, key.device_id, key.session_id))
+
+        return reader
+
+    def test_same_session_id_in_two_tenants_is_isolated(self):
+        store = {
+            ("t1", "d1", "shared"): "T1 的摘要",
+            ("t2", "d1", "shared"): "T2 的摘要",
+        }
+        gw = self._gw(self._canary_reader(store))
+        t1 = _call(
+            gw,
+            "memory.read_short",
+            {},
+            context=SessionContext(tenant_id="t1", device_id="d1", session_id="shared"),
+        )
+        t2 = _call(
+            gw,
+            "memory.read_short",
+            {},
+            context=SessionContext(tenant_id="t2", device_id="d1", session_id="shared"),
+        )
+        assert t1.data["summary"] == "T1 的摘要"
+        assert t2.data["summary"] == "T2 的摘要"
+
+    def test_same_session_on_two_devices_is_isolated(self):
+        store = {
+            ("t1", "d1", "s1"): "A 机摘要",
+            ("t1", "d2", "s1"): "B 机摘要",
+        }
+        gw = self._gw(self._canary_reader(store))
+        a = _call(
+            gw,
+            "memory.read_short",
+            {},
+            context=SessionContext(tenant_id="t1", device_id="d1", session_id="s1"),
+        )
+        b = _call(
+            gw,
+            "memory.read_short",
+            {},
+            context=SessionContext(tenant_id="t1", device_id="d2", session_id="s1"),
+        )
+        assert (a.data["summary"], b.data["summary"]) == ("A 机摘要", "B 机摘要")
+
+    def test_a_missing_memory_reader_fails_closed(self):
+        gw = build_gateway(audit_sink=_Sink())
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "memory.read_short", {}, context=SESSION)
+        assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
+
+
+class TestExecutionBoundsAndAuditFinality:
+    """Review P1: bounded concurrency and exactly ONE terminal audit per call."""
+
+    def test_concurrency_is_bounded(self):
+        import concurrent.futures
+
+        running = {"now": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def slow(_context, args):
+            with lock:
+                running["now"] += 1
+                running["peak"] = max(running["peak"], running["now"])
+            time.sleep(0.05)
+            with lock:
+                running["now"] -= 1
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=_Sink(), max_concurrency=2)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as outer:
+            list(
+                outer.map(
+                    lambda _i: _call(gw, "knowledge.search", {"query": "x"}),
+                    range(8),
+                )
+            )
+        assert running["peak"] <= 2  # never more than the configured bound
+        assert gw.peak_concurrency() <= 2
+        gw.shutdown()
+
+    def test_a_late_completion_never_writes_a_second_audit(self):
+        import asyncio
+
+        release = threading.Event()
+        sink = _Sink()
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=sink, max_concurrency=2)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        try:
+            with pytest.raises(ToolGatewayError) as exc:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "x"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                        timeout_s=0.05,
+                    )
+                )
+            assert exc.value.code is ErrorCode.TOOL_TIMEOUT
+            time.sleep(0.05)
+            release.set()  # the abandoned worker now finishes "successfully"
+            time.sleep(0.3)
+            results = [r.result for r in sink.records]
+            assert len(results) == 1, results  # exactly one terminal record
+            assert results[0].startswith("rejected:async_timeout")
+        finally:
+            release.set()
+            gw.shutdown()
+
+    def test_every_call_writes_exactly_one_audit_record(self):
+        sink = _Sink()
+        gw = build_gateway(audit_sink=sink, knowledge_store=_store_with_one_approved())
+        _call(gw, "knowledge.search", {"query": "内容"})
+        assert len(sink.records) == 1
+        with pytest.raises(ToolGatewayError):
+            _call(gw, "knowledge.search", {"query": "内容", "tenant_id": "t2"})
+        assert len(sink.records) == 2  # the denial is the SECOND call's record
+
+
+class TestAuditNeverCarriesUntrustedText:
+    """Review P1: unknown tool names and sink failures must not leak text."""
+
+    def test_unknown_tool_name_is_labelled_not_echoed(self):
+        sink = _Sink()
+        gw = ToolGateway(audit_sink=sink)
+        secret = "IGNORE-ALL-PREVIOUS-INSTRUCTIONS"
+        with pytest.raises(ToolGatewayError):
+            _call(gw, "shell.exec;" + secret, allowed=["shell.exec;" + secret])
+        record = sink.records[-1]
+        assert record.tool_names == [
+            "unregistered:"
+            + hashlib.sha256(("shell.exec;" + secret).encode()).hexdigest()[:12]
+        ]
+        assert secret not in str(record.tool_names)
+        assert secret not in record.result
+
+    def test_a_failing_sink_does_not_leak_its_exception_text(self, caplog):
+        sentinel = "SENTINEL-EXCEPTION-TEXT"
+
+        def broken(_record):
+            raise RuntimeError(sentinel)
+
+        gw = build_gateway(
+            audit_sink=broken, knowledge_store=_store_with_one_approved()
+        )
+        with caplog.at_level("WARNING"):
+            result = _call(gw, "knowledge.search", {"query": "内容"})
+        assert result.ok is True  # a broken sink never breaks the call
+        assert sentinel not in caplog.text
+        assert "details withheld" in caplog.text
+
+    def test_constructing_without_a_sink_warns(self, caplog):
+        with caplog.at_level("WARNING"):
+            gw = ToolGateway()
+        assert "WITHOUT an audit sink" in caplog.text
+        gw.shutdown()
+
+    def test_fragment_without_a_store_is_a_deployment_fault(self):
+        gw = build_gateway(audit_sink=_Sink())
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.get_fragment", {"source_id": "faq-1"})
+        assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
 
 
 class TestAliasSafety:

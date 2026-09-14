@@ -9,9 +9,17 @@ All executors are pure reads over injectable sources:
   RAG may query;
 - ``department/staff/video.search`` run a deterministic substring search over
   an optional in-memory directory index (placeholder until real indexes land
-  in a later issue);
+  in a later issue). A record is visible ONLY to its own tenant — a record
+  without an explicit ``tenant_id`` matches nobody — and results are rebuilt
+  from a FIELD WHITELIST, so private columns (``internal_note`` …) and nested
+  structures can never ride out to an agent;
 - ``memory.read_short`` reads a short-term summary through an optional
-  read-only callable.
+  read-only callable, which receives the trusted ``(tenant, device, session)``
+  triple: two tenants (or two devices) sharing a session id can never read each
+  other''s memory;
+- a tool whose dependency was never injected fails closed with
+  ``E_UNAVAILABLE_MAINTENANCE`` — an unconfigured source is a deployment fault,
+  never an empty result.
 
 Executors never write, never touch files/network and raise
 :class:`~app.tools.gateway.ToolGatewayError` (registry ErrorCode) for
@@ -22,6 +30,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.errors import ErrorCode
@@ -32,7 +41,79 @@ _TOKEN_SPLIT = re.compile(r"[\s,，。；;：:、|/\\()\[\]{}<>«»\"'“”‘�
 _SNIPPET_CHARS = 240
 
 Directories = Mapping[str, list[Mapping[str, Any]]]
-MemoryReader = Callable[[str | None], str | None]
+
+#: Fields an agent may ever see per directory domain (everything else — private
+#: columns, nested structures — is dropped before the result is built).
+DIRECTORY_FIELDS: dict[str, tuple[str, ...]] = {
+    "department": ("name", "location"),
+    "staff": ("name", "title", "department"),
+    "video": ("title", "duration_s"),
+}
+
+#: Explicit, reviewed marker for records that are public on purpose. A record
+#: WITHOUT a tenant id is NOT public: it matches nobody.
+PUBLIC_VISIBILITY = "public"
+
+#: per-field cap for the projection (defence against oversized fields)
+_DIRECTORY_FIELD_CHARS = 512
+
+
+@dataclass(frozen=True)
+class MemoryKey:
+    """The trusted key space of short-term memory: tenant+device+session."""
+
+    tenant_id: str
+    device_id: str
+    session_id: str
+
+
+#: A memory reader receives the TRUSTED key (never a bare session id).
+MemoryReader = Callable[[MemoryKey], str | None]
+
+
+def memory_key(context: Any) -> MemoryKey | None:
+    """Build the trusted memory key, or ``None`` when the context lacks one."""
+    fields = {
+        name: getattr(context, name, "")
+        for name in ("tenant_id", "device_id", "session_id")
+    }
+    if not all(isinstance(value, str) and value for value in fields.values()):
+        return None
+    return MemoryKey(**fields)
+
+
+def _directory_visible(record: Mapping[str, Any], tenant_id: str) -> bool:
+    """A record is visible only to its OWN tenant, or when explicitly public.
+
+    * ``tenant_id`` mismatch -> invisible;
+    * a record with NO ``tenant_id`` -> invisible (it is never adopted by
+      whichever tenant happens to search);
+    * ``visibility == "public"`` -> visible (an explicit, reviewed marker).
+    """
+    owner = record.get("tenant_id")
+    if isinstance(owner, str) and owner and owner == tenant_id:
+        return True
+    return record.get("visibility") == PUBLIC_VISIBILITY
+
+
+def _project_directory_record(
+    record: Mapping[str, Any], allowed: tuple[str, ...]
+) -> dict[str, Any] | None:
+    """Rebuild a record from the FIELD WHITELIST (no raw record ever escapes).
+
+    Only scalar values survive: nested dict/list values are dropped, so a
+    tampered record cannot smuggle a structure (or an identity) out to a model.
+    """
+    if not isinstance(record, Mapping):
+        return None
+    projected: dict[str, Any] = {}
+    for field in allowed:
+        value = _value(record.get(field))
+        if isinstance(value, str):
+            projected[field] = value[:_DIRECTORY_FIELD_CHARS]
+        elif isinstance(value, int) and not isinstance(value, bool):
+            projected[field] = value
+    return projected or None
 
 
 def _value(member: Any) -> Any:
@@ -109,16 +190,16 @@ def make_knowledge_get_fragment(store: Any | None) -> Callable[[Any, dict], Any]
         source_id = args["source_id"]
         fragment_index = _arg(args, "fragment_index", 0)
         fragment_chars = _arg(args, "fragment_chars", 2000)
-        item = None
-        if store is not None:
-            item = next(
-                (
-                    it
-                    for it in store.production_items(context)
-                    if getattr(it, "source_id", None) == source_id
-                ),
-                None,
-            )
+        if store is None:
+            _require_dependency("knowledge.get_fragment")
+        item = next(
+            (
+                it
+                for it in store.production_items(context)
+                if getattr(it, "source_id", None) == source_id
+            ),
+            None,
+        )
         if item is None:
             raise ToolGatewayError(
                 ErrorCode.NOT_FOUND_KNOWLEDGE,
@@ -159,10 +240,15 @@ def make_directory_search(
         # scoping follows the INJECTED context; the caller's tenant can never
         # be widened or redirected through arguments
         tenant_id = getattr(context, "tenant_id", "")
+        allowed = DIRECTORY_FIELDS[domain]
         records = [
-            r
-            for r in (directories or {}).get(domain, [])
-            if r.get("tenant_id", tenant_id) == tenant_id
+            visible
+            for visible in (
+                _project_directory_record(record, allowed)
+                for record in (directories or {}).get(domain, [])
+                if _directory_visible(record, tenant_id)
+            )
+            if visible is not None
         ]
         tokens = _tokens(query)
         scored: list[tuple[int, int, dict[str, Any]]] = []
@@ -170,7 +256,7 @@ def make_directory_search(
             haystack = " ".join(str(v) for v in record.values()).lower()
             hits = sum(1 for t in tokens if t in haystack)
             if hits:
-                scored.append((-hits, index, dict(record)))
+                scored.append((-hits, index, record))
         scored.sort()
         items = [record for _, _, record in scored[:top_k]]
         return {"items": items, "total": len(items)}
@@ -180,14 +266,18 @@ def make_directory_search(
 
 def make_memory_read_short(reader: MemoryReader | None) -> Callable[[Any, dict], Any]:
     def read_short(context: Any, args: dict[str, Any]) -> dict[str, Any]:
-        # the session comes from the trusted context, never from arguments
-        session_id = getattr(context, "session_id", "") or None
         max_chars = _arg(args, "max_chars", 2000)
         if reader is None:
             _require_dependency("memory.read_short")
-        if session_id is None:
-            return {"summary": "", "available": False}
-        summary = reader(session_id)
+        key = memory_key(context)
+        if key is None:
+            # without a device+session identity the summary cannot be
+            # attributed, so nothing is read (it is never guessed from args)
+            raise ToolGatewayError(
+                ErrorCode.AUTHZ_FORBIDDEN,
+                "memory.read_short needs a device+session identity from the server",
+            )
+        summary = reader(key)
         if isinstance(summary, str) and max_chars:
             summary = summary[: int(max_chars)]
         if not summary:

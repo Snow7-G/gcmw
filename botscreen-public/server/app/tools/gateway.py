@@ -23,14 +23,28 @@ Hard constraints (V2.3 §6.2):
   ``asyncio.wait_for`` bound, so a slow tool cannot stall the server.
 
 Executor side effects are strictly read-only by construction: specs carry no
-write capability. On timeout the call returns TOOL_TIMEOUT immediately; a
-runaway executor thread is daemon and cannot block process shutdown.
+write capability. On timeout the call returns TOOL_TIMEOUT immediately and the
+timeout is FINAL for that call: audit is written once, and a late completion of
+abandoned work can never append a second, contradictory "success" record.
+
+Execution is bounded: every call runs on a fixed-size worker pool
+(``max_concurrency``), so slow tools cannot spawn unbounded work. A timeout
+stops WAITING, not the worker — Python threads cannot be cancelled, and this
+module never claims otherwise: the abandoned worker finishes on its own, its
+result is discarded, and its audit slot is already closed.
+
+Audit policy: a gateway without an ``audit_sink`` still executes calls but runs
+in a DEGRADED, UNAUDITED mode and logs a warning at construction. Deployment
+requires a sink; a durable audit store remains a production gate (#65) and is
+not claimed here.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import copy
+import functools
 import hashlib
 import json
 import logging
@@ -45,7 +59,7 @@ from app.contracts.agent import ToolRequest, ToolResult
 from app.contracts.audit import AuditRecord
 from app.contracts.common import TenantContext
 from app.contracts.errors import ErrorCode
-from app.tools.specs import ToolSpec
+from app.tools.specs import READONLY_TOOL_NAMES, ToolSpec
 from app.tools.validation import validate
 
 _LOGGER = logging.getLogger(__name__)
@@ -75,6 +89,19 @@ IDENTITY_ARGUMENT_KEYS: frozenset[str] = frozenset(
 )
 
 
+def _audit_tool_label(tool_name: str) -> str:
+    """Fixed label for anything outside the sealed whitelist.
+
+    A model-controlled tool name is attacker-supplied text: it is never written
+    to the audit trail verbatim. Unknown names collapse to ``unregistered`` plus
+    a short digest, which keeps records correlatable without echoing payload.
+    """
+    if isinstance(tool_name, str) and tool_name in READONLY_TOOL_NAMES:
+        return tool_name
+    digest = hashlib.sha256(str(tool_name).encode("utf-8")).hexdigest()[:12]
+    return f"unregistered:{digest}"
+
+
 def find_identity_argument(node: Any) -> str | None:
     """Return the first identity key found at ANY depth (values never echoed)."""
     if isinstance(node, dict):
@@ -90,6 +117,13 @@ def find_identity_argument(node: Any) -> str | None:
             if found is not None:
                 return found
     return None
+
+
+@dataclass
+class _CallState:
+    """One call's audit slot: closed exactly once, late writes are dropped."""
+
+    closed: bool = False
 
 
 @dataclass(frozen=True)
@@ -129,10 +163,11 @@ class ToolGatewayError(RuntimeError):
 
 
 def _default_runner(fn: Callable[[], Any], timeout_seconds: float) -> Any:
-    """Run ``fn`` in a daemon thread with a wall-clock timeout.
+    """Run ``fn`` on a daemon thread with a wall-clock timeout.
 
-    On expiry ``TimeoutError`` is raised and the runaway thread is left to die
-    on its own (daemon) — the caller never waits for it.
+    On expiry ``TimeoutError`` is raised
+    and the runaway thread is left to finish on its own (daemon): Python cannot
+    cancel a thread, and nothing here pretends it can.
     """
     box: dict[str, Any] = {}
 
@@ -163,13 +198,30 @@ class ToolGateway:
         *,
         default_timeout_ms: int = 5_000,
         default_max_result_bytes: int = 64 * 1024,
+        max_concurrency: int = 4,
+        executor: concurrent.futures.ThreadPoolExecutor | None = None,
     ) -> None:
+        if max_concurrency <= 0:
+            raise ValueError("max_concurrency must be positive")
         self._audit_sink = audit_sink
+        if audit_sink is None:
+            _LOGGER.warning(
+                "tool gateway constructed WITHOUT an audit sink: calls run "
+                "unaudited (degraded mode; deployment requires a sink)"
+            )
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._runner = runner or _default_runner
+        # bounded execution: slow tools share one fixed-size pool instead of
+        # spawning a thread per call
+        self._pool = executor or concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_concurrency, thread_name_prefix="tool-executor"
+        )
+        self._owns_pool = executor is None
+        self._runner = runner or self._pool_runner
         self._default_timeout_ms = default_timeout_ms
         self._default_max_result_bytes = default_max_result_bytes
         self._lock = threading.RLock()
+        self._in_flight = 0
+        self._peak_in_flight = 0
         self._specs: dict[str, ToolSpec] = {}
         self._order: list[str] = []
         self._disabled: set[str] = set()
@@ -229,6 +281,7 @@ class ToolGateway:
         *,
         allowed_tools: Sequence[str] | None = (),
         agent_id: str = "",
+        _state: _CallState | None = None,
     ) -> ToolResult:
         """Authorized, schema-checked, timed and capped tool execution.
 
@@ -236,6 +289,7 @@ class ToolGateway:
         model); every failure raises :class:`ToolGatewayError` after an audit
         record, and the executor never runs for rejected calls.
         """
+        state = _state if _state is not None else _CallState()
         identity = identity_from_context(context)
         name = request.tool_name
         with self._lock:
@@ -249,6 +303,7 @@ class ToolGateway:
             session_id_hash=identity.session_id_hash,
             run_id=identity.run_id,
             request_id=identity.request_id,
+            state=state,
         )
 
         # 0. identity gate: the model may never supply tenant/session/reviewer.
@@ -298,10 +353,13 @@ class ToolGateway:
             audit(result="rejected:deadline_expired", code=ErrorCode.TOOL_TIMEOUT)
             raise ToolGatewayError(ErrorCode.TOOL_TIMEOUT, "deadline already expired")
 
-        # 5. executor under timeout.
+        # 5. executor under a bounded pool + per-call timeout (the in-flight
+        # counter is maintained by the worker itself, so it measures RUNNING
+        # work — not calls that are merely queued).
         try:
             payload = self._runner(
-                lambda: spec.executor(context, request.arguments), timeout_ms / 1000
+                lambda: spec.executor(context, request.arguments),
+                timeout_ms / 1000,
             )
         except ToolGatewayError as exc:
             audit(result="executor:" + exc.code.value, code=exc.code)
@@ -370,18 +428,26 @@ class ToolGateway:
         budget = (
             self._default_timeout_ms / 1000 if timeout_s is None else float(timeout_s)
         )
+        state = _CallState()
+        loop = asyncio.get_running_loop()
+        run = functools.partial(
+            self.invoke,
+            context,
+            request,
+            allowed_tools=allowed_tools,
+            agent_id=agent_id,
+            _state=state,
+        )
         try:
+            # the SAME bounded pool serves the async path: a slow tool can
+            # never spawn unbounded work, async or not
             return await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.invoke,
-                    context,
-                    request,
-                    allowed_tools=allowed_tools,
-                    agent_id=agent_id,
-                ),
-                timeout=budget,
+                loop.run_in_executor(self._pool, run), timeout=budget
             )
         except TimeoutError:
+            # the timeout is FINAL for this call: closing the slot first means
+            # the abandoned worker cannot later append a "success" record
+            state.closed = True
             identity = identity_from_context(context)
             self._audit(
                 tool_name=request.tool_name,
@@ -390,6 +456,7 @@ class ToolGateway:
                 session_id_hash=identity.session_id_hash,
                 run_id=identity.run_id,
                 request_id=identity.request_id,
+                state=_CallState(),
             )(
                 result=f"rejected:async_timeout={budget:g}s",
                 code=ErrorCode.TOOL_TIMEOUT,
@@ -398,6 +465,43 @@ class ToolGateway:
                 ErrorCode.TOOL_TIMEOUT,
                 f"tool {request.tool_name!r} exceeded the async budget",
             ) from None
+
+    def _pool_runner(self, fn: Callable[[], Any], timeout_seconds: float) -> Any:
+        """Run on the bounded pool; a timeout abandons the FUTURE, not the work."""
+
+        def counted() -> Any:
+            with self._lock:
+                self._in_flight += 1
+                self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
+            try:
+                return fn()
+            finally:
+                with self._lock:
+                    self._in_flight -= 1
+
+        future = self._pool.submit(counted)
+        try:
+            return future.result(timeout=timeout_seconds)
+        except concurrent.futures.TimeoutError:
+            # the worker keeps running (threads cannot be cancelled); the result
+            # is discarded and the call's audit slot is already closed
+            future.cancel()
+            raise TimeoutError(f"tool exceeded {timeout_seconds:g}s") from None
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Release the worker pool (called when the application shuts down)."""
+        if self._owns_pool:
+            self._pool.shutdown(wait=wait, cancel_futures=True)
+
+    def peak_concurrency(self) -> int:
+        """Highest simultaneous execution count observed (test/ops probe)."""
+        with self._lock:
+            return self._peak_in_flight
+
+    def running_calls(self) -> int:
+        """Executions in flight right now (never above ``max_concurrency``)."""
+        with self._lock:
+            return self._in_flight
 
     # -- helpers ----------------------------------------------------------------
 
@@ -420,6 +524,7 @@ class ToolGateway:
         session_id_hash: str,
         run_id: str,
         request_id: str,
+        state: _CallState | None = None,
     ) -> Callable[[str, ErrorCode | None, int], None]:
         """Build a per-invocation audit closer.
 
@@ -427,9 +532,15 @@ class ToolGateway:
         content (no raw text in logs or audit).
         """
 
+        call_state = state if state is not None else _CallState()
+        label = _audit_tool_label(tool_name)
+
         def close(
             result: str = "", code: ErrorCode | None = None, latency_ms: int = 0
         ) -> None:
+            if call_state.closed:
+                return  # a late completion must never contradict a timeout
+            call_state.closed = True
             if self._audit_sink is None:
                 return
             try:
@@ -447,15 +558,20 @@ class ToolGateway:
                         run_id=run_id,
                         tenant_id=tenant_id or "unknown",
                         action="tool.invoke",
-                        tool_names=[tool_name],
+                        # never the raw model-supplied name: an unknown tool
+                        # gets a fixed label (with a short digest to correlate)
+                        tool_names=[label],
                         error_code=code,
                         latency_ms=latency_ms,
                         result=result,
                     )
                 )
-            except Exception:  # audit must never break the call…
-                # …but a broken audit sink is a SECURITY fault: make it loud
-                # instead of silently dropping records.
-                _LOGGER.warning("tool audit record dropped", exc_info=True)
+            except Exception:  # noqa: BLE001 - audit must never break the call
+                # …but a broken sink is a SECURITY fault, so it is loud — with
+                # NO exception text: a sink may fail on untrusted content and
+                # the message must not carry any of it into the log.
+                _LOGGER.warning(
+                    "tool audit record dropped (sink raised; details withheld)"
+                )
 
         return close
