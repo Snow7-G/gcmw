@@ -10,6 +10,7 @@ Acceptance coverage:
 """
 
 import hashlib
+import json
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -1026,8 +1027,13 @@ class TestExecutionBoundsAndAuditFinality:
         gw.shutdown()
         assert isinstance(gw._pool, concurrent.futures.ThreadPoolExecutor)
 
-    def test_a_delayed_sink_cannot_produce_two_terminal_records(self):
-        """Review P1: success + timeout for ONE call is impossible."""
+    def test_a_late_executor_cannot_produce_two_terminal_records(self):
+        """Review P1: success + timeout for ONE call is impossible.
+
+        NOTE (evidence correction from review): the delay here is in the
+        EXECUTOR, not the audit sink — ``test_a_slow_sink_...`` below covers a
+        genuinely slow sink.
+        """
         import asyncio
 
         release = threading.Event()
@@ -1063,6 +1069,173 @@ class TestExecutionBoundsAndAuditFinality:
                 r.result for r in records
             ]
             assert not any(r.result.startswith("ok:") for r in records)
+        finally:
+            release.set()
+            gw.shutdown()
+
+    def test_a_slow_sink_still_yields_exactly_one_terminal_record(self):
+        """A genuinely slow AUDIT SINK must not duplicate or drop records."""
+        import asyncio
+
+        seen: list = []
+
+        def slow_sink(record):
+            time.sleep(0.05)  # the sink itself is slow
+            seen.append(record)
+
+        gw = build_gateway(
+            audit_sink=slow_sink,
+            knowledge_store=_store_with_one_approved(content="发热"),
+        )
+        result = asyncio.run(
+            gw.ainvoke(
+                TENANT,
+                _request("knowledge.search", {"query": "发热"}),
+                allowed_tools=["knowledge.search"],
+                agent_id="a",
+                timeout_s=5,
+            )
+        )
+        assert result.ok is True
+        assert [r.result for r in seen] == [
+            f"ok:result_bytes={len(json.dumps(result.data, ensure_ascii=False, separators=(',', ':')).encode())}"
+        ]
+
+    def test_an_explicit_timeout_can_only_tighten_the_tool_budget(self):
+        """Review P1: ``timeout_s`` must never EXTEND the tool budget."""
+        import asyncio
+
+        release = threading.Event()
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=_Sink(), default_timeout_ms=50, max_concurrency=2)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        try:
+            with pytest.raises(ToolGatewayError) as exc:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "x"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                        timeout_s=0.5,  # much LARGER than the 50 ms tool budget
+                    )
+                )
+            assert exc.value.code is ErrorCode.TOOL_TIMEOUT
+        finally:
+            release.set()
+            gw.shutdown()
+
+    def test_an_expired_request_deadline_bounds_the_async_budget(self):
+        import asyncio
+
+        release = threading.Event()
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=_Sink(), default_timeout_ms=5000, max_concurrency=2)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        deadline = datetime.now(timezone.utc) + timedelta(milliseconds=50)
+        try:
+            with pytest.raises(ToolGatewayError) as exc:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "x"}, deadline=deadline),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                    )
+                )
+            assert exc.value.code is ErrorCode.TOOL_TIMEOUT
+        finally:
+            release.set()
+            gw.shutdown()
+
+    @pytest.mark.parametrize(
+        "value", [0, -1, float("nan"), float("inf"), float("-inf"), True, "0.5"]
+    )
+    def test_invalid_timeout_s_is_rejected(self, value):
+        import asyncio
+
+        gw = build_gateway(
+            audit_sink=_Sink(), knowledge_store=_store_with_one_approved()
+        )
+        with pytest.raises((TypeError, ValueError)):
+            asyncio.run(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "x"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                    timeout_s=value,
+                )
+            )
+        gw.shutdown()
+
+    def test_internal_exception_text_never_enters_the_error_object(self):
+        """Review P1: only a stable code + fixed sentence leave the gateway."""
+        sentinel = "SENTINEL-INTERNAL-PAYLOAD-/etc/passwd"
+
+        def exploding(_context, args):
+            raise RuntimeError(sentinel)
+
+        gw = ToolGateway(audit_sink=_Sink())
+        gw.register(canonical_spec("knowledge.search", executor=exploding))
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.search", {"query": "x"})
+        assert exc.value.code is ErrorCode.INTERNAL_UNKNOWN
+        assert sentinel not in str(exc.value)
+        assert sentinel not in repr(exc.value)
+        assert "failed internally" in str(exc.value)
+        gw.shutdown()
+
+    def test_cancellation_writes_exactly_one_record_and_propagates(self):
+        """Review P1: a cancelled call is audited once — never as a success."""
+        import asyncio
+
+        started = threading.Event()
+        release = threading.Event()
+        records: list = []
+
+        def slow(_context, args):
+            started.set()
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=records.append, max_concurrency=2)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+
+        async def main():
+            task = asyncio.create_task(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "x"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                    timeout_s=5,
+                )
+            )
+            for _ in range(200):  # wait until the worker really started
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        try:
+            asyncio.run(main())
+            release.set()  # the abandoned worker finishes "successfully" now
+            time.sleep(0.3)
+            assert [r.result for r in records] == ["cancelled"], [
+                r.result for r in records
+            ]
+            assert records[0].error_code is None  # cancellation is not a failure
         finally:
             release.set()
             gw.shutdown()

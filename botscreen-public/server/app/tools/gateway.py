@@ -47,6 +47,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -86,6 +87,15 @@ IDENTITY_ARGUMENT_KEYS: frozenset[str] = frozenset(
         "tenant_context",
     }
 )
+
+
+def _validate_timeout_s(timeout_s: float) -> float:
+    """A caller-supplied budget must be a positive finite number."""
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+        raise TypeError(f"timeout_s must be a positive finite number: {timeout_s!r}")
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError(f"timeout_s must be a positive finite number: {timeout_s!r}")
+    return float(timeout_s)
 
 
 def _audit_tool_label(tool_name: str) -> str:
@@ -154,13 +164,18 @@ class _RunnerFuture:
 
 
 class _ToolFault(Exception):
-    """Executor/output-gate failure carrying its audit label and code."""
+    """Executor/output-gate failure carrying its audit label, code and message.
 
-    def __init__(self, label: str, code: ErrorCode, error: Exception) -> None:
+    ``message`` is always a STABLE, caller-safe text: internal exception text
+    (which may embed provider payloads, paths or model output) is never placed
+    inside the error object a caller may log.
+    """
+
+    def __init__(self, label: str, code: ErrorCode, message: str) -> None:
         super().__init__(label)
         self.label = label
         self.code = code
-        self.error = error
+        self.message = message
 
 
 @dataclass
@@ -414,19 +429,23 @@ class ToolGateway:
         try:
             payload = prepared.spec.executor(context, prepared.arguments)
         except ToolGatewayError as exc:
-            raise _ToolFault("executor:" + exc.code.value, exc.code, exc) from None
-        except Exception as exc:  # noqa: BLE001 - executor internals never leak
-            raise _ToolFault("executor:internal", ErrorCode.INTERNAL_UNKNOWN, exc)
+            # a builtin's own registry-coded error: its text is authored, safe
+            raise _ToolFault("executor:" + exc.code.value, exc.code, str(exc)) from None
+        except Exception:  # noqa: BLE001 - executor internals NEVER leak
+            # the exception text may carry provider payloads/paths/model output:
+            # only the code and a fixed sentence reach the caller
+            raise _ToolFault(
+                "executor:internal",
+                ErrorCode.INTERNAL_UNKNOWN,
+                f"tool {prepared.tool_name!r} failed internally",
+            ) from None
 
         violations = validate(prepared.spec.output_schema, payload)
         if violations:
             raise _ToolFault(
                 "rejected:output_schema",
                 ErrorCode.TOOL_SCHEMA_REJECTED,
-                ToolGatewayError(
-                    ErrorCode.TOOL_SCHEMA_REJECTED,
-                    f"output schema violations at {', '.join(violations)}",
-                ),
+                f"output schema violations at {', '.join(violations)}",
             )
         try:
             encoded = json.dumps(
@@ -436,10 +455,7 @@ class ToolGateway:
             raise _ToolFault(
                 "rejected:output_json",
                 ErrorCode.TOOL_SCHEMA_REJECTED,
-                ToolGatewayError(
-                    ErrorCode.TOOL_SCHEMA_REJECTED,
-                    f"tool {prepared.tool_name!r} returned non-JSON data",
-                ),
+                f"tool {prepared.tool_name!r} returned non-JSON data",
             ) from None
         size_bytes = len(encoded.encode("utf-8"))
         cap = prepared.spec.max_result_bytes or self._default_max_result_bytes
@@ -447,10 +463,7 @@ class ToolGateway:
             raise _ToolFault(
                 f"rejected:result_bytes={size_bytes}",
                 ErrorCode.TOOL_OVER_LIMIT,
-                ToolGatewayError(
-                    ErrorCode.TOOL_OVER_LIMIT,
-                    f"tool {prepared.tool_name!r} result exceeded {cap} bytes",
-                ),
+                f"tool {prepared.tool_name!r} result exceeded {cap} bytes",
             )
         prepared.size_bytes = size_bytes
         return payload
@@ -483,7 +496,16 @@ class ToolGateway:
 
     def _finalize_failure(self, prepared: _Prepared, fault: _ToolFault) -> None:
         prepared.audit(result=fault.label, code=fault.code)
-        raise ToolGatewayError(fault.code, str(fault.error))
+        raise ToolGatewayError(fault.code, fault.message)
+
+    def _finalize_cancelled(self, prepared: _Prepared) -> None:
+        """The CALLER cancelled: one terminal record, then cancel propagates.
+
+        No error code is attached — a cancelled call is not a tool failure —
+        and the abandoned worker still cannot append a success record, because
+        only the awaiting side ever writes audit.
+        """
+        prepared.audit(result="cancelled", latency_ms=None)
 
     def invoke(
         self,
@@ -518,9 +540,7 @@ class ToolGateway:
                 _ToolFault(
                     "rejected:timeout",
                     ErrorCode.TOOL_TIMEOUT,
-                    ToolGatewayError(
-                        ErrorCode.TOOL_TIMEOUT, f"tool {prepared.tool_name!r} timed out"
-                    ),
+                    f"tool {prepared.tool_name!r} timed out",
                 ),
             )
         except _ToolFault as fault:
@@ -552,11 +572,19 @@ class ToolGateway:
             agent_id=agent_id,
             state=_CallState(),
         )
-        budget = prepared.timeout_s if timeout_s is None else float(timeout_s)
+        # an explicit caller cap may only TIGHTEN the tool budget; it can never
+        # extend it (that would let a caller outrun the deadline/timeout gates)
+        budget = prepared.timeout_s
+        if timeout_s is not None:
+            budget = min(budget, _validate_timeout_s(timeout_s))
         future = self._submit(prepared, context, allow_injected=False)
         wrapped = asyncio.wrap_future(future, loop=asyncio.get_running_loop())
         try:
             payload = await asyncio.wait_for(wrapped, timeout=budget)
+        except asyncio.CancelledError:
+            future.cancel()
+            self._finalize_cancelled(prepared)
+            raise
         except TimeoutError:
             future.cancel()
             self._finalize_failure(
@@ -564,10 +592,7 @@ class ToolGateway:
                 _ToolFault(
                     f"rejected:async_timeout={budget:g}s",
                     ErrorCode.TOOL_TIMEOUT,
-                    ToolGatewayError(
-                        ErrorCode.TOOL_TIMEOUT,
-                        f"tool {prepared.tool_name!r} exceeded the async budget",
-                    ),
+                    f"tool {prepared.tool_name!r} exceeded the async budget",
                 ),
             )
         except _ToolFault as fault:
@@ -622,7 +647,9 @@ class ToolGateway:
         label = _audit_tool_label(tool_name)
 
         def close(
-            result: str = "", code: ErrorCode | None = None, latency_ms: int = 0
+            result: str = "",
+            code: ErrorCode | None = None,
+            latency_ms: int | None = 0,
         ) -> None:
             if call_state.closed:
                 return  # a late completion must never contradict a timeout
@@ -648,7 +675,7 @@ class ToolGateway:
                         # gets a fixed label (with a short digest to correlate)
                         tool_names=[label],
                         error_code=code,
-                        latency_ms=latency_ms,
+                        latency_ms=latency_ms or 0,
                         result=result,
                     )
                 )
