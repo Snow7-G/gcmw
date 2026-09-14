@@ -1413,6 +1413,192 @@ class TestTrustedSnapshotIsolation:
         assert runner._result.evidence[0].content == "原始证据"
 
 
+class TestEvidenceIsRevalidatedNotJustCopied:
+    """Review P1: ``model_copy(deep=True)`` keeps an INVALID field.
+
+    A malformed Evidence (mutated after construction, or built with
+    ``model_copy(update=...)``) used to pass the verifier and be delivered,
+    because pydantic does not re-validate on copy. The boundary now rebuilds
+    every item from a whitelisted payload with ``model_validate(strict=True)``.
+    """
+
+    PRIVATE = "SYNTHETIC_PRIVATE_TEXT_九号患者"
+
+    @staticmethod
+    def _manager(registry, evidence_item):
+        raw = _agent_execution(
+            answer="原始答案",
+            evidence=(evidence_item,),
+        )
+
+        async def runner(ctx):
+            return raw
+
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry, agent_runners={"qa": runner}, verifier=verifier
+        )
+        return m, verifier
+
+    def _assert_refused_before_verifier(self, registry, item):
+        m, verifier = self._manager(registry, item)
+        with pytest.raises(ManagerAgentError) as exc:
+            asyncio.run(m.execute(_context(), "发烧怎么办"))
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert str(exc.value) == "routed agent returned an invalid execution result"
+        assert verifier.seen == []  # never reached the verifier
+        return exc.value
+
+    def _assert_no_private_value_escapes(self, error):
+        for field in (
+            str(error),
+            repr(error),
+            repr(vars(error)),
+            repr(error.args),
+        ):
+            assert self.PRIVATE not in field
+            assert "SYNTHETIC_PRIVATE_TEXT" not in field
+        assert error.__cause__ is None
+        assert error.__context__ is None
+
+    @mark.asyncio
+    async def test_an_emptied_source_id_is_refused(self, registry):
+        item = _evidence(content=self.PRIVATE)
+        item.source_id = ""  # mutated into an invalid state after construction
+        m, verifier = self._manager(registry, item)
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert verifier.seen == []
+        self._assert_no_private_value_escapes(exc.value)
+
+    @mark.parametrize("bad_content", [{"patient": "secret"}, ["patient", "secret"]])
+    @mark.asyncio
+    async def test_a_non_string_content_is_refused(self, registry, bad_content):
+        item = _evidence()
+        item.content = bad_content  # type: ignore[assignment]
+        m, verifier = self._manager(registry, item)
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert verifier.seen == []
+
+    @mark.asyncio
+    async def test_model_copy_update_cannot_smuggle_an_invalid_field(self, registry):
+        item = _evidence(content=self.PRIVATE).model_copy(update={"source_id": ""})
+        m, verifier = self._manager(registry, item)
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert verifier.seen == []
+        self._assert_no_private_value_escapes(exc.value)
+
+    @mark.asyncio
+    async def test_a_wrongly_typed_optional_field_is_refused(self, registry):
+        item = _evidence().model_copy(update={"knowledge_version": 42})
+        m, verifier = self._manager(registry, item)
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert verifier.seen == []
+
+    @mark.asyncio
+    async def test_a_deleted_field_is_refused(self, registry):
+        item = _evidence()
+        del item.source_type  # type: ignore[misc]
+        m, verifier = self._manager(registry, item)
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert verifier.seen == []
+
+    @mark.asyncio
+    async def test_corruption_through_the_runners_reference_is_refused_early(
+        self, registry
+    ):
+        """The runner still holds the object it returned; invalidating it is caught
+        at the trust boundary, i.e. before the verifier is engaged."""
+        item = _evidence(content=self.PRIVATE)
+        raw = _agent_execution(answer="原始答案", evidence=(item,))
+
+        async def runner(ctx):
+            return raw
+
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry, agent_runners={"qa": runner}, verifier=verifier
+        )
+        item.source_id = ""  # mutated through the runner's own reference
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.MODEL_OUTPUT_UNPARSEABLE
+        assert verifier.seen == []  # refused before any verification
+
+    @mark.asyncio
+    async def test_a_verifier_corrupting_its_own_copy_cannot_reach_delivery(
+        self, registry
+    ):
+        """The verifier may only write to its isolated copy."""
+
+        class _CorruptingVerifier:
+            def __init__(self):
+                self.seen = []
+                self.risks = []
+                self.corrupted = False
+
+            async def __call__(self, ctx, execution):
+                self.seen.append(execution.answer_candidate)
+                self.risks.append(ctx.risk_level)
+                if execution.evidence:
+                    execution.evidence[0].source_id = ""
+                    execution.evidence[0].content = {"patient": "secret"}
+                    self.corrupted = True
+                return Verdict(VerifierOutcome.PASS)
+
+        verifier = _CorruptingVerifier()
+        m = build_manager(
+            registry=registry,
+            agent_runners={
+                "qa": _Runner(
+                    result=_agent_execution(
+                        answer="原始答案", evidence=(_evidence(content="已审核证据"),)
+                    )
+                )
+            },
+            verifier=verifier,
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert verifier.corrupted is True  # the writes really happened...
+        assert result.safety_status == "verified"
+        assert result.evidence[0].source_id == "faq-1"
+        assert result.evidence[0].content == "已审核证据"
+        assert "secret" not in json.dumps(result.model_dump(), ensure_ascii=False)
+
+    @mark.asyncio
+    async def test_a_valid_evidence_item_is_still_delivered(self, registry):
+        """The boundary must not be over-broad: a valid item crosses unchanged."""
+        item = _evidence(content="已审核证据正文")
+        m, verifier = self._manager(registry, item)
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.safety_status == "verified"
+        assert result.evidence[0].content == "已审核证据正文"
+        assert result.evidence[0].source_id == "faq-1"
+        assert result.evidence[0] is not item  # a rebuilt, isolated object
+        assert verifier.seen == ["原始答案"]
+
+    @mark.asyncio
+    async def test_extra_attributes_are_not_forwarded(self, registry):
+        """Only whitelisted fields survive the rebuild."""
+        item = _evidence(content="已审核证据正文")
+        object.__setattr__(item, "internal_prompt", "system: 你是医生")
+        m, _ = self._manager(registry, item)
+        result = await m.execute(_context(), "发烧怎么办")
+        assert "internal_prompt" not in result.evidence[0].model_dump()
+        assert "system: 你是医生" not in json.dumps(
+            result.model_dump(), ensure_ascii=False
+        )
+
+
 class TestToolBudgetIsRunCumulative:
     """Review P1: the ≤4 tool cap is summed over the whole run."""
 

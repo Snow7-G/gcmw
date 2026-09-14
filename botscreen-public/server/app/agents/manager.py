@@ -533,6 +533,51 @@ class ManagerAgent:
         {AgentStatus.COMPLETED, AgentStatus.FAILED, AgentStatus.CANCELLED}
     )
 
+    #: the ONLY Evidence fields carried across the trust boundary; anything else
+    #: attached to the object is ignored, never forwarded
+    _EVIDENCE_FIELDS = (
+        "source_id",
+        "source_type",
+        "title",
+        "content",
+        "source_uri",
+        "content_hash",
+        "knowledge_version",
+    )
+
+    def _validated_evidence_copy(self, item: Evidence) -> Evidence:
+        """Rebuild ONE Evidence item by RE-VALIDATING a whitelisted payload.
+
+        ``model_copy(deep=True)`` copies whatever currently sits on the object —
+        including a field mutated into an INVALID state after construction
+        (``source_id=""``, ``content={...}``), because pydantic does not
+        re-validate on copy. So the payload is assembled field by field from an
+        explicit whitelist and validated again with
+        ``Evidence.model_validate(payload, strict=True)``: a value that no longer
+        satisfies the contract is refused here instead of crossing the PASS
+        boundary.
+
+        ``model_dump()`` is deliberately NOT used — serializing a malformed field
+        can emit a warning that quotes the offending value. Validation failures
+        are turned into the fixed public error OUTSIDE the handler, so the raised
+        error keeps neither the original value nor an exception chain. The global
+        ``Evidence`` contract is untouched: this is a local boundary.
+        """
+        payload: dict[str, Any] = {
+            name: getattr(item, name, None) for name in self._EVIDENCE_FIELDS
+        }
+        rebuilt: Evidence | None = None
+        try:
+            # pydantic's ValidationError is a ValueError subclass
+            rebuilt = Evidence.model_validate(payload, strict=True)
+        except (TypeError, ValueError):
+            rebuilt = None
+        if rebuilt is None:
+            raise ManagerAgentError(
+                ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
+            )
+        return rebuilt
+
     def _trusted_snapshot(self, raw: Any, *, agent_id: str) -> AgentExecution:
         """Validate a routed agent's return value and isolate a COPY of it.
 
@@ -603,7 +648,9 @@ class ManagerAgent:
             agent_id=agent_id,
             status=raw.status,
             answer_candidate=raw.answer_candidate,
-            evidence=tuple(item.model_copy(deep=True) for item in raw.evidence),
+            evidence=tuple(
+                self._validated_evidence_copy(item) for item in raw.evidence
+            ),
             tool_calls=tool_calls,
             provider_id=raw.provider_id,
             model_id=raw.model_id,
