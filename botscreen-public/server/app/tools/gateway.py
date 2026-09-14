@@ -89,16 +89,41 @@ IDENTITY_ARGUMENT_KEYS: frozenset[str] = frozenset(
 )
 
 
-def _violation_kinds(violations: list[str]) -> str:
-    """Classification of schema violations, WITHOUT any path or value.
+#: The complete set of violation types ``app.tools.validation`` can emit. A
+#: violation string is ``"<path>: <kind>"``, and the PATH may contain a
+#: model-supplied key (even one containing ``": "``), so the kind is taken from
+#: the END of the string and MUST be one of these — anything else is reported as
+#: ``other`` rather than echoed.
+SCHEMA_VIOLATION_KINDS: frozenset[str] = frozenset(
+    {
+        "schema-false",
+        "invalid-schema",
+        "type",
+        "enum",
+        "minLength",
+        "maxLength",
+        "minimum",
+        "maximum",
+        "required",
+        "additionalProperties",
+        "minItems",
+        "maxItems",
+    }
+)
 
-    A violation path can embed a MODEL-SUPPLIED key (an extra argument or a
-    result field name), so the audit records only the developer-authored kinds
-    (``required``/``type``/``additionalProperties`` …). Operators keep a
-    useful signal; no untrusted text reaches a durable record.
+
+def _violation_kinds(violations: list[str]) -> str:
+    """Fixed classification of schema violations, WITHOUT path or value.
+
+    Operators keep a useful signal (``required``/``additionalProperties`` …);
+    no untrusted text — not even a fragment of a model-supplied key — reaches a
+    durable audit record.
     """
-    kinds = sorted({item.split(": ", 1)[-1] for item in violations})
-    return "+".join(kinds) if kinds else "unspecified"
+    kinds = set()
+    for item in violations:
+        candidate = item.rsplit(": ", 1)[-1]  # take the type from the END
+        kinds.add(candidate if candidate in SCHEMA_VIOLATION_KINDS else "other")
+    return "+".join(sorted(kinds)) if kinds else "unspecified"
 
 
 def _validate_timeout_s(timeout_s: float) -> float:
@@ -234,15 +259,16 @@ class ToolGatewayError(RuntimeError):
     leak a tool name, an argument/result key or payload text into a string that
     a future Agent or log handler might record.
 
-    Detailed, VALUE-FREE reason markers belong in the audit record's ``result``
-    field (``denied:not_whitelisted``, ``rejected:output_schema`` …) and in
-    :attr:`reason`, which is diagnostic only and never part of ``str()``.
+    Detailed, VALUE-FREE reason markers live in the audit record's ``result``
+    field (``denied:not_whitelisted``, ``rejected:input_schema:required`` …) and
+    nowhere else: the constructor accepts a ``message`` purely so raise sites
+    read well, and deliberately does NOT retain it — a raw path could embed a
+    model-supplied key and would then be readable through the exception object.
     """
 
     def __init__(self, code: ErrorCode, message: str = "") -> None:
+        del message  # accepted for readability at raise sites; never stored
         self.code = code
-        #: diagnostic marker for tests/tracing — NEVER rendered by str()/repr()
-        self.reason = message
         super().__init__(lookup(code).message)
 
 

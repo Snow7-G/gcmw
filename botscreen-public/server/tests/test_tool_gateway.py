@@ -1336,6 +1336,70 @@ class TestAuditNeverCarriesUntrustedText:
         assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
 
 
+class TestColonBearingKeysNeverLeakThroughDiagnostics:
+    """Review P1: a key containing ": " must not smuggle text anywhere."""
+
+    SENTINEL = "SYNTHETIC: PRIVATE"
+
+    def _assert_nowhere(self, exc, sink):
+        for blob in (str(exc.value), repr(exc.value), str(vars(exc.value))):
+            assert "PRIVATE" not in blob
+            assert self.SENTINEL not in blob
+        assert not hasattr(exc.value, "reason")  # the raw path is not retained
+        assert all("PRIVATE" not in r.result for r in sink.records)
+        assert all("PRIVATE" not in str(r) for r in sink.records)
+        envelope = ErrorEnvelope.build(
+            code=exc.value.code, request_id="r", trace_id="t"
+        )
+        assert "PRIVATE" not in envelope.model_dump_json()
+
+    def test_input_key_with_colon_is_classified_not_echoed(self):
+        sink = _Sink()
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(
+            canonical_spec("knowledge.search", executor=lambda _c, _a: {"items": []})
+        )
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.search", {"query": "x", self.SENTINEL: "v"})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+        self._assert_nowhere(exc, sink)
+        assert sink.records[-1].result == "rejected:input_schema:additionalProperties"
+        gw.shutdown()
+
+    def test_output_key_with_colon_is_classified_not_echoed(self):
+        sink = _Sink()
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(
+            canonical_spec(
+                "knowledge.search",
+                output_schema={
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                    "required": ["items"],
+                    "additionalProperties": False,
+                },
+                executor=lambda _c, _a: {self.SENTINEL: "v"},
+            )
+        )
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.search", {"query": "x"})
+        assert exc.value.code is ErrorCode.TOOL_SCHEMA_REJECTED
+        self._assert_nowhere(exc, sink)
+        assert sink.records[-1].result.startswith("rejected:output_schema:")
+        assert "additionalProperties" in sink.records[-1].result
+        gw.shutdown()
+
+    def test_unknown_kind_collapses_to_other(self):
+        """Anything outside the fixed set is reported as ``other``."""
+        from app.tools.gateway import SCHEMA_VIOLATION_KINDS, _violation_kinds
+
+        assert "PRIVATE" not in _violation_kinds([f"$.{self.SENTINEL}"])
+        assert _violation_kinds([f"$.{self.SENTINEL}"]) == "other"
+        assert _violation_kinds(["$.query: required"]) == "required"
+        assert _violation_kinds(["$.a: type", "$.b: type"]) == "type"  # de-duplicated
+        assert SCHEMA_VIOLATION_KINDS  # the allowlist is non-empty
+
+
 class TestWholeErrorBoundaryIsScrubbed:
     """Review P1: EVERY gate reports the registry text, never model text."""
 
