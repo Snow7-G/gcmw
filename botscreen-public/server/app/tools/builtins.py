@@ -198,9 +198,9 @@ def make_knowledge_get_fragment(store: Any | None) -> Callable[[Any, dict], Any]
             None,
         )
         if item is None:
+            # the requested id is MODEL-SUPPLIED: it is never echoed in an error
             raise ToolGatewayError(
-                ErrorCode.NOT_FOUND_KNOWLEDGE,
-                f"source {source_id!r} not available",
+                ErrorCode.NOT_FOUND_KNOWLEDGE, "knowledge source not available"
             )
         content = _attr(item, "content")
         fragments = [
@@ -211,8 +211,7 @@ def make_knowledge_get_fragment(store: Any | None) -> Callable[[Any, dict], Any]
             fragments = [""]
         if fragment_index >= len(fragments):
             raise ToolGatewayError(
-                ErrorCode.NOT_FOUND_KNOWLEDGE,
-                f"fragment {fragment_index} out of range for {source_id!r}",
+                ErrorCode.NOT_FOUND_KNOWLEDGE, "fragment index out of range"
             )
         return {
             "source_id": _attr(item, "source_id"),

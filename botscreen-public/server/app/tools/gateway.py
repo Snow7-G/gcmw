@@ -58,7 +58,7 @@ from typing import Any
 from app.contracts.agent import ToolRequest, ToolResult
 from app.contracts.audit import AuditRecord
 from app.contracts.common import TenantContext
-from app.contracts.errors import ErrorCode
+from app.contracts.errors import ErrorCode, lookup
 from app.tools.specs import READONLY_TOOL_NAMES, ToolSpec
 from app.tools.validation import validate
 
@@ -429,8 +429,12 @@ class ToolGateway:
         try:
             payload = prepared.spec.executor(context, prepared.arguments)
         except ToolGatewayError as exc:
-            # a builtin's own registry-coded error: its text is authored, safe
-            raise _ToolFault("executor:" + exc.code.value, exc.code, str(exc)) from None
+            # NEVER trust executor-provided text — not even from a builtin: the
+            # boundary keeps the CODE and the registry's audited message only, so
+            # an error embedding model input can never reach a caller's log
+            raise _ToolFault(
+                "executor:" + exc.code.value, exc.code, lookup(exc.code).message
+            ) from None
         except Exception:  # noqa: BLE001 - executor internals NEVER leak
             # the exception text may carry provider payloads/paths/model output:
             # only the code and a fixed sentence reach the caller
@@ -565,6 +569,8 @@ class ToolGateway:
         abandoned work can never append a second, contradictory "success"
         record, because auditing happens ONLY on the awaiting side.
         """
+        # validated FIRST: an invalid budget fails before ANY gate runs
+        caller_budget = None if timeout_s is None else _validate_timeout_s(timeout_s)
         prepared = self._prepare(
             context,
             request,
@@ -575,8 +581,8 @@ class ToolGateway:
         # an explicit caller cap may only TIGHTEN the tool budget; it can never
         # extend it (that would let a caller outrun the deadline/timeout gates)
         budget = prepared.timeout_s
-        if timeout_s is not None:
-            budget = min(budget, _validate_timeout_s(timeout_s))
+        if caller_budget is not None:
+            budget = min(budget, caller_budget)
         future = self._submit(prepared, context, allow_injected=False)
         wrapped = asyncio.wrap_future(future, loop=asyncio.get_running_loop())
         try:

@@ -20,7 +20,7 @@ import pytest
 
 from app.contracts.agent import ToolRequest
 from app.contracts.common import SessionContext, TenantContext
-from app.contracts.errors import ErrorCode
+from app.contracts.errors import ErrorCode, ErrorEnvelope, lookup
 from app.tools.builtins import build_gateway
 from app.tools.gateway import ToolGateway, ToolGatewayError
 from app.tools.specs import READONLY_TOOL_NAMES, WhitelistError, canonical_spec
@@ -1327,6 +1327,136 @@ class TestAuditNeverCarriesUntrustedText:
         with pytest.raises(ToolGatewayError) as exc:
             _call(gw, "knowledge.get_fragment", {"source_id": "faq-1"})
         assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
+
+
+class TestRegistryCodedErrorsAreScrubbedToo:
+    """Review P1: a coded executor error must not smuggle its own text."""
+
+    SENTINEL = "SENTINEL-KNOWLEDGE-PAYLOAD-患者私密文本"
+
+    def _gateway(self, executor):
+        gw = ToolGateway(audit_sink=_Sink())
+        gw.register(canonical_spec("knowledge.get_fragment", executor=executor))
+        return gw
+
+    def _assert_clean(self, exc, sink):
+        assert exc.value.code is ErrorCode.NOT_FOUND_KNOWLEDGE  # code preserved
+        assert self.SENTINEL not in str(exc.value)
+        assert self.SENTINEL not in repr(exc.value)
+        # the message is the REGISTRY text, not the executor's
+        assert str(exc.value) == lookup(ErrorCode.NOT_FOUND_KNOWLEDGE).message
+        assert all(self.SENTINEL not in r.result for r in sink.records)
+        assert all(self.SENTINEL not in str(r) for r in sink.records)
+        # and the HTTP envelope would carry only the registry message
+        envelope = ErrorEnvelope.build(
+            code=exc.value.code, request_id="r", trace_id="t"
+        )
+        assert self.SENTINEL not in envelope.model_dump_json()
+
+    def test_sync_coded_error_is_scrubbed(self):
+        sink = _Sink()
+
+        def executor(_context, args):
+            raise ToolGatewayError(ErrorCode.NOT_FOUND_KNOWLEDGE, self.SENTINEL)
+
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(canonical_spec("knowledge.get_fragment", executor=executor))
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(gw, "knowledge.get_fragment", {"source_id": "x"})
+        self._assert_clean(exc, sink)
+        gw.shutdown()
+
+    def test_async_coded_error_is_scrubbed(self):
+        import asyncio
+
+        sink = _Sink()
+
+        def executor(_context, args):
+            raise ToolGatewayError(ErrorCode.NOT_FOUND_KNOWLEDGE, self.SENTINEL)
+
+        gw = ToolGateway(audit_sink=sink)
+        gw.register(canonical_spec("knowledge.get_fragment", executor=executor))
+        with pytest.raises(ToolGatewayError) as exc:
+            asyncio.run(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.get_fragment", {"source_id": "x"}),
+                    allowed_tools=["knowledge.get_fragment"],
+                    agent_id="a",
+                )
+            )
+        self._assert_clean(exc, sink)
+        gw.shutdown()
+
+    @pytest.mark.parametrize("runner", ["invoke", "ainvoke"])
+    def test_builtin_never_echoes_the_requested_source_id(self, runner):
+        """The BUILTIN's own message must not embed model-supplied input."""
+        import asyncio
+
+        sink = _Sink()
+        store = _store_with_one_approved()
+        gw = build_gateway(knowledge_store=store, audit_sink=sink)
+        arguments = {"source_id": self.SENTINEL}
+        request = _request("knowledge.get_fragment", arguments)
+
+        with pytest.raises(ToolGatewayError) as exc:
+            if runner == "invoke":
+                gw.invoke(
+                    TENANT,
+                    request,
+                    allowed_tools=["knowledge.get_fragment"],
+                    agent_id="a",
+                )
+            else:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        request,
+                        allowed_tools=["knowledge.get_fragment"],
+                        agent_id="a",
+                    )
+                )
+        assert exc.value.code is ErrorCode.NOT_FOUND_KNOWLEDGE
+        assert self.SENTINEL not in str(exc.value)
+        assert self.SENTINEL not in repr(exc.value)
+        assert all(self.SENTINEL not in r.result for r in sink.records)
+        gw.shutdown()
+
+    def test_fragment_index_out_of_range_has_no_identifier_either(self):
+        store = _store_with_one_approved(content="短内容")
+        gw = build_gateway(knowledge_store=store, audit_sink=_Sink())
+        with pytest.raises(ToolGatewayError) as exc:
+            _call(
+                gw,
+                "knowledge.get_fragment",
+                {"source_id": "faq-1", "fragment_index": 9},
+            )
+        assert exc.value.code is ErrorCode.NOT_FOUND_KNOWLEDGE
+        assert "faq-1" not in str(exc.value)
+        gw.shutdown()
+
+
+class TestInvalidBudgetFailsBeforeAnyGate:
+    """Review wording fix: validation happens BEFORE `_prepare`."""
+
+    def test_invalid_timeout_wins_over_a_gate_violation(self):
+        import asyncio
+
+        sink = _Sink()
+        gw = build_gateway(audit_sink=sink, knowledge_store=_store_with_one_approved())
+        with pytest.raises(ValueError):
+            asyncio.run(
+                gw.ainvoke(
+                    TENANT,
+                    # this argument would ALSO trip the identity gate
+                    _request("knowledge.search", {"query": "x", "tenant_id": "t2"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                    timeout_s=0,
+                )
+            )
+        assert sink.records == []  # no gate ran, so no audit record was written
+        gw.shutdown()
 
 
 class TestPoolLifecycle:
