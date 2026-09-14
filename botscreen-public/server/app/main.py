@@ -45,6 +45,8 @@ from app.config import Settings
 from app.contracts.errors import ErrorCode
 from app.providers.model_gateway import ModelGatewayError
 from app.runtime import build_run_repository, readiness_report
+from app.tools.builtins import build_gateway
+from app.tools.gateway import ToolGatewayError
 
 APP_TITLE = "gcmw agent api"
 APP_VERSION = "0.1.0"
@@ -158,6 +160,11 @@ def create_app(
         # SSE connection leases live beside the service: the last subscriber of
         # a run leaving starts the reconnect grace, and only then is the run
         # cancelled (see ``RunLeaseRegistry``)
+        # the tool gateway is the single tool entry point: whitelisted
+        # read-only specs only, identity injected by the server (#57/#69)
+        tool_gateway = build_gateway(audit_sink=_log_audit_record)
+        app.state.tool_gateway = tool_gateway
+
         leases = RunLeaseRegistry(
             on_expire=service.cancel_for_disconnect,
             grace_s=reconnect_grace_s,
@@ -171,8 +178,10 @@ def create_app(
             yield
         finally:
             await leases.shutdown()
+            tool_gateway.shutdown()  # release the bounded tool worker pool
             app.state.agent_service = None
             app.state.credentials = None
+            app.state.tool_gateway = None
             app.state.rate_limiter = None
             app.state.readiness = None
             app.state.stream_leases = None
@@ -182,6 +191,7 @@ def create_app(
     app.state.agent_service = None
     app.state.credentials = None
     app.state.rate_limiter = None
+    app.state.tool_gateway = None
     app.state.readiness = None
     app.state.stream_leases = None
 
@@ -205,6 +215,10 @@ def create_app(
 
     @app.exception_handler(ModelGatewayError)
     async def gateway_error_handler(request: Request, exc: ModelGatewayError):
+        return _envelope_response(request, exc.code)
+
+    @app.exception_handler(ToolGatewayError)
+    async def tool_error_handler(request: Request, exc: ToolGatewayError):
         return _envelope_response(request, exc.code)
 
     @app.exception_handler(RequestValidationError)
