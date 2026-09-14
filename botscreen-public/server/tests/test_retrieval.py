@@ -1,11 +1,20 @@
 """Tests for the RAG RetrievalService cascade (issue #53).
 
 Coverage: FAQ exact match stage, structured filters, deterministic lexical
-ranking with title/phrase boosts and stable tie-breaks, empty-query handling
-and the never-null source guard.
+ranking with title/phrase boosts and stable tie-breaks, empty-query handling,
+the never-null source guard, and the TENANCY contract — a trusted
+``TenantContext`` is required (a bare tenant id is refused), the production view
+receives exactly that context, and the same ``source_id`` in another tenant is
+invisible.
 """
 
+import pytest
+
+from app.contracts.common import TenantContext
 from app.rag.retrieval import RetrievalHit, RetrievalService, rank_items
+
+T1 = TenantContext(tenant_id="t1")
+T2 = TenantContext(tenant_id="t2")
 
 
 class _Item:
@@ -33,13 +42,15 @@ class _Item:
 
 
 class _Source:
+    """Production-view stand-in: scoped by the TRUSTED context it is handed."""
+
     def __init__(self, items) -> None:
         self._items = list(items)
+        self.contexts: list[object] = []
 
-    def production_items(self, tenant_id=None):
-        if tenant_id is None:
-            return list(self._items)
-        return [it for it in self._items if it.tenant_id == tenant_id]
+    def production_items(self, context):
+        self.contexts.append(context)
+        return [it for it in self._items if it.tenant_id == context.tenant_id]
 
 
 _FAQ = [
@@ -96,7 +107,7 @@ class TestRanking:
 
 class TestSearchCascade:
     def test_structured_filter_before_ranking(self):
-        hits = _service().search("咳嗽", source_type="department", tenant_id="t1")
+        hits = _service().search("咳嗽", source_type="department", context=T1)
         assert all(h.source_type == "department" for h in hits)
         assert hits[0].source_id == "dept-resp"
 
@@ -107,25 +118,50 @@ class TestSearchCascade:
                 _Item("b", "y", "咳嗽 护理", medical_domain="oncology"),
             ]
         )
-        hits = service.search("咳嗽", medical_domain="respiratory")
+        hits = service.search("咳嗽", context=T1, medical_domain="respiratory")
         assert [h.source_id for h in hits] == ["a"]
 
-    def test_tenant_narrowing_delegated_to_source(self):
+    def test_another_tenants_item_is_invisible(self):
         service = _service([_Item("a", "x", "发热 处理", tenant_id="t2")])
-        assert service.search("发热", tenant_id="t1") == []
+        assert service.search("发热", context=T1) == []
+        assert [h.source_id for h in service.search("发热", context=T2)] == ["a"]
+
+    def test_the_same_source_id_is_isolated_per_tenant(self):
+        """Identical source_id in two tenants: each sees only its own record."""
+        shared = [
+            _Item("faq-fever", "发热指南", "t1 版：成人发热三天就诊", tenant_id="t1"),
+            _Item("faq-fever", "发热指南", "t2 版：儿童发热两天就诊", tenant_id="t2"),
+        ]
+        service = _service(shared)
+        t1_hits = service.search("发热", context=T1)
+        t2_hits = service.search("发热", context=T2)
+        assert [h.source_id for h in t1_hits] == ["faq-fever"]
+        assert "t1 版" in t1_hits[0].snippet
+        assert "t2 版" in t2_hits[0].snippet
+
+    def test_a_bare_tenant_id_is_refused(self):
+        """Tenancy is an input, not a guess: no context -> no query."""
+        for bogus in ("t1", None, 1):
+            with pytest.raises(TypeError):
+                _service().search("发热", context=bogus)  # type: ignore[arg-type]
+
+    def test_the_production_view_receives_the_trusted_context(self):
+        source = _Source(_FAQ)
+        RetrievalService(source).search("咳嗽", context=T1)
+        assert source.contexts == [T1]  # the very object, not a derived id
 
     def test_top_k_limits_hits(self):
-        hits = _service().search("科", top_k=1)
+        hits = _service().search("科", context=T1, top_k=1)
         assert len(hits) <= 1
 
     def test_no_source_returns_empty(self):
-        assert RetrievalService(None).search("发热") == []
+        assert RetrievalService(None).search("发热", context=T1) == []
 
     def test_blank_query_returns_empty(self):
-        assert _service().search("   ") == []
+        assert _service().search("   ", context=T1) == []
 
     def test_hit_exposes_evidence_fields(self):
-        hits = _service().search("咳嗽 哮喘")
+        hits = _service().search("咳嗽 哮喘", context=T1)
         assert hits
         hit = hits[0]
         assert isinstance(hit, RetrievalHit)

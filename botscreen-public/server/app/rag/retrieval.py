@@ -8,13 +8,20 @@ Cascade implemented in v1 (V2.3 §6.2 subset):
 4. lightweight rerank   — title hits and phrase containment boost, stable
                           insertion-order tie-break.
 
-Only the *production view* of a knowledge source may be queried — the source
-is any object exposing ``production_items(tenant_id) -> list`` of items with
-``source_id/title/content/...`` attributes (the #56 KnowledgeStore satisfies
-this structurally; its production view already gates review status and
-validity windows, so unreviewed content is unreachable here by construction).
-PostgreSQL reconciliation and vector recall arrive with the storage layer
-(#40) behind the same interface.
+Only the *production view* of a knowledge source may be queried — the source is
+any object exposing ``production_items(context) -> list`` of items with
+``source_id/title/content/...`` attributes (the #56 KnowledgeStore satisfies this
+structurally; its production view already gates review status, validity windows
+and supersession, so unreviewed/expired/revoked content is unreachable here by
+construction). PostgreSQL reconciliation and vector recall arrive with the
+storage layer (#40) behind the same interface.
+
+TENANCY: ``search`` takes a trusted
+:class:`app.contracts.common.TenantContext` — never a tenant id string. The
+tenant of a query is therefore decided by the server-injected context, and the
+production view is asked for exactly that tenant, so the same ``source_id`` in
+another tenant is invisible here. A caller without a trusted context cannot
+query at all (fail loud, not empty results).
 """
 
 from __future__ import annotations
@@ -23,6 +30,8 @@ import math
 import re
 from dataclasses import dataclass
 from typing import Any
+
+from app.contracts.common import TenantContext
 
 _PHRASE_SPLIT = re.compile(r"\s+")
 _SNIPPET_CHARS = 240
@@ -121,10 +130,14 @@ def rank_items(items: list[Any], query: str) -> list[tuple[int, int, Any]]:
     scored: list[tuple[int, int, Any]] = []
     for index, (item, tokens) in enumerate(zip(items, token_sets)):
         title_tokens = set(tokenize(_attr(item, "title")))
+        document = _document(item)
         score = 0
         matched_any = False
         for token in query_tokens:
-            if token not in tokens:
+            # recall is TOKEN-set membership or plain substring containment: a
+            # long unbroken run ("xxxx…") is one ASCII token, so a short query
+            # token must still be able to find it inside the text
+            if token not in tokens and token not in document:
                 continue
             matched_any = True
             idf = math.log(1 + total / (1 + frequencies.get(token, 0)))
@@ -168,19 +181,30 @@ class RetrievalService:
         self,
         query: str,
         *,
-        tenant_id: str | None = None,
+        context: TenantContext,
         top_k: int = 5,
         source_type: str | None = None,
         medical_domain: str | None = None,
         audience: str | None = None,
     ) -> list[RetrievalHit]:
-        """Query the production view only. Filters apply before ranking;
-        results are sorted by descending score with stable ties."""
+        """Query the production view of ``context.tenant_id`` only.
+
+        Filters apply before ranking; results are sorted by descending score with
+        stable ties. The context is REQUIRED and must be a trusted
+        :class:`TenantContext`: tenancy is an input to this function, not an
+        argument it will guess, and a bare tenant id (or ``None``) is refused
+        rather than silently widening the query.
+        """
+        if not isinstance(context, TenantContext):
+            raise TypeError(
+                "retrieval requires a trusted TenantContext, not "
+                f"{type(context).__name__}"
+            )
         if not (query or "").strip():
             return []
         if self._source is None:
             return []
-        production = list(self._source.production_items(tenant_id))
+        production = list(self._source.production_items(context))
 
         # structured-filter stage
         if source_type is not None:

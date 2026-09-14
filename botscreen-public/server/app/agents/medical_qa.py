@@ -8,22 +8,36 @@ Hard rules (V2.3 §6.2/§7):
 - the answer model is reachable ONLY through the ModelGateway duck — the
   agent never calls a provider SDK directly; every call is recorded with the
   actual provider/model ids for the run record;
-- answers are evidence-grounded: when retrieval finds nothing the agent
-  returns an empty answer with ``safety="no_evidence"`` — it never invents
-  content from a model call without approved evidence;
-- tool usage is bounded (≤ ``max_tool_calls``) and counted for the Manager's
-  run budget; marker actions carry no chain-of-thought or raw text.
+- answers are evidence-grounded: when retrieval finds nothing the agent FAILS
+  the run (``status=FAILED``, ``safety="no_evidence"``, empty answer) — it never
+  invents content from a model call without approved evidence, and the model is
+  not even asked;
+- citations are carried on the evidence itself: every delivered
+  :class:`~app.contracts.agent.Evidence` carries the ``source_id`` /
+  ``knowledge_version`` / ``content_hash`` of the approved production record it
+  came from, so a citation can be verified against the store;
+- tenancy comes from the trusted ToolGateway context only: the agent never sends
+  a tenant/session/reviewer argument (those are not in the tool schema at all —
+  ``additionalProperties: false``), so it cannot ask for another tenant's data;
+- tool usage is bounded (≤ ``max_tool_calls``) and the EXACT number of gateway
+  round-trips — including failed ones — is reported as ``tool_calls`` for the
+  Manager's run budget; marker actions carry no chain-of-thought or raw text.
 
-The agent implements the runner shape that ManagerAgent (#52) drives: it
-consumes an AgentContext and returns an execution result whose attributes
-match #52's ``AgentExecution`` structurally.
+The agent implements the runner contract ManagerAgent (#52) drives: it consumes
+an AgentContext and returns :class:`app.agents.manager.AgentExecution` (evidence
+as a tuple, identity bound to the routed agent id), so the Manager's trust
+boundary accepts it without an adapter.
+
+Model provenance note: provider/model ids are still filled in on the execution,
+but the Manager does NOT publish them (no trusted source yet, see #52) — the run
+record gets provenance from the trusted ModelGateway wiring in #55A.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from app.agents.manager import AgentExecution
 from app.contracts.agent import AgentContext, AgentStatus, Evidence, ToolRequest
 from app.contracts.model import ModelRequest
 from app.rag.retrieval import RetrievalHit
@@ -35,33 +49,21 @@ _GROUNDED_HEADER = (
 )
 
 
-@dataclass
-class QAExecution:
-    """Runner result structurally compatible with ManagerAgent.AgentExecution."""
-
-    agent_id: str = "qa"
-    status: AgentStatus = AgentStatus.COMPLETED
-    answer_candidate: str = ""
-    evidence: list[Evidence] = field(default_factory=list)
-    tool_calls: int = 0
-    provider_id: str = ""
-    model_id: str = ""
-    model_version: str = ""
-    safety_status: str = "unknown"
-
-
 class ToolGatewayDuck(Protocol):
-    """The #57 ToolGateway surface the agent is allowed to touch."""
+    """The #57 ToolGateway surface the agent is allowed to touch.
 
-    async def invoke(
+    Identity travels ONLY as the trusted context (first positional argument) —
+    there is no tenant/run/request kwarg to pass, and the gateway rejects any
+    identity key that appears inside ``request.arguments`` anyway.
+    """
+
+    async def ainvoke(
         self,
+        context: Any,
         request: ToolRequest,
         *,
-        allowed_tools: list[str],
-        agent_id: str,
-        tenant_id: str,
-        run_id: str,
-        request_id: str,
+        allowed_tools: Any = (),
+        agent_id: str = "",
     ) -> Any: ...
 
 
@@ -98,6 +100,7 @@ class MedicalQAAgent:
         max_tool_calls: int = 4,
         max_fragments: int = 2,
         provider_hint: str | None = None,
+        agent_id: str = "qa",
     ) -> None:
         self._models = models
         self._tools = tools
@@ -105,26 +108,28 @@ class MedicalQAAgent:
         self._max_tool_calls = max_tool_calls
         self._max_fragments = max_fragments
         self._provider_hint = provider_hint
+        # the id this agent reports back: the Manager's trust boundary requires
+        # it to equal the routed manifest id, so wiring sets it explicitly
+        self._agent_id = agent_id
 
     # -- internal helpers -----------------------------------------------------
 
     async def _search(
         self, ctx: AgentContext, budget: dict[str, int]
     ) -> list[RetrievalHit]:
-        result = await self._tools.invoke(
+        result = await self._tools.ainvoke(
+            ctx,  # trusted identity: the gateway derives tenant/session/run here
             ToolRequest(
                 tool_name="knowledge.search",
+                # NO identity arguments: tenant/session come from the context the
+                # gateway injects, and the schema forbids extra properties
                 arguments={
                     "query": ctx.normalized_input,
-                    "tenant_id": ctx.tenant_id,
                     "top_k": self._max_fragments + 2,
                 },
             ),
             allowed_tools=self._allowed_tools,
-            agent_id="qa",
-            tenant_id=ctx.tenant_id,
-            run_id=ctx.run_id,
-            request_id=ctx.run_id,
+            agent_id=self._agent_id,
         )
         budget["calls"] += 1
         if not result.ok:
@@ -151,19 +156,14 @@ class MedicalQAAgent:
     async def _fragment(
         self, ctx: AgentContext, hit: RetrievalHit, budget: dict[str, int]
     ) -> str:
-        result = await self._tools.invoke(
+        result = await self._tools.ainvoke(
+            ctx,
             ToolRequest(
                 tool_name="knowledge.get_fragment",
-                arguments={
-                    "source_id": hit.source_id,
-                    "tenant_id": ctx.tenant_id,
-                },
+                arguments={"source_id": hit.source_id},
             ),
             allowed_tools=self._allowed_tools,
-            agent_id="qa",
-            tenant_id=ctx.tenant_id,
-            run_id=ctx.run_id,
-            request_id=ctx.run_id,
+            agent_id=self._agent_id,
         )
         budget["calls"] += 1
         if not result.ok:
@@ -173,7 +173,30 @@ class MedicalQAAgent:
 
     # -- main entry -------------------------------------------------------------
 
-    async def run(self, context: AgentContext) -> QAExecution:
+    def _execution(
+        self,
+        *,
+        status: AgentStatus,
+        safety: str,
+        tool_calls: int,
+        answer: str = "",
+        evidence: list[Evidence] | None = None,
+        response: Any | None = None,
+    ) -> AgentExecution:
+        """Build the immutable runner result the Manager's boundary expects."""
+        return AgentExecution(
+            agent_id=self._agent_id,
+            status=status,
+            answer_candidate=answer,
+            evidence=tuple(evidence or ()),
+            tool_calls=tool_calls,
+            provider_id=getattr(response, "provider_id", ""),
+            model_id=getattr(response, "model_id", ""),
+            model_version=getattr(response, "model_version", ""),
+            safety_status=safety,
+        )
+
+    async def run(self, context: AgentContext) -> AgentExecution:
         """Answer one grounded turn. Raises nothing by design except gateway
         violations — failures surface as structured results for the Manager.
 
@@ -181,10 +204,10 @@ class MedicalQAAgent:
         concurrent runs on one shared agent instance can never interleave
         counters (the budget is a security control, not shared state)."""
         budget = {"calls": 0}
-        execution = QAExecution(agent_id="qa", status=AgentStatus.COMPLETED)
         if not (context.normalized_input or "").strip():
-            execution.status = AgentStatus.FAILED
-            return execution
+            return self._execution(
+                status=AgentStatus.FAILED, safety="invalid_input", tool_calls=0
+            )
 
         hits = await self._search(context, budget)
 
@@ -200,12 +223,13 @@ class MedicalQAAgent:
                 f"（来源 {hit.source_id} / {hit.knowledge_version}）\n{text}"
             )
 
-        execution.evidence = evidence
-        execution.tool_calls = budget["calls"]
+        tool_calls = budget["calls"]
         if not evidence:
-            # no approved evidence: never invent an answer
-            execution.safety_status = "no_evidence"
-            return execution
+            # no approved evidence: FAIL the run (never an empty success) and do
+            # not even ask the model — an answer may not come from "common sense"
+            return self._execution(
+                status=AgentStatus.FAILED, safety="no_evidence", tool_calls=tool_calls
+            )
 
         user_text = (
             _GROUNDED_HEADER
@@ -221,14 +245,21 @@ class MedicalQAAgent:
                 provider_hint=self._provider_hint,
             )
         )
-        execution.provider_id = response.provider_id
-        execution.model_id = response.model_id
-        execution.model_version = response.model_version
-        execution.answer_candidate = (response.content or "").strip()
-        if not execution.answer_candidate:
+        answer = (response.content or "").strip()
+        if not answer:
             # grounded but empty model output: do not deliver an empty success
-            execution.status = AgentStatus.FAILED
-            execution.safety_status = "empty_reply"
-            return execution
-        execution.safety_status = "grounded"
-        return execution
+            return self._execution(
+                status=AgentStatus.FAILED,
+                safety="empty_reply",
+                tool_calls=tool_calls,
+                evidence=evidence,
+                response=response,
+            )
+        return self._execution(
+            status=AgentStatus.COMPLETED,
+            safety="grounded",
+            tool_calls=tool_calls,
+            answer=answer,
+            evidence=evidence,
+            response=response,
+        )
