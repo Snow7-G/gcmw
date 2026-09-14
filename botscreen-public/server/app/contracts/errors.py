@@ -51,6 +51,7 @@ class ErrorCode(str, Enum):
     AUTHZ_FORBIDDEN = "E_AUTHZ_FORBIDDEN"
     # rate limiting / conflicts
     RATE_LIMIT_EXCEEDED = "E_RATE_LIMIT_EXCEEDED"
+    RUN_BUDGET_EXCEEDED = "E_RUN_BUDGET_EXCEEDED"
     CONFLICT_ACTIVE_RUN = "E_CONFLICT_ACTIVE_RUN"
     CONFLICT_IDEMPOTENCY = "E_CONFLICT_IDEMPOTENCY"
     # resources
@@ -196,6 +197,14 @@ _register(
     True,
     False,
     "请求过于频繁，请稍后再试",
+)
+_register(
+    ErrorCode.RUN_BUDGET_EXCEEDED,
+    ErrorCategory.RATE_LIMIT,
+    429,
+    False,
+    True,
+    "超出本次运行预算限制",
 )
 _register(
     ErrorCode.CONFLICT_ACTIVE_RUN,
