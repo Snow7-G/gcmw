@@ -8,11 +8,19 @@ Cascade implemented in v1 (V2.3 §6.2 subset):
 4. lightweight rerank   — title hits and phrase containment boost, stable
                           insertion-order tie-break.
 
-CANDIDACY is gated by relevance, not by scoring: a document enters the result
-set only when a CJK bigram, an ASCII/numeric token or the normalized phrase
-matches. A single shared CJK character ("痛" in 腹痛 vs 眼痛) may contribute to
-the score but can never justify calling the record evidence, so an unrelated
-approved item cannot produce a "grounded" answer.
+CANDIDACY is gated by CONTENT relevance, not by scoring. A document enters the
+result set only when
+* a CJK bigram of the CORE query matches (token or substring), or
+* an ASCII/numeric token of length >= 2 matches, or
+* the normalized CORE phrase (length >= 2) is contained in the document.
+
+Question scaffolding ("请问/怎么办/怎么处理/可以吗" … see
+:data:`_QUESTION_SCAFFOLD`) is stripped from the QUERY first, so a shared "怎么办"
+can never make two unrelated questions look alike, and single characters — a lone
+CJK character, a letter or a digit ("1号楼眼科" vs "1型糖尿病", "维生素A说明" vs
+"A型流感", "腹痛" vs "眼痛") — may contribute to the score but can never establish
+candidacy. This is a deliberately small, deterministic MVP lexical gate, not a
+medical dictionary, an NLP model or a vector index.
 
 Only the *production view* of a knowledge source may be queried — the source is
 any object exposing ``production_items(context) -> list`` of items with
@@ -55,19 +63,47 @@ def _is_cjk(ch: str) -> bool:
     return 0x4E00 <= ord(ch) <= 0x9FFF
 
 
-def _token_class(token: str) -> str:
-    """What a matched token is allowed to PROVE.
+#: MVP lexical gate: question scaffolding carries no medical content, so it is
+#: stripped from a QUERY before candidacy and scoring. A small, deterministic,
+#: reviewable list — explicitly NOT a medical dictionary and NOT an NLP model.
+#: Longer phrases are removed first so "怎么处理" is not reduced to "处理".
+_QUESTION_SCAFFOLD: tuple[str, ...] = (
+    "请问一下",
+    "怎么处理",
+    "如何处理",
+    "怎么治疗",
+    "如何治疗",
+    "需不需要",
+    "怎么回事",
+    "有什么",
+    "是什么",
+    "怎么办",
+    "怎么做",
+    "怎么治",
+    "如何做",
+    "可以吗",
+    "请问",
+    "咋办",
+    "怎样",
+    "要不要",
+    "行吗",
+    "怎么",
+    "如何",
+    "什么",
+)
+_SCAFFOLD_ORDER: tuple[str, ...] = tuple(
+    sorted(_QUESTION_SCAFFOLD, key=len, reverse=True)
+)
 
-    ``cjk1`` — a single CJK character. It may contribute to the score but can
-    never make a document a candidate on its own: one shared common character
-    ("痛" in 腹痛 vs 眼痛) would otherwise turn an unrelated approved record into
-    "evidence". ``cjk`` — a CJK bigram or longer. ``word`` — an ASCII/numeric
-    token (any length: #57's substring recall relies on short tokens finding long
-    unbroken runs).
+
+def _is_strong_token(token: str) -> bool:
+    """Eligibility: a CONTENT token — a CJK bigram or an ASCII/numeric token >= 2.
+
+    A single CJK character, a single letter or a single digit may contribute to
+    the SCORE but can never make a document a candidate: shared characters and
+    digits are not evidence of relevance.
     """
-    if all(_is_cjk(ch) for ch in token):
-        return "cjk1" if len(token) == 1 else "cjk"
-    return "word"
+    return len(token) >= 2
 
 
 def tokenize(text: str) -> list[str]:
@@ -108,6 +144,19 @@ def normalize_text(text: str) -> str:
     return " ".join(_PHRASE_SPLIT.split((text or "").lower())).strip()
 
 
+def normalize_core_query(text: str) -> str:
+    """The query with question scaffolding removed (MVP lexical gate).
+
+    "发热怎么办" -> "发热", "B超怎么做" -> "b超". Stripping happens before both
+    candidacy and scoring, so the scaffolding cannot create false relevance and
+    cannot inflate the score either.
+    """
+    core = normalize_text(text)
+    for phrase in _SCAFFOLD_ORDER:
+        core = core.replace(phrase, " ")
+    return " ".join(core.split())
+
+
 @dataclass(frozen=True)
 class RetrievalHit:
     """One ranked, filter-passing hit over the production view."""
@@ -135,10 +184,11 @@ def rank_items(items: list[Any], query: str) -> list[tuple[int, int, Any]]:
     Returns ``(negative_score, insertion_index, item)`` triples so the caller
     can sort stably without ever touching item internals.
     """
-    query_tokens = tokenize(query)
+    norm_query = normalize_core_query(query)  # scaffolding removed
+    query_tokens = tokenize(norm_query)
     if not query_tokens:
-        return []
-    norm_query = normalize_text(query)
+        return []  # a query that is ONLY scaffolding has no content to match
+    raw_query = normalize_text(query)
     frequencies: dict[str, int] = {}
     token_sets: list[set[str]] = []
     for item in items:
@@ -159,11 +209,11 @@ def rank_items(items: list[Any], query: str) -> list[tuple[int, int, Any]]:
         eligible = False
         for token in query_tokens:
             # recall is TOKEN-set membership or plain substring containment: a
-            # long unbroken run ("xxxx…") is one ASCII token, so a short query
-            # token must still be able to find it inside the text
+            # long unbroken run ("xxxx…") is one ASCII token, so a multi-character
+            # query token must still be able to find it inside the text
             if token not in tokens and token not in document:
                 continue
-            if _token_class(token) != "cjk1":
+            if _is_strong_token(token):
                 eligible = True
             idf = math.log(1 + total / (1 + frequencies.get(token, 0)))
             score += idf
@@ -172,8 +222,8 @@ def rank_items(items: list[Any], query: str) -> list[tuple[int, int, Any]]:
         if len(norm_query) >= 2 and norm_query in document:
             eligible = True
             score += 10  # phrase containment boost
-        if norm_query and norm_query == normalize_text(_attr(item, "content")):
-            score += 5  # FAQ exact-match cascade stage
+        if raw_query and raw_query == normalize_text(_attr(item, "content")):
+            score += 5  # FAQ exact-match cascade stage (full question text)
         if not eligible:
             continue
         scored.append((-score, index, item))

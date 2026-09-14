@@ -168,7 +168,9 @@ class MedicalQAAgent:
         fragment answer must AGREE with the hit on ``source_id``,
         ``knowledge_version`` and ``content_hash`` — otherwise a delivered
         citation would pair one version's text with another version's
-        provenance.
+        provenance. ``fragment_index``/``total_fragments`` are validated as
+        STRICT integers (a bool or a float is refused even when it compares equal
+        to 0/1).
 
         There is deliberately NO fallback to the search snippet: a citation that
         cannot be tied to the exact version it came from is worse than refusing
@@ -213,7 +215,10 @@ class MedicalQAAgent:
             return None
         if data.get("content_hash") != hit.content_hash:
             return None
-        if data.get("fragment_index") != 0:
+        index = data.get("fragment_index")
+        # STRICT integer 0: ``False == 0`` and ``0.0 == 0`` are both true in
+        # Python, so an equality test alone would accept a bool or a float
+        if isinstance(index, bool) or not isinstance(index, int) or index != 0:
             return None
         total = data.get("total_fragments")
         if isinstance(total, bool) or not isinstance(total, int) or total < 1:

@@ -259,10 +259,12 @@ class TestSizeGate:
         gw = build_gateway(
             audit_sink=sink,
             default_max_result_bytes=64,
-            knowledge_store=_store_with_one_approved(content="x" * 5000),
+            knowledge_store=_store_with_one_approved(content="needle" * 900),
         )
         with pytest.raises(ToolGatewayError) as exc:
-            _call(gw, "knowledge.search", {"query": "x"})
+            # a multi-character substring: single characters are deliberately not
+            # evidence in #53's relevance gate, and this test is about SIZE
+            _call(gw, "knowledge.search", {"query": "needle"})
         assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
         assert "result_bytes=" in sink.records[-1].result
         assert "result_bytes=" in sink.records[-1].result  # audit keeps the size

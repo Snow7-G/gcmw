@@ -11,9 +11,15 @@ invisible.
 from typing import ClassVar
 
 import pytest
+from pytest import mark
 
 from app.contracts.common import TenantContext
-from app.rag.retrieval import RetrievalHit, RetrievalService, rank_items
+from app.rag.retrieval import (
+    RetrievalHit,
+    RetrievalService,
+    normalize_core_query,
+    rank_items,
+)
 
 T1 = TenantContext(tenant_id="t1")
 T2 = TenantContext(tenant_id="t2")
@@ -139,11 +145,57 @@ class TestRelevanceGate:
             "faq-fever"
         ]
 
-    def test_ascii_substring_recall_is_preserved(self):
-        """#57 relies on a short ASCII token finding a long unbroken run."""
-        items = [_Item("long", "标题", "x" * 400)]
-        hits = _service(items).search("x", context=T1)
+    @mark.parametrize("query", ["xx", "needle"])
+    def test_multi_character_ascii_substring_recall_is_preserved(self, query):
+        """#57 relies on a >=2-char ASCII token finding a long unbroken run."""
+        content = "x" * 400 if query == "xx" else "a" * 100 + "needle" + "b" * 100
+        items = [_Item("long", "标题", content)]
+        hits = _service(items).search(query, context=T1)
         assert [h.source_id for h in hits] == ["long"]
+
+    def test_a_single_ascii_character_is_not_evidence(self):
+        items = [_Item("long", "标题", "x" * 400)]
+        assert _service(items).search("x", context=T1) == []
+        assert _service(items).search("1", context=T1) == []
+
+    @mark.parametrize(
+        ("query", "title", "content"),
+        [
+            ("发热怎么办", "腹泻怎么办", "腹泻怎么办？"),
+            ("腹痛怎么办", "眼痛怎么办", "眼痛怎么办？"),
+            ("1型糖尿病怎么办", "1号楼眼科", "1号楼眼科门诊安排。"),
+            ("A型流感怎么办", "维生素A说明", "维生素A说明与用法。"),
+        ],
+    )
+    def test_scaffolding_and_single_characters_are_not_evidence(
+        self, query, title, content
+    ):
+        """Review P1: a shared 怎么办, digit or letter proves nothing.
+
+        These pairs share ONLY scaffolding or a single ASCII/digit character, and
+        each of them produced a "grounded" answer before the content-word gate.
+        """
+        assert _service([_Item("only", title, content)]).search(query, context=T1) == []
+
+    @mark.parametrize(
+        ("query", "title", "content"),
+        [
+            ("发热怎么办", "发热指南", "成人发热超过三天建议门诊就诊。"),
+            ("腹泻怎么办", "腹泻处理指南", "腹泻伴脱水表现需及时就诊。"),
+            ("1型糖尿病怎么办", "1型糖尿病指南", "1型糖尿病需规范监测血糖。"),
+            ("B超怎么做", "B超检查指南", "B超检查前需空腹八小时。"),
+        ],
+    )
+    def test_content_word_hits_still_match(self, query, title, content):
+        """The gate must not be over-broad: real content words still hit."""
+        hits = _service([_Item("hit", title, content)]).search(query, context=T1)
+        assert [h.source_id for h in hits] == ["hit"]
+
+    def test_scaffolding_is_stripped_before_scoring(self):
+        assert normalize_core_query("发热怎么办") == "发热"
+        assert normalize_core_query("请问B超怎么做") == "b超"
+        assert normalize_core_query("怎么处理发热") == "发热"
+        assert normalize_core_query("可以吗") == ""  # only scaffolding: no content
 
     def test_a_single_character_never_decides_candidacy_but_still_scores(self):
         """Two eligible docs: the one also sharing the lone character ranks first."""
@@ -203,7 +255,7 @@ class TestSearchCascade:
         assert source.contexts == [T1]  # the very object, not a derived id
 
     def test_top_k_limits_hits(self):
-        hits = _service().search("科", context=T1, top_k=1)
+        hits = _service().search("内科", context=T1, top_k=1)
         assert len(hits) <= 1
 
     def test_no_source_returns_empty(self):
