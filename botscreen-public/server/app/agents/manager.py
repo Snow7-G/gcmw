@@ -33,7 +33,10 @@ import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Any, Protocol
+
+from pydantic import AwareDatetime
 
 from app.contracts.agent import AgentContext, AgentResult, AgentStatus, Evidence
 from app.contracts.errors import ErrorCode
@@ -45,6 +48,49 @@ _PII_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[A-Za-z0-9]{16,}"),  # vendor API key style
     re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)"),  # CN mobile number
     re.compile(r"(?<!\d)\d{17}[\dXx](?!\d)"),  # CN id card number
+)
+
+
+# The ONLY marker types this module may publish, and the ONLY keys those
+# markers may carry. Both axes are allowlisted in :meth:`ManagerAgent._mark`, so
+# free text (raw input, prompt, model output, chain-of-thought) has no path into
+# ``AgentResult.actions`` even by mistake: a marker is a typed decision, not a
+# place to attach prose.
+SAFE_MARKER_TYPES: frozenset[str] = frozenset(
+    {
+        "manager.guard",
+        "manager.risk",
+        "manager.route",
+        "manager.revised",
+        "route.handoff",
+        "agent.done",
+        "model.call",
+        "safety.escalate",
+        "verify.handoff",
+        "verify.verdict",
+        "verify.revise",
+        "verify.missing",
+        "verify.blocked",
+        "verify.escalated",
+        "verify.reject_final",
+    }
+)
+
+SAFE_MARKER_KEYS: frozenset[str] = frozenset(
+    {
+        "type",
+        "intent",
+        "level",
+        "agent_id",
+        "handoffs",
+        "status",
+        "outcome",
+        "revision",
+        "count",
+        "provider_id",
+        "model_id",
+        "model_version",
+    }
 )
 
 
@@ -68,8 +114,74 @@ class ManagerAgentError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class RedFlagRules:
+    """Clinically APPROVED red-flag rule set (V2.3 §5.3).
+
+    An empty or unapproved rule set cannot be represented, and the Manager
+    refuses to run without one: "no rules configured" must never mean "no red
+    flags found". ``approved_by``/``approved_at`` record the clinical sign-off.
+    """
+
+    patterns: tuple[str, ...]
+    approved_by: str
+    approved_at: AwareDatetime
+
+    def __post_init__(self) -> None:
+        if not self.patterns:
+            raise ValueError("red-flag rules must not be empty")
+        if not all(isinstance(item, str) and item.strip() for item in self.patterns):
+            raise ValueError("red-flag rules must be non-empty strings")
+        if not self.approved_by or not self.approved_by.strip():
+            raise ValueError("red-flag rules need an approving clinician")
+
+    def matches(self, text: str) -> bool:
+        lowered = text.lower()
+        return any(rule.lower() in lowered for rule in self.patterns)
+
+
+class RiskLevel(str, Enum):
+    """Question risk as decided by the Manager BEFORE routing."""
+
+    LOW = "low"
+    HIGH = "high"
+
+
+@dataclass(frozen=True)
+class RiskRules:
+    """Clinically APPROVED high-risk question markers.
+
+    Same fail-closed contract as :class:`RedFlagRules`: without an approved
+    marker set the Manager cannot claim a question is low risk.
+    """
+
+    patterns: tuple[str, ...]
+    approved_by: str
+    approved_at: AwareDatetime
+
+    def __post_init__(self) -> None:
+        if not self.patterns:
+            raise ValueError("risk markers must not be empty")
+        if not self.approved_by or not self.approved_by.strip():
+            raise ValueError("risk markers need an approving clinician")
+
+    def classify(self, text: str) -> RiskLevel:
+        lowered = text.lower()
+        for pattern in self.patterns:
+            if pattern.lower() in lowered:
+                return RiskLevel.HIGH
+        return RiskLevel.LOW
+
+
+@dataclass(frozen=True)
 class ManagerLimits:
-    """Hard per-run budgets (V2.3 §6.1: ≤2 handoffs, ≤4 tools, ≤1 revision)."""
+    """Per-run budgets (V2.3 §6.1: ≤2 handoffs, ≤4 tools, ≤1 revision).
+
+    IMPORTANT (honest scope): the handoff budget is enforced by this module at
+    call time, but ``max_tool_calls`` is a **POST-HOC check** — tool calls are
+    read from the sub-agent's own report after it returns. Call-time hard
+    counting requires the ToolGateway quota path and lands with #55A; until
+    then this PR must not claim the tool budget is preemptively enforced.
+    """
 
     max_input_chars: int = 2000
     max_handoffs: int = 2
@@ -92,10 +204,29 @@ class AgentExecution:
     safety_status: str = "unknown"
 
 
+class VerifierOutcome(str, Enum):
+    """The verifier's decision. A boolean cannot express it (V2.3 §6.4):
+
+    * ``PASS``     — the answer may be delivered;
+    * ``REVISE``   — the ONE controlled retry (and only this outcome retries);
+    * ``BLOCK``    — stop immediately: no retry, no answer;
+    * ``ESCALATE`` — hand the case to a human: no AI answer is delivered.
+    """
+
+    PASS = "pass"
+    REVISE = "revise"
+    BLOCK = "block"
+    ESCALATE = "escalate"
+
+
 @dataclass(frozen=True)
 class Verdict:
-    approved: bool
+    outcome: VerifierOutcome
     reason: str = ""
+
+    @property
+    def approved(self) -> bool:
+        return self.outcome is VerifierOutcome.PASS
 
 
 class AgentRunner(Protocol):
@@ -122,7 +253,8 @@ class ManagerAgent:
         verifier: VerifierRunner | None = None,
         intent_routes: Mapping[str, tuple[str, ...]] | None = None,
         default_intent: str = "knowledge",
-        red_flags: tuple[str, ...] = (),
+        red_flag_rules: RedFlagRules | None = None,
+        risk_rules: RiskRules | None = None,
         clock: Callable[[], datetime] | None = None,
         limits: ManagerLimits | None = None,
     ) -> None:
@@ -132,7 +264,21 @@ class ManagerAgent:
         # intent -> keyword tuple; first keyword hit wins (registration order)
         self._intent_routes: dict[str, tuple[str, ...]] = dict(intent_routes or {})
         self._default_intent = default_intent
-        self._red_flags = tuple(red_flags)
+        # FAIL CLOSED at construction: a Manager without clinically approved
+        # red-flag and risk rules could silently "find no red flags" and route a
+        # high-risk question down the normal path.
+        if red_flag_rules is None:
+            raise ValueError(
+                "red_flag_rules are required: an unconfigured red-flag set must "
+                "never default to 'no red flags found'"
+            )
+        if risk_rules is None:
+            raise ValueError(
+                "risk_rules are required: without approved markers the Manager "
+                "cannot classify a question as low risk"
+            )
+        self._red_flag_rules = red_flag_rules
+        self._risk_rules = risk_rules
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._limits = limits or ManagerLimits()
 
@@ -166,8 +312,13 @@ class ManagerAgent:
     # -- red-flag pre-model gate ------------------------------------------------
 
     def _red_flag_escalated(self, cleaned: str) -> bool:
-        lowered = cleaned.lower()
-        return any(rule.lower() in lowered for rule in self._red_flags)
+        """True when an APPROVED clinical red-flag rule matches.
+
+        The rule set is mandatory (see ``__init__``): an unconfigured or
+        unapproved set can never reach this point, so "no match" always means
+        "the approved rules were actually evaluated".
+        """
+        return self._red_flag_rules.matches(cleaned)
 
     # -- lightweight routing ----------------------------------------------------
 
@@ -222,6 +373,11 @@ class ManagerAgent:
                 safety="escalated",
             )
 
+        # risk is decided BEFORE routing: a high-risk question may never take a
+        # low-risk shortcut, and it always requires verification
+        risk = self._risk_rules.classify(cleaned)
+        self._mark(actions, "manager.risk", level=risk.value)
+
         intent = self._classify_intent(cleaned)
         self._mark(actions, "manager.route", intent=intent)
         manifest = self._resolve_agent(intent, ctx)
@@ -250,7 +406,19 @@ class ManagerAgent:
 
         verdict: Verdict | None = None
         revisions = 0
-        if self._verifier is not None and execution.status is AgentStatus.COMPLETED:
+        if self._verifier is None:
+            # NO VERIFIER = NO MEDICAL ANSWER. The previous behaviour marked the
+            # run "passed"; an unverified answer must never leave this module.
+            self._mark(actions, "verify.missing")
+            return self._finalize(
+                ctx,
+                actions,
+                evidence,
+                status=AgentStatus.FAILED,
+                answer="",
+                safety="unverified",
+            )
+        if execution.status is AgentStatus.COMPLETED:
             # verification is a second distinct engagement; revisions re-run the
             # same routed agent in-loop and do not consume new handoffs
             handoffs += 1
@@ -261,8 +429,14 @@ class ManagerAgent:
             verdict = await self._run_with_deadline(
                 self._verifier(sub_ctx, execution), self._remaining_ms(ctx)
             )
-            self._mark(actions, "verify.verdict", approved=verdict.approved)
-            while not verdict.approved and revisions < self._limits.max_revisions:
+            self._mark(actions, "verify.verdict", outcome=verdict.outcome.value)
+            # ONLY "revise" retries, exactly once. BLOCK stops immediately and
+            # ESCALATE goes to a human — neither may be retried or re-answered.
+            while (
+                verdict is not None
+                and verdict.outcome is VerifierOutcome.REVISE
+                and revisions < self._limits.max_revisions
+            ):
                 revisions += 1
                 self._mark(actions, "verify.revise", revision=revisions)
                 execution = await self._run_with_deadline(
@@ -274,12 +448,36 @@ class ManagerAgent:
                 verdict = await self._run_with_deadline(
                     self._verifier(sub_ctx, execution), self._remaining_ms(ctx)
                 )
-                self._mark(actions, "verify.verdict", approved=verdict.approved)
+                self._mark(actions, "verify.verdict", outcome=verdict.outcome.value)
 
-        if verdict is not None and not verdict.approved:
-            # final rejection after ≤1 controlled revision: an unverified
-            # medical answer must never be delivered — the run fails cleanly
-            # with audit markers only (no answer leaves this module)
+        if verdict is not None and verdict.outcome is VerifierOutcome.BLOCK:
+            # BLOCK: stop now, no retry, no answer
+            self._mark(actions, "verify.blocked")
+            if revisions:
+                self._mark(actions, "manager.revised", count=revisions)
+            return self._finalize(
+                ctx,
+                actions,
+                evidence,
+                status=AgentStatus.FAILED,
+                answer="",
+                safety="blocked",
+            )
+        if verdict is not None and verdict.outcome is VerifierOutcome.ESCALATE:
+            # ESCALATE: a human handles the case; this run delivers no AI answer
+            self._mark(actions, "verify.escalated")
+            if revisions:
+                self._mark(actions, "manager.revised", count=revisions)
+            return self._finalize(
+                ctx,
+                actions,
+                evidence,
+                status=AgentStatus.COMPLETED,
+                answer="",
+                safety="escalated",
+            )
+        if verdict is not None and verdict.outcome is VerifierOutcome.REVISE:
+            # the single revision did not satisfy the verifier: refuse to answer
             self._mark(actions, "verify.reject_final")
             if revisions:
                 self._mark(actions, "manager.revised", count=revisions)
@@ -292,6 +490,7 @@ class ManagerAgent:
                 safety="revised",
             )
 
+        # only a PASS verdict reaches this point
         safety = (
             "passed"
             if execution.safety_status in ("", "unknown")
@@ -330,13 +529,12 @@ class ManagerAgent:
         self, actions: list[dict[str, Any]], execution: AgentExecution
     ) -> None:
         if execution.provider_id and execution.model_id:
-            actions.append(
-                {
-                    "type": "model.call",
-                    "provider_id": execution.provider_id,
-                    "model_id": execution.model_id,
-                    "model_version": execution.model_version,
-                }
+            self._mark(
+                actions,
+                "model.call",
+                provider_id=execution.provider_id,
+                model_id=execution.model_id,
+                model_version=execution.model_version,
             )
 
     def _mark(
@@ -345,6 +543,16 @@ class ManagerAgent:
         marker: str,
         **details: Any,
     ) -> None:
+        """Append one SAFE public trace marker (allowlisted on both axes).
+
+        An unknown marker name or key is a programming error: the run fails
+        loudly rather than publishing something the allowlist did not sanction.
+        """
+        if marker not in SAFE_MARKER_TYPES:
+            raise ValueError(f"unknown marker type {marker!r}")
+        unknown = set(details) - SAFE_MARKER_KEYS
+        if unknown:
+            raise ValueError(f"unsafe marker keys for {marker!r}: {sorted(unknown)}")
         entry: dict[str, Any] = {"type": marker}
         entry.update(details)
         actions.append(entry)
