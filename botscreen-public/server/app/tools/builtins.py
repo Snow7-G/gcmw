@@ -3,10 +3,14 @@
 All executors are pure reads over injectable sources:
 
 - ``knowledge.search`` / ``knowledge.get_fragment`` read the production view
-  of any object exposing ``production_items(tenant_id) -> list`` whose items
+  of any object exposing ``production_items(context) -> list`` whose items
   carry ``source_id/title/content/...`` attributes — the #56 KnowledgeStore
   satisfies this structurally and its production view is the only view #53
-  RAG may query;
+  RAG may query. ``knowledge.search`` ranks with the SAME tokenizer/scoring as
+  :class:`app.rag.retrieval.RetrievalService` (ASCII words plus CJK unigrams and
+  bigrams), so a natural question ("发热怎么办") can match an FAQ whose title
+  merely contains the term ("发热指南") — punctuation-only splitting matched
+  whole CJK sentences and therefore never hit;
 - ``department/staff/video.search`` run a deterministic substring search over
   an optional in-memory directory index (placeholder until real indexes land
   in a later issue). A record is visible ONLY to its own tenant — a record
@@ -35,6 +39,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.contracts.errors import ErrorCode
+from app.rag.retrieval import rank_items
 from app.tools.gateway import ToolGateway, ToolGatewayError
 from app.tools.specs import canonical_spec
 
@@ -164,16 +169,12 @@ def make_knowledge_search(store: Any | None) -> Callable[[Any, dict], Any]:
         top_k = _arg(args, "top_k", 5)
         if store is None:
             _require_dependency("knowledge.search")
-        tokens = set(_tokens(query))
-        scored: list[tuple[int, int, Any]] = []
         # identity ALWAYS comes from the injected context, never from arguments
-        for index, item in enumerate(store.production_items(context)):
-            haystack = f"{_attr(item, 'title')} {_attr(item, 'content')}".lower()
-            score = sum(1 for t in tokens if t in haystack)
-            if score:
-                scored.append((-score, index, item))
-        scored.sort()
-        ranked = scored[:top_k]
+        production = list(store.production_items(context))
+        # ONE ranking implementation shared with the RAG service: IDF-weighted
+        # token overlap over ASCII words + CJK unigrams/bigrams, title and
+        # phrase boosts, stable insertion-order ties.
+        ranked = rank_items(production, query)[:top_k]
         return {
             "items": [_item_summary(item) for _, _, item in ranked],
             "total": len(ranked),
