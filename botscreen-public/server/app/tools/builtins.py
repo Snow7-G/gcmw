@@ -10,7 +10,8 @@ All executors are pure reads over injectable sources:
 - ``department/staff/video.search`` run a deterministic substring search over
   an optional in-memory directory index (placeholder until real indexes land
   in a later issue). A record is visible ONLY to its own tenant — a record
-  without an explicit ``tenant_id`` matches nobody — and results are rebuilt
+  without an explicit ``tenant_id`` matches nobody, with no flag-based
+  exception — and results are rebuilt
   from a FIELD WHITELIST, so private columns (``internal_note`` …) and nested
   structures can never ride out to an agent;
 - ``memory.read_short`` reads a short-term summary through an optional
@@ -50,10 +51,6 @@ DIRECTORY_FIELDS: dict[str, tuple[str, ...]] = {
     "video": ("title", "duration_s"),
 }
 
-#: Explicit, reviewed marker for records that are public on purpose. A record
-#: WITHOUT a tenant id is NOT public: it matches nobody.
-PUBLIC_VISIBILITY = "public"
-
 #: per-field cap for the projection (defence against oversized fields)
 _DIRECTORY_FIELD_CHARS = 512
 
@@ -83,17 +80,17 @@ def memory_key(context: Any) -> MemoryKey | None:
 
 
 def _directory_visible(record: Mapping[str, Any], tenant_id: str) -> bool:
-    """A record is visible only to its OWN tenant, or when explicitly public.
+    """A record is visible ONLY to its own explicit tenant.
 
     * ``tenant_id`` mismatch -> invisible;
-    * a record with NO ``tenant_id`` -> invisible (it is never adopted by
-      whichever tenant happens to search);
-    * ``visibility == "public"`` -> visible (an explicit, reviewed marker).
+    * a record with NO ``tenant_id`` -> invisible (never adopted by whichever
+      tenant happens to search);
+    * there is NO ``visibility`` escape hatch: a raw dictionary flag is not
+      proof of review, and sharing a directory across tenants needs its own
+      review/publish contract (out of scope for the single-tenant v1 boundary).
     """
     owner = record.get("tenant_id")
-    if isinstance(owner, str) and owner and owner == tenant_id:
-        return True
-    return record.get("visibility") == PUBLIC_VISIBILITY
+    return isinstance(owner, str) and bool(owner) and owner == tenant_id
 
 
 def _project_directory_record(

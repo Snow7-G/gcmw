@@ -178,6 +178,7 @@ def create_app(
             yield
         finally:
             await leases.shutdown()
+            tool_gateway.shutdown()  # release the bounded tool worker pool
             app.state.agent_service = None
             app.state.credentials = None
             app.state.tool_gateway = None

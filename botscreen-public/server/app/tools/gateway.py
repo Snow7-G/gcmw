@@ -44,7 +44,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
-import functools
 import hashlib
 import json
 import logging
@@ -117,6 +116,51 @@ def find_identity_argument(node: Any) -> str | None:
             if found is not None:
                 return found
     return None
+
+
+@dataclass
+class _Prepared:
+    """One call's post-gate state (what the pool worker needs)."""
+
+    spec: ToolSpec
+    tool_name: str
+    arguments: dict[str, Any]
+    timeout_s: float
+    audit: Callable[..., None]
+    started: float
+    size_bytes: int = 0
+
+
+class _RunnerFuture:
+    """Adapter giving an injected runner the ``result``/``cancel`` contract."""
+
+    def __init__(self, call: Callable[[], Any]) -> None:
+        self._call = call
+
+    def result(self, timeout: float | None = None) -> Any:
+        return self._call()
+
+    def cancel(self) -> bool:
+        return False
+
+    def cancelled(self) -> bool:
+        return False
+
+    def done(self) -> bool:
+        return False
+
+    def add_done_callback(self, callback: Callable[[Any], None]) -> None:
+        callback(self)
+
+
+class _ToolFault(Exception):
+    """Executor/output-gate failure carrying its audit label and code."""
+
+    def __init__(self, label: str, code: ErrorCode, error: Exception) -> None:
+        super().__init__(label)
+        self.label = label
+        self.code = code
+        self.error = error
 
 
 @dataclass
@@ -216,7 +260,9 @@ class ToolGateway:
             max_workers=max_concurrency, thread_name_prefix="tool-executor"
         )
         self._owns_pool = executor is None
-        self._runner = runner or self._pool_runner
+        # an INJECTED runner (tests, sync-only) replaces the pool for `invoke`;
+        # the async path always uses the bounded pool so concurrency stays capped
+        self._runner = runner
         self._default_timeout_ms = default_timeout_ms
         self._default_max_result_bytes = default_max_result_bytes
         self._lock = threading.RLock()
@@ -274,28 +320,24 @@ class ToolGateway:
 
     # -- invocation ------------------------------------------------------------
 
-    def invoke(
+    def _prepare(
         self,
         context: TenantContext | Any,
         request: ToolRequest,
         *,
-        allowed_tools: Sequence[str] | None = (),
-        agent_id: str = "",
-        _state: _CallState | None = None,
-    ) -> ToolResult:
-        """Authorized, schema-checked, timed and capped tool execution.
-
-        ``context`` is the TRUSTED identity injected by the server (never by the
-        model); every failure raises :class:`ToolGatewayError` after an audit
-        record, and the executor never runs for rejected calls.
+        allowed_tools: Sequence[str] | None,
+        agent_id: str,
+        state: _CallState,
+    ) -> _Prepared:
+        """Every gate that needs no worker: identity, whitelist, permission,
+        input schema, deadline. Cheap, CPU-only, and it NEVER touches the pool —
+        that is what keeps ``max_concurrency=1`` from deadlocking the async path.
         """
-        state = _state if _state is not None else _CallState()
         identity = identity_from_context(context)
         name = request.tool_name
         with self._lock:
             spec = self._specs.get(name)
             disabled = name in self._disabled
-        started = time.perf_counter()
         audit = self._audit(
             tool_name=name,
             agent_id=agent_id,
@@ -353,60 +395,137 @@ class ToolGateway:
             audit(result="rejected:deadline_expired", code=ErrorCode.TOOL_TIMEOUT)
             raise ToolGatewayError(ErrorCode.TOOL_TIMEOUT, "deadline already expired")
 
-        # 5. executor under a bounded pool + per-call timeout (the in-flight
-        # counter is maintained by the worker itself, so it measures RUNNING
-        # work — not calls that are merely queued).
-        try:
-            payload = self._runner(
-                lambda: spec.executor(context, request.arguments),
-                timeout_ms / 1000,
-            )
-        except ToolGatewayError as exc:
-            audit(result="executor:" + exc.code.value, code=exc.code)
-            raise
-        except TimeoutError:
-            audit(result="rejected:timeout", code=ErrorCode.TOOL_TIMEOUT)
-            raise ToolGatewayError(
-                ErrorCode.TOOL_TIMEOUT, f"tool {name!r} timed out"
-            ) from None
-        except Exception:  # noqa: BLE001 - executor internals never leak
-            audit(result="executor:internal", code=ErrorCode.INTERNAL_UNKNOWN)
-            raise ToolGatewayError(
-                ErrorCode.INTERNAL_UNKNOWN, f"tool {name!r} failed internally"
-            ) from None
+        return _Prepared(
+            spec=spec,
+            tool_name=name,
+            arguments=request.arguments,
+            timeout_s=timeout_ms / 1000,
+            audit=audit,
+            started=time.perf_counter(),
+        )
 
-        # 6. result schema + size gates.
-        violations = validate(spec.output_schema, payload)
+    def _run_tool(self, prepared: _Prepared, context: Any) -> Any:
+        """Executor + output gates. Runs ON a pool worker; audits nothing.
+
+        It reports failures by raising :class:`_ToolFault` (label + code), so the
+        DECIDING side — whichever coroutine/thread awaited this call — writes the
+        one and only terminal audit record.
+        """
+        try:
+            payload = prepared.spec.executor(context, prepared.arguments)
+        except ToolGatewayError as exc:
+            raise _ToolFault("executor:" + exc.code.value, exc.code, exc) from None
+        except Exception as exc:  # noqa: BLE001 - executor internals never leak
+            raise _ToolFault("executor:internal", ErrorCode.INTERNAL_UNKNOWN, exc)
+
+        violations = validate(prepared.spec.output_schema, payload)
         if violations:
-            audit(result="rejected:output_schema", code=ErrorCode.TOOL_SCHEMA_REJECTED)
-            raise ToolGatewayError(
+            raise _ToolFault(
+                "rejected:output_schema",
                 ErrorCode.TOOL_SCHEMA_REJECTED,
-                f"output schema violations at {', '.join(violations)}",
+                ToolGatewayError(
+                    ErrorCode.TOOL_SCHEMA_REJECTED,
+                    f"output schema violations at {', '.join(violations)}",
+                ),
             )
         try:
             encoded = json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
             )
         except (TypeError, ValueError):
-            audit(result="rejected:output_json", code=ErrorCode.TOOL_SCHEMA_REJECTED)
-            raise ToolGatewayError(
-                ErrorCode.TOOL_SCHEMA_REJECTED, f"tool {name!r} returned non-JSON data"
+            raise _ToolFault(
+                "rejected:output_json",
+                ErrorCode.TOOL_SCHEMA_REJECTED,
+                ToolGatewayError(
+                    ErrorCode.TOOL_SCHEMA_REJECTED,
+                    f"tool {prepared.tool_name!r} returned non-JSON data",
+                ),
             ) from None
         size_bytes = len(encoded.encode("utf-8"))
-        cap = spec.max_result_bytes or self._default_max_result_bytes
+        cap = prepared.spec.max_result_bytes or self._default_max_result_bytes
         if size_bytes > cap:
-            audit(
-                result=f"rejected:result_bytes={size_bytes}",
-                code=ErrorCode.TOOL_OVER_LIMIT,
-            )
-            raise ToolGatewayError(
+            raise _ToolFault(
+                f"rejected:result_bytes={size_bytes}",
                 ErrorCode.TOOL_OVER_LIMIT,
-                f"tool {name!r} result exceeded {cap} bytes",
+                ToolGatewayError(
+                    ErrorCode.TOOL_OVER_LIMIT,
+                    f"tool {prepared.tool_name!r} result exceeded {cap} bytes",
+                ),
             )
+        prepared.size_bytes = size_bytes
+        return payload
 
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        audit(result=f"ok:result_bytes={size_bytes}", latency_ms=latency_ms)
-        return ToolResult(tool_name=name, ok=True, data=payload)
+    def _submit(
+        self, prepared: _Prepared, context: Any, *, allow_injected: bool
+    ) -> Any:
+        """The ONE execution submission per call (bounded concurrency lives here)."""
+
+        def counted() -> Any:
+            with self._lock:
+                self._in_flight += 1
+                self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
+            try:
+                return self._run_tool(prepared, context)
+            finally:
+                with self._lock:
+                    self._in_flight -= 1
+
+        if allow_injected and self._runner is not None:
+            return _RunnerFuture(lambda: self._runner(counted, prepared.timeout_s))
+        return self._pool.submit(counted)
+
+    def _finalize_success(self, prepared: _Prepared, payload: Any) -> ToolResult:
+        latency_ms = int((time.perf_counter() - prepared.started) * 1000)
+        prepared.audit(
+            result=f"ok:result_bytes={prepared.size_bytes}", latency_ms=latency_ms
+        )
+        return ToolResult(tool_name=prepared.tool_name, ok=True, data=payload)
+
+    def _finalize_failure(self, prepared: _Prepared, fault: _ToolFault) -> None:
+        prepared.audit(result=fault.label, code=fault.code)
+        raise ToolGatewayError(fault.code, str(fault.error))
+
+    def invoke(
+        self,
+        context: TenantContext | Any,
+        request: ToolRequest,
+        *,
+        allowed_tools: Sequence[str] | None = (),
+        agent_id: str = "",
+        _state: _CallState | None = None,
+    ) -> ToolResult:
+        """Authorized, schema-checked, timed and capped tool execution.
+
+        ``context`` is the TRUSTED identity injected by the server (never by the
+        model). Gates run on the CALLER's thread, the executor runs on the
+        bounded pool exactly once, and the caller writes the single terminal
+        audit record — so one call can never produce contradictory records.
+        """
+        prepared = self._prepare(
+            context,
+            request,
+            allowed_tools=allowed_tools,
+            agent_id=agent_id,
+            state=_state if _state is not None else _CallState(),
+        )
+        future = self._submit(prepared, context, allow_injected=True)
+        try:
+            payload = future.result(timeout=prepared.timeout_s)
+        except concurrent.futures.TimeoutError:
+            future.cancel()  # stops a QUEUED task; a running thread finishes
+            self._finalize_failure(
+                prepared,
+                _ToolFault(
+                    "rejected:timeout",
+                    ErrorCode.TOOL_TIMEOUT,
+                    ToolGatewayError(
+                        ErrorCode.TOOL_TIMEOUT, f"tool {prepared.tool_name!r} timed out"
+                    ),
+                ),
+            )
+        except _ToolFault as fault:
+            self._finalize_failure(prepared, fault)
+        return self._finalize_success(prepared, payload)
 
     async def ainvoke(
         self,
@@ -417,81 +536,43 @@ class ToolGateway:
         agent_id: str = "",
         timeout_s: float | None = None,
     ) -> ToolResult:
-        """Async entry point: the whole gated call runs OFF the event loop.
+        """Async entry point: gates here, execution on the bounded pool.
 
-        The same gates as :meth:`invoke` apply (the sync path runs in a worker
-        thread), and ``asyncio.wait_for`` adds a hard upper bound so a slow or
-        hung tool cannot stall the loop. Cancellation propagates unchanged —
-        a cancelled call applies no side effects (executors are read-only, and
-        the gateway itself never writes).
+        Crucially the gates do NOT consume a worker, so ``max_concurrency=1``
+        still serves calls (this used to deadlock: the async path submitted
+        ``invoke`` — which itself waits for a worker — to the same pool).
+        A timeout is FINAL: the awaiting side writes the timeout record and the
+        abandoned work can never append a second, contradictory "success"
+        record, because auditing happens ONLY on the awaiting side.
         """
-        budget = (
-            self._default_timeout_ms / 1000 if timeout_s is None else float(timeout_s)
-        )
-        state = _CallState()
-        loop = asyncio.get_running_loop()
-        run = functools.partial(
-            self.invoke,
+        prepared = self._prepare(
             context,
             request,
             allowed_tools=allowed_tools,
             agent_id=agent_id,
-            _state=state,
+            state=_CallState(),
         )
+        budget = prepared.timeout_s if timeout_s is None else float(timeout_s)
+        future = self._submit(prepared, context, allow_injected=False)
+        wrapped = asyncio.wrap_future(future, loop=asyncio.get_running_loop())
         try:
-            # the SAME bounded pool serves the async path: a slow tool can
-            # never spawn unbounded work, async or not
-            return await asyncio.wait_for(
-                loop.run_in_executor(self._pool, run), timeout=budget
-            )
+            payload = await asyncio.wait_for(wrapped, timeout=budget)
         except TimeoutError:
-            # the timeout is FINAL for this call: closing the slot first means
-            # the abandoned worker cannot later append a "success" record
-            state.closed = True
-            identity = identity_from_context(context)
-            self._audit(
-                tool_name=request.tool_name,
-                agent_id=agent_id,
-                tenant_id=identity.tenant_id,
-                session_id_hash=identity.session_id_hash,
-                run_id=identity.run_id,
-                request_id=identity.request_id,
-                state=_CallState(),
-            )(
-                result=f"rejected:async_timeout={budget:g}s",
-                code=ErrorCode.TOOL_TIMEOUT,
-            )
-            raise ToolGatewayError(
-                ErrorCode.TOOL_TIMEOUT,
-                f"tool {request.tool_name!r} exceeded the async budget",
-            ) from None
-
-    def _pool_runner(self, fn: Callable[[], Any], timeout_seconds: float) -> Any:
-        """Run on the bounded pool; a timeout abandons the FUTURE, not the work."""
-
-        def counted() -> Any:
-            with self._lock:
-                self._in_flight += 1
-                self._peak_in_flight = max(self._peak_in_flight, self._in_flight)
-            try:
-                return fn()
-            finally:
-                with self._lock:
-                    self._in_flight -= 1
-
-        future = self._pool.submit(counted)
-        try:
-            return future.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError:
-            # the worker keeps running (threads cannot be cancelled); the result
-            # is discarded and the call's audit slot is already closed
             future.cancel()
-            raise TimeoutError(f"tool exceeded {timeout_seconds:g}s") from None
-
-    def shutdown(self, *, wait: bool = False) -> None:
-        """Release the worker pool (called when the application shuts down)."""
-        if self._owns_pool:
-            self._pool.shutdown(wait=wait, cancel_futures=True)
+            self._finalize_failure(
+                prepared,
+                _ToolFault(
+                    f"rejected:async_timeout={budget:g}s",
+                    ErrorCode.TOOL_TIMEOUT,
+                    ToolGatewayError(
+                        ErrorCode.TOOL_TIMEOUT,
+                        f"tool {prepared.tool_name!r} exceeded the async budget",
+                    ),
+                ),
+            )
+        except _ToolFault as fault:
+            self._finalize_failure(prepared, fault)
+        return self._finalize_success(prepared, payload)
 
     def peak_concurrency(self) -> int:
         """Highest simultaneous execution count observed (test/ops probe)."""
@@ -502,6 +583,11 @@ class ToolGateway:
         """Executions in flight right now (never above ``max_concurrency``)."""
         with self._lock:
             return self._in_flight
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        """Release the bounded worker pool (called when the app shuts down)."""
+        if self._owns_pool:
+            self._pool.shutdown(wait=wait, cancel_futures=True)
 
     # -- helpers ----------------------------------------------------------------
 

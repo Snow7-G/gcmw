@@ -797,15 +797,38 @@ class TestDirectoryIsolationAndProjection:
         assert "internal_note" not in item
         assert "13800000000" not in str(result.data)
 
-    def test_only_explicitly_public_records_cross_tenants(self):
-        gw = self._gw()
-        names = [
-            item["name"]
-            for item in _call(
-                gw, "department.search", {"query": "导医"}, context=OTHER_TENANT
+    def test_no_flag_makes_a_record_cross_tenants(self):
+        """Review P1: a raw ``visibility``/``review_status`` flag is not proof
+        of review, so the single-tenant v1 boundary has NO exception."""
+        gw = build_gateway(
+            audit_sink=_Sink(),
+            directories={
+                "department": [
+                    {
+                        "tenant_id": "t2",
+                        "name": "别家科室",
+                        "location": "2号楼",
+                        "visibility": "public",
+                        "review_status": "approved",
+                    },
+                    {"name": "无租户科室", "location": "?", "visibility": "public"},
+                ]
+            },
+        )
+        # t1 sees nothing: the flags on t2's record are not an exception
+        assert (
+            _call(gw, "department.search", {"query": "科室"}, context=TENANT).data[
+                "items"
+            ]
+            == []
+        )
+        # t2 sees ONLY its own record (never the tenant-less one)
+        assert [
+            i["name"]
+            for i in _call(
+                gw, "department.search", {"query": "科室"}, context=OTHER_TENANT
             ).data["items"]
-        ]
-        assert names == ["公开导医台"]  # the reviewed marker, not a missing tenant
+        ] == ["别家科室"]
 
     def test_nested_values_are_dropped_not_returned(self):
         gw = build_gateway(
@@ -920,6 +943,130 @@ class TestExecutionBoundsAndAuditFinality:
         assert gw.peak_concurrency() <= 2
         gw.shutdown()
 
+    def test_a_single_async_call_works_at_max_concurrency_one(self):
+        """Review P1: the async path must not occupy a worker with its own gate."""
+        import asyncio
+
+        gw = build_gateway(
+            audit_sink=_Sink(),
+            knowledge_store=_store_with_one_approved(content="发热"),
+        )
+
+        async def main():
+            gw._pool.shutdown(wait=True)  # replace the default pool
+            import concurrent.futures as cf
+
+            gw._pool = cf.ThreadPoolExecutor(max_workers=1)
+            result = await asyncio.wait_for(
+                gw.ainvoke(
+                    TENANT,
+                    _request("knowledge.search", {"query": "发热"}),
+                    allowed_tools=["knowledge.search"],
+                    agent_id="a",
+                ),
+                timeout=5,
+            )
+            return result
+
+        result = asyncio.run(main())
+        assert result.ok is True
+        gw.shutdown()
+
+    def test_concurrent_async_calls_all_succeed(self):
+        """Default concurrency: 4 simultaneous calls, none falsely timing out."""
+        import asyncio
+
+        gw = build_gateway(
+            audit_sink=_Sink(),
+            knowledge_store=_store_with_one_approved(content="发热"),
+        )
+
+        async def main():
+            return await asyncio.gather(
+                *(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "发热"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                        timeout_s=5,
+                    )
+                    for _ in range(4)
+                )
+            )
+
+        results = asyncio.run(main())
+        assert all(r.ok for r in results)
+        gw.shutdown()
+
+    def test_a_fast_tool_never_times_out_under_load(self):
+        import asyncio
+        import concurrent.futures
+
+        gw = build_gateway(
+            audit_sink=_Sink(),
+            knowledge_store=_store_with_one_approved(content="发热"),
+        )
+
+        async def main():
+            return await asyncio.gather(
+                *(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "发热"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                        timeout_s=5,
+                    )
+                    for _ in range(8)
+                )
+            )
+
+        assert all(r.ok for r in asyncio.run(main()))
+        gw.shutdown()
+        assert isinstance(gw._pool, concurrent.futures.ThreadPoolExecutor)
+
+    def test_a_delayed_sink_cannot_produce_two_terminal_records(self):
+        """Review P1: success + timeout for ONE call is impossible."""
+        import asyncio
+
+        release = threading.Event()
+        records: list = []
+
+        def delayed_sink(record):
+            records.append(record)
+
+        def slow(_context, args):
+            release.wait(timeout=10)
+            return {"items": [], "total": 0}
+
+        gw = ToolGateway(audit_sink=delayed_sink, max_concurrency=2)
+        gw.register(canonical_spec("knowledge.search", executor=slow))
+        try:
+            with pytest.raises(ToolGatewayError) as exc:
+                asyncio.run(
+                    gw.ainvoke(
+                        TENANT,
+                        _request("knowledge.search", {"query": "x"}),
+                        allowed_tools=["knowledge.search"],
+                        agent_id="a",
+                        timeout_s=0.05,
+                    )
+                )
+            assert exc.value.code is ErrorCode.TOOL_TIMEOUT
+            release.set()  # the abandoned worker finishes "successfully" now
+            for _ in range(50):
+                time.sleep(0.02)
+                if len(records) > 1:
+                    break
+            assert [r.result for r in records] == ["rejected:async_timeout=0.05s"], [
+                r.result for r in records
+            ]
+            assert not any(r.result.startswith("ok:") for r in records)
+        finally:
+            release.set()
+            gw.shutdown()
+
     def test_a_late_completion_never_writes_a_second_audit(self):
         import asyncio
 
@@ -1007,6 +1154,30 @@ class TestAuditNeverCarriesUntrustedText:
         with pytest.raises(ToolGatewayError) as exc:
             _call(gw, "knowledge.get_fragment", {"source_id": "faq-1"})
         assert exc.value.code is ErrorCode.UNAVAILABLE_MAINTENANCE
+
+
+class TestPoolLifecycle:
+    """Gate item: the worker pool is released when the application stops."""
+
+    def test_app_shutdown_releases_the_tool_pool(self):
+        from fastapi.testclient import TestClient
+
+        from app.config import Settings
+        from app.main import create_app
+
+        app = create_app(settings=Settings(environment="test"))
+        with TestClient(app):
+            gateway = app.state.tool_gateway
+            assert gateway is not None
+            assert gateway._pool._shutdown is False
+        assert gateway._pool._shutdown is True
+        assert app.state.tool_gateway is None
+
+    def test_explicit_shutdown_is_idempotent(self):
+        gw = ToolGateway(audit_sink=_Sink())
+        gw.shutdown()
+        gw.shutdown()  # a second call must not raise
+        assert gw._pool._shutdown is True
 
 
 class TestAliasSafety:
