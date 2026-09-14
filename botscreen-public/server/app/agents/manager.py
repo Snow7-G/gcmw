@@ -10,30 +10,39 @@ events without re-deriving semantics:
                 no tools, no runner);
 2. route      — risk decided BEFORE routing and written into the context the
                 routed agent and the verifier receive (``AgentContext.risk_level``,
-                the shared contract enum), then deterministic intent
-                classification and registry routing; hard budgets: ≤ max_handoffs
-                engagements, ≤ max_tool_calls tool calls (reported by the
-                executed agent), ≤ max_revisions verifier-driven revisions —
-                the V2.3 numbers are CEILINGS that cannot be configured upward;
+                the shared contract enum). The effective level is the HIGHER of
+                the declared context risk and this round's rule decision, so a
+                rule miss never downgrades MEDIUM/CRITICAL to LOW. Then
+                deterministic intent classification and registry routing; hard
+                budgets: ≤ max_handoffs engagements (checked BEFORE each
+                engagement), ≤ max_tool_calls tool calls (reported by the
+                executed agent, POST-HOC), ≤ max_revisions verifier-driven
+                revisions — the V2.3 numbers are CEILINGS that cannot be
+                configured upward;
 3. execute    — the routed agent runs (its own ModelGateway/ToolGateway usage
                 arrives with #53) under the remaining deadline;
 4. verify     — optional Verifier handoff (runner arrives with #54) with
                 at-most-one controlled revision when the verdict is reject;
-5. finalize   — AgentResult with evidence, safe public trace markers and the
-                actual provider/model ids for run records. ONE delivery
-                predicate decides whether an answer may leave this module
+5. finalize   — AgentResult with evidence and safe public trace markers. ONE
+                delivery predicate decides whether anything leaves this module
                 (``_may_deliver``: the run COMPLETED *and* the verifier returned
                 PASS); every other combination — failed or cancelled run, missing
                 verdict, blocked/escalated/rejected verdict, revision that never
-                completed — delivers an empty answer.
+                completed — funnels through ``_refuse``, which publishes an empty
+                answer AND no evidence (``Evidence.content`` is model-generated
+                material that no verifier has passed). Model provenance is NOT
+                published: this module cannot attest provider/model identity from
+                a sub-agent's self-report, so the run record gets it from the
+                trusted ModelGateway wiring in #55A instead.
 
 No free multi-agent chat: agents only reach models through ModelGateway and
 tools through ToolGateway; the Manager itself never calls the model for
 "thinking" — routing is rule-based and lightweight, and no chain-of-thought,
 prompt or raw input ever leaves this module except as the desensitized text
 that the routed agent is allowed to see. Public trace markers are allowlisted on
-THREE axes (type, key, value — see :func:`is_safe_marker_value`), so
-sub-agent-supplied metadata that is not a safe token is simply not published.
+THREE axes (type, key, value — see :func:`is_safe_marker_value`); the marker set
+carries decisions only (audit state, budgets, verdicts) and no free text from
+any source.
 """
 
 from __future__ import annotations
@@ -80,7 +89,6 @@ SAFE_MARKER_TYPES: frozenset[str] = frozenset(
         "manager.revised",
         "route.handoff",
         "agent.done",
-        "model.call",
         "safety.escalate",
         "verify.handoff",
         "verify.verdict",
@@ -98,15 +106,13 @@ SAFE_MARKER_KEYS: frozenset[str] = frozenset(
         "type",
         "intent",
         "level",
+        "declared",
         "agent_id",
         "handoffs",
         "status",
         "outcome",
         "revision",
         "count",
-        "provider_id",
-        "model_id",
-        "model_version",
     }
 )
 
@@ -137,13 +143,57 @@ class ManagerAgentError(RuntimeError):
         self.code = code
 
 
+def _validate_rule_set(
+    label: str,
+    patterns: tuple[str, ...],
+    approved_by: str,
+    approved_at: AwareDatetime,
+) -> None:
+    """Shared fail-closed validation for clinical rule sets.
+
+    Rejects the two ways a rule set can look configured while being unable to
+    fire or to be audited:
+
+    * a pattern that is not NORMALIZED (leading/trailing whitespace, embedded
+      control characters) — ``" 自杀 "`` is accepted by a naive check yet never
+      matches ``"我想自杀"``, i.e. a silently dead red flag;
+    * an approval timestamp that is naive (no timezone) — it cannot be compared
+      against an audit trail.
+
+    NOTE (honest scope): a non-empty ``approved_by`` is a RECORDED ATTESTATION,
+    not proof of a clinical signature. Nothing here can verify that a human
+    clinician approved anything; that remains a process gate.
+    """
+    if not patterns:
+        raise ValueError(f"{label} must not be empty")
+    for pattern in patterns:
+        if not isinstance(pattern, str) or not pattern:
+            raise ValueError(f"{label} must be non-empty strings")
+        if pattern != pattern.strip():
+            raise ValueError(
+                f"{label} must be normalized (no leading/trailing whitespace): "
+                f"{pattern!r}"
+            )
+        if any(char in pattern for char in "\r\n\t"):
+            raise ValueError(f"{label} must not contain control characters")
+    if not isinstance(approved_by, str) or not approved_by.strip():
+        raise ValueError(f"{label} need an approving clinician")
+    if approved_by != approved_by.strip():
+        raise ValueError(f"{label} approving clinician must be normalized")
+    if not isinstance(approved_at, datetime) or approved_at.tzinfo is None:
+        raise ValueError(f"{label} approval timestamp must be timezone-aware")
+    if approved_at.utcoffset() is None:
+        raise ValueError(f"{label} approval timestamp must be timezone-aware")
+
+
 @dataclass(frozen=True)
 class RedFlagRules:
     """Clinically APPROVED red-flag rule set (V2.3 §5.3).
 
-    An empty or unapproved rule set cannot be represented, and the Manager
-    refuses to run without one: "no rules configured" must never mean "no red
-    flags found". ``approved_by``/``approved_at`` record the clinical sign-off.
+    An empty, unapproved or non-normalized rule set cannot be represented, and
+    the Manager refuses to run without one: "no rules configured" must never mean
+    "no red flags found". ``approved_by``/``approved_at`` record the clinical
+    sign-off (an attestation, see :func:`_validate_rule_set`).
     """
 
     patterns: tuple[str, ...]
@@ -151,12 +201,9 @@ class RedFlagRules:
     approved_at: AwareDatetime
 
     def __post_init__(self) -> None:
-        if not self.patterns:
-            raise ValueError("red-flag rules must not be empty")
-        if not all(isinstance(item, str) and item.strip() for item in self.patterns):
-            raise ValueError("red-flag rules must be non-empty strings")
-        if not self.approved_by or not self.approved_by.strip():
-            raise ValueError("red-flag rules need an approving clinician")
+        _validate_rule_set(
+            "red-flag rules", self.patterns, self.approved_by, self.approved_at
+        )
 
     def matches(self, text: str) -> bool:
         lowered = text.lower()
@@ -180,10 +227,9 @@ class RiskRules:
     approved_at: AwareDatetime
 
     def __post_init__(self) -> None:
-        if not self.patterns:
-            raise ValueError("risk markers must not be empty")
-        if not self.approved_by or not self.approved_by.strip():
-            raise ValueError("risk markers need an approving clinician")
+        _validate_rule_set(
+            "risk markers", self.patterns, self.approved_by, self.approved_at
+        )
 
     def classify(self, text: str) -> RiskLevel:
         lowered = text.lower()
@@ -203,8 +249,9 @@ class ManagerLimits:
     and break the "≤1 controlled revision" rule). A budget may be tightened
     (disabled) but never raised.
 
-    IMPORTANT (honest scope): the handoff budget is enforced by this module at
-    call time, but ``max_tool_calls`` is a **POST-HOC check** — tool calls are
+    IMPORTANT (honest scope): the handoff budget is enforced BEFORE each
+    engagement (a tightened ``max_handoffs`` forbids the call rather than
+    reporting it afterwards), but ``max_tool_calls`` is a **POST-HOC check** — tool calls are
     read from the sub-agent's own report after it returns. Call-time hard
     counting requires the ToolGateway quota path and lands with #55A; until
     then this PR must not claim the tool budget is preemptively enforced.
@@ -260,11 +307,28 @@ class VerifierOutcome(str, Enum):
 #: Enumerated marker keys may only carry their known values (value-level guard
 #: companion to :data:`SAFE_MARKER_KEYS`); all other keys accept bounded ints or
 #: short ASCII tokens (see :func:`is_safe_marker_value`).
+_RISK_VALUES = frozenset(item.value for item in RiskLevel)
 SAFE_MARKER_VALUE_SETS: dict[str, frozenset[str]] = {
-    "level": frozenset({RiskLevel.LOW.value, RiskLevel.HIGH.value}),
+    "level": _RISK_VALUES,
+    "declared": _RISK_VALUES,
     "outcome": frozenset(item.value for item in VerifierOutcome),
     "status": frozenset(item.value for item in AgentStatus),
 }
+
+#: Total order over the contract risk levels: a run is treated as the HIGHER of
+#: the declared risk and this round's rule-based decision, so a context that
+#: arrives as MEDIUM/CRITICAL can never be downgraded to LOW by a rule miss.
+_RISK_RANK: dict[RiskLevel, int] = {
+    RiskLevel.LOW: 0,
+    RiskLevel.MEDIUM: 1,
+    RiskLevel.HIGH: 2,
+    RiskLevel.CRITICAL: 3,
+}
+
+
+def highest_risk(*levels: RiskLevel) -> RiskLevel:
+    """The most severe of ``levels`` (declared context risk vs decided risk)."""
+    return max(levels, key=lambda level: _RISK_RANK[level])
 
 
 def is_safe_marker_value(key: str, value: Any) -> bool:
@@ -408,12 +472,22 @@ class ManagerAgent:
 
     # -- budget helpers ---------------------------------------------------------
 
-    def _raise_if_over_budget(self, handoffs: int, tool_calls: int) -> None:
+    def _raise_if_handoff_over_budget(self, handoffs: int) -> None:
+        """CALL-TIME check: a handoff must be refused BEFORE it happens.
+
+        A tightened budget (``max_handoffs=0``) has to prevent the engagement,
+        not report it afterwards — otherwise the sub-agent has already run.
+        """
         if handoffs > self._limits.max_handoffs:
             raise ManagerAgentError(
                 ErrorCode.RUN_BUDGET_EXCEEDED,
                 f"handoff budget exceeded ({handoffs} > {self._limits.max_handoffs})",
             )
+
+    def _raise_if_tool_over_budget(self, tool_calls: int) -> None:
+        """POST-HOC check (honest scope): the count is the sub-agent's own
+        report, read after it returned. Call-time hard counting arrives with the
+        ToolGateway quota path (#55A)."""
         if tool_calls > self._limits.max_tool_calls:
             raise ManagerAgentError(
                 ErrorCode.TOOL_OVER_LIMIT,
@@ -447,19 +521,19 @@ class ManagerAgent:
 
         if self._red_flag_escalated(cleaned):
             self._mark(actions, "safety.escalate")
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=AgentStatus.COMPLETED,
-                answer="",
-                safety="escalated",
+            return self._refuse(
+                ctx, actions, status=AgentStatus.COMPLETED, safety="escalated"
             )
 
         # risk is decided BEFORE routing: a high-risk question may never take a
-        # low-risk shortcut, and it always requires verification
-        risk = self._risk_rules.classify(cleaned)
-        self._mark(actions, "manager.risk", level=risk.value)
+        # low-risk shortcut, and it always requires verification. A rule MISS
+        # only ever means "these rules did not raise it" — it must not downgrade
+        # a context that already arrives as MEDIUM/CRITICAL, so the effective
+        # level is the HIGHER of the declared and the decided level.
+        declared = RiskLevel(ctx.risk_level)
+        decision = self._risk_rules.classify(cleaned)
+        risk = highest_risk(declared, decision)
+        self._mark(actions, "manager.risk", level=risk.value, declared=declared.value)
 
         intent = self._classify_intent(cleaned)
         self._mark(actions, "manager.route", intent=intent)
@@ -471,6 +545,9 @@ class ManagerAgent:
                 ErrorCode.NOT_FOUND_AGENT,
                 f"no runner registered for agent {agent_id!r}",
             )
+        # check the handoff budget BEFORE engaging: a tightened budget must be
+        # able to forbid the call, not merely report it after the agent ran
+        self._raise_if_handoff_over_budget(handoffs)
         self._mark(actions, "route.handoff", agent_id=agent_id, handoffs=handoffs)
 
         # The declared risk travels WITH the run: the routed agent and the
@@ -484,9 +561,8 @@ class ManagerAgent:
         execution = await self._run_with_deadline(
             self._runners[agent_id](sub_ctx), self._remaining_ms(ctx)
         )
-        self._raise_if_over_budget(handoffs, execution.tool_calls)
-        evidence.extend(execution.evidence)
-        self._record_model(actions, execution)
+        self._raise_if_tool_over_budget(execution.tool_calls)
+        evidence = list(execution.evidence)
         self._mark(
             actions,
             "agent.done",
@@ -500,19 +576,14 @@ class ManagerAgent:
             # NO VERIFIER = NO MEDICAL ANSWER. The previous behaviour marked the
             # run "passed"; an unverified answer must never leave this module.
             self._mark(actions, "verify.missing")
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=AgentStatus.FAILED,
-                answer="",
-                safety="unverified",
+            return self._refuse(
+                ctx, actions, status=AgentStatus.FAILED, safety="unverified"
             )
         if execution.status is AgentStatus.COMPLETED:
             # verification is a second distinct engagement; revisions re-run the
             # same routed agent in-loop and do not consume new handoffs
             handoffs += 1
-            self._raise_if_over_budget(handoffs, execution.tool_calls)
+            self._raise_if_handoff_over_budget(handoffs)
             self._mark(
                 actions, "verify.handoff", agent_id="verifier", handoffs=handoffs
             )
@@ -532,9 +603,8 @@ class ManagerAgent:
                 execution = await self._run_with_deadline(
                     self._runners[agent_id](sub_ctx), self._remaining_ms(ctx)
                 )
-                self._raise_if_over_budget(handoffs, execution.tool_calls)
+                self._raise_if_tool_over_budget(execution.tool_calls)
                 evidence = list(execution.evidence)
-                self._record_model(actions, execution)
                 if execution.status is not AgentStatus.COMPLETED:
                     # a revision that did not complete is not verifiable: stop
                     # here and let the single delivery decision below refuse it
@@ -552,53 +622,31 @@ class ManagerAgent:
             self._mark(actions, "verify.not_run")
             if revisions:
                 self._mark(actions, "manager.revised", count=revisions)
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=execution.status,
-                answer="",
-                safety="failed",
-            )
+            return self._refuse(ctx, actions, status=execution.status, safety="failed")
 
         if verdict is not None and verdict.outcome is VerifierOutcome.BLOCK:
             # BLOCK: stop now, no retry, no answer
             self._mark(actions, "verify.blocked")
             if revisions:
                 self._mark(actions, "manager.revised", count=revisions)
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=AgentStatus.FAILED,
-                answer="",
-                safety="blocked",
+            return self._refuse(
+                ctx, actions, status=AgentStatus.FAILED, safety="blocked"
             )
         if verdict is not None and verdict.outcome is VerifierOutcome.ESCALATE:
             # ESCALATE: a human handles the case; this run delivers no AI answer
             self._mark(actions, "verify.escalated")
             if revisions:
                 self._mark(actions, "manager.revised", count=revisions)
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=AgentStatus.COMPLETED,
-                answer="",
-                safety="escalated",
+            return self._refuse(
+                ctx, actions, status=AgentStatus.COMPLETED, safety="escalated"
             )
         if verdict is not None and verdict.outcome is VerifierOutcome.REVISE:
             # the single revision did not satisfy the verifier: refuse to answer
             self._mark(actions, "verify.reject_final")
             if revisions:
                 self._mark(actions, "manager.revised", count=revisions)
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=AgentStatus.FAILED,
-                answer="",
-                safety="revised",
+            return self._refuse(
+                ctx, actions, status=AgentStatus.FAILED, safety="revised"
             )
 
         # ---- THE single delivery decision ----------------------------------
@@ -610,13 +658,8 @@ class ManagerAgent:
             self._mark(actions, "manager.revised", count=revisions)
         if not deliverable:
             self._mark(actions, "verify.not_run")
-            return self._finalize(
-                ctx,
-                actions,
-                evidence,
-                status=AgentStatus.FAILED,
-                answer="",
-                safety="unverified",
+            return self._refuse(
+                ctx, actions, status=AgentStatus.FAILED, safety="unverified"
             )
 
         # only COMPLETED + PASS reach this point (see _may_deliver)
@@ -645,35 +688,30 @@ class ManagerAgent:
             return 60_000
         return max(int((ctx.deadline - self._clock()).total_seconds() * 1000), 0)
 
-    def _record_model(
-        self, actions: list[dict[str, Any]], execution: AgentExecution
-    ) -> None:
-        """Publish provider/model provenance ONLY when it is a safe token.
+    def _refuse(
+        self,
+        ctx: AgentContext,
+        actions: list[dict[str, Any]],
+        *,
+        status: AgentStatus,
+        safety: str,
+    ) -> AgentResult:
+        """EVERY non-delivering exit funnels through here.
 
-        These three fields come from the sub-agent's own report, i.e. from
-        outside this module's trusted core. They are therefore treated as
-        UNTRUSTED: a value that is not a short ASCII token is simply not
-        published — never truncated, never hashed, never echoed — so the public
-        ``actions`` list cannot be used as a text channel.
-
-        * provider/model id unsafe (or empty) → no ``model.call`` marker at all;
-        * only the version unsafe (or empty) → provenance is still recorded,
-          the version key is dropped.
+        A refusal publishes neither a draft answer NOR the unverified evidence
+        the sub-agent produced: ``Evidence.content`` is model-generated material
+        that no verifier has passed, so it is exactly as unpublishable as the
+        draft itself. Evidence reaches the public result only on the single
+        COMPLETED + PASS path (see :meth:`_may_deliver`).
         """
-        provider_id = execution.provider_id
-        model_id = execution.model_id
-        if not provider_id or not model_id:
-            return
-        if not (
-            is_safe_marker_value("provider_id", provider_id)
-            and is_safe_marker_value("model_id", model_id)
-        ):
-            return
-        details: dict[str, Any] = {"provider_id": provider_id, "model_id": model_id}
-        version = execution.model_version
-        if version and is_safe_marker_value("model_version", version):
-            details["model_version"] = version
-        self._mark(actions, "model.call", **details)
+        return self._finalize(
+            ctx,
+            actions,
+            [],
+            status=status,
+            answer="",
+            safety=safety,
+        )
 
     def _mark(
         self,

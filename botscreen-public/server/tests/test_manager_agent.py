@@ -33,6 +33,7 @@ from app.agents.manager import (
     Verdict,
     VerifierOutcome,
     desensitize,
+    highest_risk,
     is_safe_marker_value,
 )
 from app.agents.registry import AgentManifest, AgentRegistry
@@ -321,10 +322,9 @@ class TestPipeline:
         assert "route.handoff" in markers
         assert "agent.done" in markers
         assert "manager.risk" in markers  # risk is decided before routing
-        model_call = next(a for a in result.actions if a["type"] == "model.call")
-        assert model_call["provider_id"] == "mock"
-        assert model_call["model_id"] == "mock-model"
-        assert model_call["model_version"] == "1.0.0"
+        # model provenance is NOT published from a sub-agent self-report: the
+        # run record takes it from the trusted ModelGateway (#55A)
+        assert not any(a["type"] == "model.call" for a in result.actions)
         # safe markers only: every marker and every key must be inside the
         # module's own allowlist (enforced by ManagerAgent._mark)
         for action in result.actions:
@@ -681,6 +681,81 @@ class TestBudgetScopeIsHonest:
         assert "POST-HOC" in (ManagerLimits.__doc__ or "")
 
 
+class TestRiskIsNeverDowngraded:
+    """Review P1: a rule MISS must not lower a declared MEDIUM/CRITICAL risk.
+
+    ``classify`` only ever returns LOW/HIGH from *text* rules, so using it alone
+    reported LOW for a context that arrived as MEDIUM or CRITICAL. The effective
+    level is the higher of the two, across all four contract levels.
+    """
+
+    @mark.parametrize(
+        ("declared", "expected"),
+        [
+            (RiskLevel.LOW, RiskLevel.LOW),
+            (RiskLevel.MEDIUM, RiskLevel.MEDIUM),
+            (RiskLevel.HIGH, RiskLevel.HIGH),
+            (RiskLevel.CRITICAL, RiskLevel.CRITICAL),
+        ],
+    )
+    @mark.asyncio
+    async def test_a_rule_miss_keeps_the_declared_level(
+        self, registry, declared, expected
+    ):
+        runner = _Runner(result=_agent_execution())
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+            risk_rules=approved_risk_rules("剧烈"),  # matches NOTHING here
+        )
+        result = await m.execute(_context(risk_level=declared), "孩子近视后需要复查吗")
+        marker = next(a for a in result.actions if a["type"] == "manager.risk")
+        assert marker["level"] == expected.value
+        assert marker["declared"] == declared.value
+        assert runner.risks == [expected]  # what the routed agent receives
+        assert verifier.risks == [expected]  # and the verifier
+
+    @mark.asyncio
+    async def test_a_rule_hit_raises_a_lower_declared_level(self, registry):
+        runner = _Runner(result=_agent_execution())
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+            risk_rules=approved_risk_rules("剧烈"),
+        )
+        result = await m.execute(
+            _context(risk_level=RiskLevel.LOW), "剧烈头痛需要急诊吗"
+        )
+        marker = next(a for a in result.actions if a["type"] == "manager.risk")
+        assert marker["level"] == "high"
+        assert marker["declared"] == "low"
+        assert runner.risks == [RiskLevel.HIGH]
+
+    @mark.asyncio
+    async def test_critical_stays_critical_when_the_rule_also_hits(self, registry):
+        runner = _Runner(result=_agent_execution())
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+            risk_rules=approved_risk_rules("剧烈"),
+        )
+        await m.execute(_context(risk_level=RiskLevel.CRITICAL), "剧烈头痛需要急诊吗")
+        assert runner.risks == [RiskLevel.CRITICAL]  # never downgraded to high
+
+    def test_the_ordering_covers_every_contract_level(self):
+        assert highest_risk(RiskLevel.LOW, RiskLevel.CRITICAL) is RiskLevel.CRITICAL
+        assert highest_risk(RiskLevel.MEDIUM, RiskLevel.HIGH) is RiskLevel.HIGH
+        assert highest_risk(RiskLevel.HIGH, RiskLevel.MEDIUM) is RiskLevel.HIGH
+        assert highest_risk(RiskLevel.LOW, RiskLevel.MEDIUM) is RiskLevel.MEDIUM
+        assert highest_risk(RiskLevel.LOW) is RiskLevel.LOW
+        with pytest.raises(KeyError):
+            highest_risk(RiskLevel.LOW, "urgent")  # type: ignore[arg-type]
+
+
 class TestRiskReachesTheExecutionChain:
     """Review P1: the Manager's risk decision must reach the runner/verifier.
 
@@ -746,6 +821,223 @@ class TestRiskReachesTheExecutionChain:
         )
         await m.execute(_context(), "剧烈头痛需要急诊吗")
         assert runner.risks == [RiskLevel.HIGH, RiskLevel.HIGH]
+
+
+def _evidence(content="证据正文：疑似脑膜炎，请立即服用抗生素") -> Evidence:
+    return Evidence(
+        source_id="faq-1",
+        source_type="faq",
+        title="t",
+        content=content,
+        content_hash="h",
+    )
+
+
+class TestUnverifiedEvidenceIsNeverPublished:
+    """Review P1: the draft was cleared on FAILED, but ``Evidence.content`` was not.
+
+    Evidence content is model-generated material that no verifier has passed, so
+    it is exactly as unpublishable as the draft. Every non-PASS exit must publish
+    an empty evidence list.
+    """
+
+    MARKER = "疑似脑膜炎"
+
+    @mark.asyncio
+    async def test_failed_run_publishes_no_evidence(self, registry):
+        runner = _Runner(
+            result=_agent_execution(
+                answer="草稿",
+                evidence=(_evidence(),),
+                status=AgentStatus.FAILED,
+            )
+        )
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.FAILED
+        assert result.evidence == []
+        assert self.MARKER not in json.dumps(result.model_dump(), ensure_ascii=False)
+
+    @mark.parametrize(
+        ("verdict", "expected_safety"),
+        [
+            (Verdict(VerifierOutcome.BLOCK), "blocked"),
+            (Verdict(VerifierOutcome.ESCALATE), "escalated"),
+            (Verdict(VerifierOutcome.REVISE), "revised"),
+        ],
+    )
+    @mark.asyncio
+    async def test_no_pass_verdict_publishes_no_evidence(
+        self, registry, verdict, expected_safety
+    ):
+        runner = _Runner(result=_agent_execution(evidence=(_evidence(),)))
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            # two verdicts: REVISE consumes the one controlled revision
+            verifier=_Verifier([verdict, verdict]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.safety_status == expected_safety
+        assert result.answer_candidate == ""
+        assert result.evidence == []
+        assert self.MARKER not in json.dumps(result.model_dump(), ensure_ascii=False)
+
+    @mark.asyncio
+    async def test_missing_verifier_publishes_no_evidence(self, registry):
+        runner = _Runner(result=_agent_execution(evidence=(_evidence(),)))
+        m = build_manager(registry=registry, agent_runners={"qa": runner})
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.safety_status == "unverified"
+        assert result.evidence == []
+
+    @mark.asyncio
+    async def test_a_pass_run_still_publishes_its_evidence(self, registry):
+        """The refusal must not be over-broad: verified evidence is delivered."""
+        runner = _Runner(
+            result=_agent_execution(
+                answer="发热咳嗽请挂呼吸内科", evidence=(_evidence(),)
+            )
+        )
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.safety_status == "verified"
+        assert [item.source_id for item in result.evidence] == ["faq-1"]
+
+    @mark.asyncio
+    async def test_red_flag_path_publishes_no_evidence(self, registry):
+        runner = _Runner(result=_agent_execution(evidence=(_evidence(),)))
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+            red_flag_rules=approved_red_flags("自杀"),
+        )
+        result = await m.execute(_context(), "我想自杀")
+        assert result.safety_status == "escalated"
+        assert result.evidence == []
+        assert len(runner.calls) == 0
+
+
+class TestHandoffBudgetIsCheckedBeforeTheCall:
+    """Review P1: a tightened handoff budget must forbid the call, not report it."""
+
+    @mark.asyncio
+    async def test_max_handoffs_zero_never_runs_the_agent(self, registry):
+        runner = _Runner(result=_agent_execution())
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+            limits=ManagerLimits(max_handoffs=0),
+        )
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.RUN_BUDGET_EXCEEDED
+        assert len(runner.calls) == 0  # zero engagements: refused up front
+        assert len(verifier.seen) == 0
+
+    @mark.asyncio
+    async def test_the_first_handoff_is_still_allowed_at_the_default(self, registry):
+        runner = _Runner(result=_agent_execution())
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+        )
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.status is AgentStatus.COMPLETED
+        assert len(runner.calls) == 1
+
+    @mark.asyncio
+    async def test_the_verifier_handoff_is_also_checked_before_it_runs(self, registry):
+        runner = _Runner(result=_agent_execution())
+        verifier = _Verifier([Verdict(VerifierOutcome.PASS)])
+        m = build_manager(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+            limits=ManagerLimits(max_handoffs=1),  # qa + verifier = 2 > 1
+        )
+        with pytest.raises(ManagerAgentError) as exc:
+            await m.execute(_context(), "发烧怎么办")
+        assert exc.value.code is ErrorCode.RUN_BUDGET_EXCEEDED
+        assert len(runner.calls) == 1  # the routed agent ran...
+        assert verifier.seen == []  # ...but the verifier was never engaged
+
+
+class TestClinicalRuleSetsAreValidated:
+    """Review: a rule that can never fire is worse than no rule at all."""
+
+    @mark.parametrize(
+        "patterns",
+        [
+            (" 自杀 ",),  # un-normalized: would never match "我想自杀"
+            ("自杀 ",),
+            (" 自杀",),
+            ("自杀\n",),
+            ("自杀\t胸痛",),
+            ("",),
+            ("   ",),
+        ],
+    )
+    def test_unusable_patterns_are_rejected(self, patterns):
+        with pytest.raises(ValueError):
+            RedFlagRules(
+                patterns=patterns, approved_by="clinical-board", approved_at=APPROVED_AT
+            )
+        with pytest.raises(ValueError):
+            RiskRules(
+                patterns=patterns, approved_by="clinical-board", approved_at=APPROVED_AT
+            )
+
+    def test_a_normalized_pattern_actually_matches(self):
+        rules = RedFlagRules(
+            patterns=("自杀",), approved_by="clinical-board", approved_at=APPROVED_AT
+        )
+        assert rules.matches("我想自杀")
+
+    def test_naive_approval_timestamps_are_rejected(self):
+        naive = datetime(2026, 1, 5)  # noqa: DTZ001 - naive on purpose: must be refused
+        with pytest.raises(ValueError):
+            RedFlagRules(patterns=("自杀",), approved_by="board", approved_at=naive)
+        with pytest.raises(ValueError):
+            RiskRules(patterns=("剧烈",), approved_by="board", approved_at=naive)
+
+    @mark.parametrize("approved_by", ["", "   ", " board", "board "])
+    def test_the_approver_must_be_a_normalized_name(self, approved_by):
+        with pytest.raises(ValueError):
+            RedFlagRules(
+                patterns=("自杀",), approved_by=approved_by, approved_at=APPROVED_AT
+            )
+
+    def test_the_manager_still_refuses_to_start_without_rules(self, registry):
+        """Startup failure, not a silent default — the whole point of the check."""
+        with pytest.raises(ValueError):
+            ManagerAgent(
+                registry=registry,
+                agent_runners={},
+                risk_rules=approved_risk_rules(),
+            )
+        with pytest.raises(ValueError):
+            ManagerAgent(
+                registry=registry,
+                agent_runners={},
+                red_flag_rules=approved_red_flags(),
+            )
+
+    def test_the_docstring_does_not_claim_a_real_signature(self):
+        text = (RedFlagRules.__doc__ or "") + (RiskRules.__doc__ or "")
+        assert "attestation" in text.lower()
 
 
 class TestNonCompletedRunNeverDelivers:
@@ -823,16 +1115,35 @@ class TestMarkerValuesAreConstrained:
 
     PRIVATE = "患者自述：三天前开始发热咳嗽，住址朝阳区"
 
-    @mark.parametrize("field", ["provider_id", "model_id"])
+    @mark.parametrize(
+        "values",
+        [
+            {"provider_id": "SYNTHETIC_PRIVATE_TEXT"},
+            {"model_id": "SYNTHETIC_PRIVATE_TEXT"},
+            {"model_version": "SYNTHETIC_PRIVATE_TEXT"},
+            {"provider_id": "患者自述：三天前开始发热咳嗽"},
+            {"model_version": ""},
+        ],
+    )
     @mark.asyncio
-    async def test_untrusted_model_identity_is_not_published(self, registry, field):
-        values = {
+    async def test_model_identity_is_never_published_from_a_self_report(
+        self, registry, values
+    ):
+        """A *short ASCII* string is not a *trusted* string.
+
+        ``SYNTHETIC_PRIVATE_TEXT`` passes the token rule, so value checks alone
+        cannot make this field safe — the Manager simply cannot attest provider
+        or model identity from a sub-agent's own report. Until the trusted
+        ModelGateway wiring (#55A) supplies provenance, nothing about the model
+        is published.
+        """
+        fields = {
             "provider_id": "mock",
             "model_id": "mock-model",
             "model_version": "1.0.0",
         }
-        values[field] = self.PRIVATE
-        runner = _Runner(result=_agent_execution(**values))
+        fields.update(values)
+        runner = _Runner(result=_agent_execution(**fields))
         m = build_manager(
             registry=registry,
             agent_runners={"qa": runner},
@@ -843,42 +1154,24 @@ class TestMarkerValuesAreConstrained:
         assert result.status is AgentStatus.COMPLETED
         assert result.safety_status == "verified"
         assert result.answer_candidate != ""
-        # ...but the untrusted metadata is not published at all: not truncated,
-        # not hashed, not echoed
+        # ...and no model metadata is published under any name
+        dumped = json.dumps(result.actions, ensure_ascii=False)
+        assert "SYNTHETIC_PRIVATE_TEXT" not in dumped
+        assert "患者自述" not in dumped
         assert not any(a["type"] == "model.call" for a in result.actions)
-        assert self.PRIVATE not in json.dumps(result.actions, ensure_ascii=False)
+        for action in result.actions:
+            assert not ({"provider_id", "model_id", "model_version"} & set(action))
 
     @mark.asyncio
-    async def test_untrusted_model_version_is_dropped_not_the_whole_marker(
-        self, registry
-    ):
-        """Provenance is worth keeping: only the unsafe version key goes away."""
-        runner = _Runner(
-            result=_agent_execution(provider_id="mock", model_version=self.PRIVATE)
-        )
-        m = build_manager(
-            registry=registry,
-            agent_runners={"qa": runner},
-            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
-        )
-        result = await m.execute(_context(), "发烧怎么办")
-        marker = next(a for a in result.actions if a["type"] == "model.call")
-        assert marker["provider_id"] == "mock"
-        assert marker["model_id"] == "mock-model"
-        assert "model_version" not in marker
-        assert self.PRIVATE not in json.dumps(result.actions, ensure_ascii=False)
-
-    @mark.asyncio
-    async def test_an_empty_model_version_is_simply_absent(self, registry):
-        runner = _Runner(result=_agent_execution(model_version=""))
-        m = build_manager(
-            registry=registry,
-            agent_runners={"qa": runner},
-            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
-        )
-        result = await m.execute(_context(), "发烧怎么办")
-        marker = next(a for a in result.actions if a["type"] == "model.call")
-        assert "model_version" not in marker
+    async def test_model_metadata_keys_are_not_even_allowed(self, registry):
+        """The allowlist itself no longer sanctions model-identity markers."""
+        m = build_manager(registry=registry, agent_runners={})
+        with pytest.raises(ValueError):
+            m._mark([], "model.call", provider_id="mock")
+        with pytest.raises(ValueError):
+            m._mark([], "route.handoff", provider_id="SYNTHETIC_PRIVATE_TEXT")
+        assert "provider_id" not in SAFE_MARKER_KEYS
+        assert "model.call" not in SAFE_MARKER_TYPES
 
     @mark.asyncio
     async def test_internal_markers_refuse_a_private_value(self, registry):
@@ -905,7 +1198,9 @@ class TestMarkerValuesAreConstrained:
         assert not is_safe_marker_value("agent_id", "a" * 65)
         assert not is_safe_marker_value("handoffs", -1)
         assert not is_safe_marker_value("handoffs", True)
-        assert not is_safe_marker_value("level", "medium")  # not a Manager level
+        assert is_safe_marker_value("level", "critical")  # all four levels
+        assert is_safe_marker_value("declared", "medium")
+        assert not is_safe_marker_value("level", "unknown")
 
 
 class TestRevisionCeilingIsLocked:
