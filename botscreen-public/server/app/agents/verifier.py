@@ -54,9 +54,18 @@ CITATION GRAMMAR — two forms are accepted by this verifier:
 A bare ``[N]``, ``参考[N]``, ``依据[N]``, ``出处[N]`` or ``资料[#N]`` is not a
 marker, so 「参考[2024]版指南」 is not read as citing item 2024.
 
-Coverage is computed from the CLAIMS, never from the raw answer text: a
-markers-only sentence cannot give an otherwise uncited evidence item a coverage
-credit.
+CITATIONS ARE CHECKED ON TWO TRACKS, and the two must never be conflated:
+
+* **Legitimacy — every marker in the whole answer.** Each recognised marker must
+  resolve: an out-of-range ``资料[N]`` or a ``来源 <id>`` that names no delivered
+  item is ``citation_unknown`` wherever it appears. A marker may not be smuggled
+  in behind a passing claim.
+* **Coverage — only the markers ATTACHED TO a substantive claim.** An item earns
+  delivered-evidence status only when a conclusion cites it; a markers-only
+  sentence grants nothing. Conversely, a known marker hanging off no claim at
+  all (「结论A（资料[1]）。资料[1]」) is ``citation_mismatch``: the answer points at
+  a source for no conclusion. The raw-answer id set is never reused for
+  coverage — doing so was the hole where 「资料[2]」 covered an unrelated item.
 
 TRUST: the candidate output is untrusted input. It is accepted only as the
 #52 contract type — a fresh, strictly re-validated ``AgentExecution`` whose
@@ -409,33 +418,35 @@ def _citations_in(answer: str) -> list[tuple[str | None, int | None]]:
     return found
 
 
-def _resolve_claim_citations(
-    claims: list[tuple[str, list[tuple[str | None, int | None]]]],
-    evidence: list[Evidence],
+def _resolve_markers(
+    markers: list[tuple[str | None, int | None]], evidence: list[Evidence]
 ) -> tuple[set[str], bool]:
-    """Resolve the citations that are ATTACHED TO a substantive claim.
+    """Resolve a SEQUENCE of markers onto evidence source ids.
 
-    Coverage must never be computed from the raw answer text. Extracting markers
-    from the whole answer let a markers-only sentence such as 「资料[2]」 give the
-    unrelated evidence item 2 a coverage credit it never earned, and the item was
-    then delivered as a verified source. Markers reach coverage only through a
-    claim that carries a body, because a citation is a statement about a
-    conclusion, not a free-standing token.
+    Returns ``(resolved_source_ids, all_known)``; an out-of-range ``资料[N]``
+    marker makes ``all_known`` False, never a silent pass.
 
-    Returns (cited_source_ids, all_known): an out-of-range ``资料[N]`` marker is
-    an unknown citation, never a silent pass.
+    The same resolution is used twice, on purpose, and the two uses must not be
+    conflated:
+
+    * over EVERY marker in the answer — to decide legitimacy (unknown id,
+      out-of-range index) and to spot a marker that hangs off no claim at all;
+    * over the markers ATTACHED TO a substantive claim — to decide coverage.
+
+    Only the second set may grant coverage. Reusing the raw-answer set for
+    coverage was the earlier hole: a markers-only sentence such as 「资料[2]」
+    gave an unrelated item a coverage credit it never earned.
     """
-    cited: set[str] = set()
+    resolved: set[str] = set()
     all_known = True
-    for _body, markers in claims:
-        for source_id, index in markers:
-            if source_id is not None:
-                cited.add(source_id)
-            elif index is not None and 1 <= index <= len(evidence):
-                cited.add(evidence[index - 1].source_id)
-            else:
-                all_known = False
-    return cited, all_known
+    for source_id, index in markers:
+        if source_id is not None:
+            resolved.add(source_id)
+        elif index is not None and 1 <= index <= len(evidence):
+            resolved.add(evidence[index - 1].source_id)
+        else:
+            all_known = False
+    return resolved, all_known
 
 
 def _contains_red_flag(text: str, rules: RedFlagRules) -> bool:
@@ -527,12 +538,22 @@ class SafetyEvidenceVerifier:
         duplicate_source = _has_duplicate_source_ids(evidence)
         # ONE split of the answer: the same claim list answers "does a
         # deliverable answer exist?" (answer_present), "which sources does the
-        # answer actually cite?" (coverage) and "is it supported?" (the gate)
+        # answer actually cite by a conclusion?" (coverage) and "is it
+        # supported?" (the gate)
         claims = _claim_bodies(answer)
         known_ids = {item.source_id for item in evidence}
-        # coverage comes from the CLAIMS, never from the raw answer text: a
-        # markers-only sentence must not earn coverage for an uncited item
-        cited_ids, citations_known = _resolve_claim_citations(claims, evidence)
+
+        # TRACK A — legitimacy of EVERY marker in the answer, claim or not.
+        # Validation only: these ids are NEVER fed into coverage.
+        raw_markers = _citations_in(answer)
+        raw_ids, markers_known = _resolve_markers(raw_markers, evidence)
+
+        # TRACK B — coverage, from the markers ATTACHED TO a substantive claim
+        # only. A markers-only sentence must not earn coverage for an item.
+        claim_markers = [marker for _body, markers in claims for marker in markers]
+        cited_ids, _ = _resolve_markers(claim_markers, evidence)
+        every_marker_attached = len(raw_markers) == len(claim_markers)
+
         provenance_complete = all(
             item.source_id and item.knowledge_version and item.content_hash
             for item in evidence
@@ -542,7 +563,9 @@ class SafetyEvidenceVerifier:
         citation_reason = ""
         unsupported = bool(answer) and not grounded
         if answer and grounded:
-            if not citations_known or not cited_ids <= known_ids:
+            if not markers_known or not raw_ids <= known_ids:
+                # a marker anywhere in the answer that resolves to nothing:
+                # 「资料[99]」 past the end, or 「来源 ghost」 citing no item
                 citation_coverage = False
                 citation_reason = "citation_unknown"
                 unsupported = True
@@ -552,9 +575,10 @@ class SafetyEvidenceVerifier:
             elif not provenance_complete:
                 citation_coverage = False
                 citation_reason = "citation_incomplete"
-            elif cited_ids != known_ids:
-                # every delivered item must be cited: a citation set that does
-                # not match the evidence set is an inconsistent answer
+            elif not every_marker_attached or cited_ids != known_ids:
+                # either the answer carries a known marker that backs NO
+                # conclusion, or a delivered item is never cited by one — both
+                # mean the citation set and the evidence set disagree
                 citation_coverage = False
                 citation_reason = "citation_mismatch"
 

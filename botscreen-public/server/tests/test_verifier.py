@@ -1027,6 +1027,82 @@ class TestClaimToSourceAssociation:
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "evidence_unsupported"
 
+    def test_a_trailing_unknown_index_is_still_unknown(self):
+        """A marker past the end of the evidence list is invalid wherever it
+        sits — a passing claim earlier in the answer must not cover for it."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。资料[99]",
+                evidence=[_evidence("doc-1", "结论A。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "citation_unknown"
+        assert decision.citation_coverage is False
+
+    def test_a_trailing_ghost_source_id_is_still_unknown(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。来源 ghost",
+                evidence=[_evidence("doc-1", "结论A。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "citation_unknown"
+
+    def test_a_dangling_known_marker_is_a_mismatch(self):
+        """「资料[1]」 repeated with no conclusion behind it: the source is real
+        but the answer points at it for nothing, so the sets disagree."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。资料[1]",
+                evidence=[_evidence("doc-1", "结论A。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "citation_mismatch"
+        assert decision.citation_coverage is False
+
+    def test_a_dangling_marker_for_a_real_second_item_is_a_mismatch(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。资料[2]",
+                evidence=[
+                    _evidence("doc-1", "结论A。"),
+                    _evidence("doc-2", "结论A。", source_type="document"),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "citation_mismatch"
+
+    def test_a_markers_only_answer_stays_empty_answer(self):
+        decision = _verifier().decide(
+            _context(), _execution(answer="资料[1]", evidence=[_evidence()])
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "empty_answer"
+
+    def test_every_marker_attached_to_its_own_claim_still_passes(self):
+        """The two tracks must not turn a well-formed answer into a refusal."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。结论B（资料[2]）。",
+                evidence=[
+                    _evidence("doc-1", "结论A。"),
+                    _evidence("doc-2", "结论B。", source_type="document"),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+        assert decision.citation_coverage is True
+        assert decision.evidence_supported is True
+
 
 class TestCitationGrammar:
     """Review scope: exactly two forms — ``资料[N]`` and ``来源 <source_id>``."""
