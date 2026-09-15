@@ -130,6 +130,7 @@ def running_app(
     credentials: list[dict] | None = None,
     settings_kwargs: dict | None = None,
     default_credential: str | None = PRIMARY_TOKEN,
+    agent_executor: bool = False,
 ) -> Iterator[Harness]:
     """Run the application under test.
 
@@ -149,6 +150,7 @@ def running_app(
         app = create_app(
             settings=settings,
             repository_factory=lambda _settings: repository,
+            agent_executor=agent_executor,
         )
         clock = FakeClock()
         headers = (

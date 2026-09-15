@@ -10,61 +10,96 @@ moved it further. The executor is the ONLY non-test code that connects
 and it makes no safety decision of its own:
 
 * every state change goes through the repository's ``commit_transition`` with
-  the EXPECTED state (CAS), so a concurrent cancel can never be overwritten —
-  a lost race is read as "the run moved elsewhere" and the executor stands
-  down for the rest of the turn;
+  the EXPECTED state (CAS). A lost race means "the run moved elsewhere" and the
+  executor stands down — but ONLY after confirming the durable run really is
+  terminal. A CAS conflict against a live run, or an invariant / illegal
+  transition, is an EXPLICIT fault: the executor surfaces it and then commits
+  exactly one terminal ``FAILED`` (with its ``run.completed``) when the
+  repository is still writable, so no admitted run is ever left as a live
+  orphan;
 * staged transitions are driven by the Manager's optional progress hook
   (``ManagerAgent.execute(on_stage=...)``), whose fixed stage vocabulary maps
   one-to-one onto run states. The hook carries no result data, so agent
   internals cannot leak into the stream through it;
 * what reaches the client is decided by the MANAGER (only a verifier PASS
   delivers an answer) — the executor merely packages the already-verified
-  result into the SSE contract's allowlisted keys.
+  result into the SSE contract's allowlisted keys;
+* the whole turn runs under ``AgentContext.deadline`` (``run_timeout_ms``), so
+  the configured run budget actually bounds a slow model.
 
 Outcome mapping (fixed, public, no agent prose):
 
-=================  ============  ==============================
-Manager outcome    Run state     ``run.completed`` result
-=================  ============  ==============================
-verified (PASS)    COMPLETED     ``answered``
-escalated          HANDOFF       ``escalated_to_human``
-blocked            FAILED        ``refused_blocked``
-revised (final)    FAILED        ``refused_revised``
-unverified/failed  FAILED        ``refused_no_answer``
-=================  ============  ==============================
+=========================  ============  ==============================
+Manager outcome            Run state     ``run.completed`` result
+=========================  ============  ==============================
+verified (PASS)            COMPLETED     ``answered``
+escalated                  HANDOFF       ``escalated_to_human``
+blocked                    FAILED        ``refused_blocked``
+revised (final)            FAILED        ``refused_revised``
+no evidence / other        FAILED        ``refused_no_answer``
+deadline / budget exceeded FAILED        ``deadline_exceeded``
+=========================  ============  ==============================
 
 A cancelled run needs no epilogue from here: the CAS cancel itself commits the
 terminal transition and therefore the terminal ``run.completed`` frame.
+
+Faults are CONSUMED, never re-raised: this coroutine runs as a fire-and-forget
+background task, so an escaping exception would only land in the event loop's
+"task exception was never retrieved" log with its raw text. The executor logs a
+FIXED fault category (never the original message) through ``fault_sink`` and
+always leaves the run terminal when the repository allows it.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 from typing import Any
 
-from ..agents.manager import ManagerAgent
+from ..agents.manager import ManagerAgent, ManagerAgentError
 from ..contracts.agent import AgentContext, Channel
+from ..contracts.errors import ErrorCode
 from ..contracts.events import ContentOrigin, SSEEventType
 from ..contracts.run import RunState
 from ..storage.run_repository import RunRepositoryError, RunRepositoryFault
 from .state_machine import is_terminal_state
 
+_LOGGER = logging.getLogger(__name__)
+
 #: how large one ``answer.delta`` chunk is. The answer is verified verbatim
 #: content, so chunking is presentation only.
 _DELTA_CHUNK_CHARS = 24
 
-#: repository faults that mean "this run moved / ended elsewhere": the executor
-#: stands down instead of fighting or surfacing them. Anything else is a real
-#: storage fault and propagates to the unexpected-fault path.
-_STOP_FAULTS = frozenset(
-    {
-        RunRepositoryFault.CAS_CONFLICT,
-        RunRepositoryFault.ILLEGAL_TRANSITION,
-        RunRepositoryFault.INVARIANT,
-        RunRepositoryFault.NOT_FOUND,
-    }
+
+#: fixed fault categories for the fault sink. NEVER an exception's own text.
+class FaultCategory(str, Enum):
+    STORAGE_TRANSITION = "storage_transition_fault"
+    STORAGE_APPEND = "storage_append_fault"
+    DEADLINE = "deadline_exceeded"
+    CANCELLED = "cancelled"
+    UNEXPECTED = "unexpected_fault"
+
+
+class RunExecutionFault(RuntimeError):
+    """An executor fault carrying ONLY its fixed category.
+
+    The original repository exception is deliberately not chained or embedded:
+    this error crosses the fault sink boundary, and its text must never reach a
+    log or a client."""
+
+    def __init__(self, category: FaultCategory) -> None:
+        super().__init__(category.value)
+        self.category = category
+
+
+#: repository faults that mean "this run moved / ended elsewhere". The executor
+#: stands down instead of fighting them — but only after confirming the run is
+#: terminal (see ``_stand_down``). NOT_FOUND means the run record is gone.
+_STAND_DOWN_FAULTS = frozenset(
+    {RunRepositoryFault.CAS_CONFLICT, RunRepositoryFault.NOT_FOUND}
 )
 
 #: fixed public result markers (``run.completed`` data key ``result``). A
@@ -74,6 +109,7 @@ RESULT_ESCALATED = "escalated_to_human"
 RESULT_BLOCKED = "refused_blocked"
 RESULT_REVISED = "refused_revised"
 RESULT_NO_ANSWER = "refused_no_answer"
+RESULT_DEADLINE = "deadline_exceeded"
 
 _STAGE_MESSAGES: dict[str, str] = {
     "guarding": "安全检查中",
@@ -103,11 +139,15 @@ class RunExecutor:
         manager: ManagerAgent,
         clock: Callable[[], datetime] | None = None,
         delta_chunk_chars: int = _DELTA_CHUNK_CHARS,
+        run_timeout_ms: int = 15_000,
+        fault_sink: Callable[[FaultCategory, str], None] | None = None,
     ) -> None:
         self._repository = repository
         self._manager = manager
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._delta_chunk_chars = max(1, int(delta_chunk_chars))
+        self._run_timeout_ms = max(1, int(run_timeout_ms))
+        self._fault_sink = fault_sink or self._default_fault_sink
         self._tasks: set[asyncio.Task[None]] = set()
 
     # -- lifecycle ---------------------------------------------------------------
@@ -119,6 +159,20 @@ class RunExecutor:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    def cancel(self, run_id: str) -> bool:
+        """Interrupt the in-flight task for one run (API cancel / lease expiry).
+
+        The run's terminal state is committed by the caller's CAS; cancelling
+        the task only stops the slow work behind it. Returns whether a task was
+        found."""
+        name = f"gcmw-run:{run_id}"
+        found = False
+        for task in list(self._tasks):
+            if task.get_name() == name and not task.done():
+                task.cancel()
+                found = True
+        return found
 
     async def shutdown(self) -> None:
         """Cancel every in-flight run task (application shutdown)."""
@@ -133,16 +187,21 @@ class RunExecutor:
     async def execute(self, record: Any) -> None:
         """Drive one run from ``ACCEPTED`` to a terminal state.
 
-        Every failure path ends the run through the repository so the client
-        always receives exactly one terminal ``run.completed`` frame."""
+        Faults are CONSUMED here (this coroutine is a fire-and-forget task) and
+        reduced to a fixed category; the run itself is driven to a terminal
+        state whenever the repository is still writable."""
         identity = record.identity
         try:
             await self._run_turn(record)
         except asyncio.CancelledError:
-            raise
-        except Exception:
             await self._fail_from(identity)
-            raise
+            self._emit_fault(identity, FaultCategory.CANCELLED)
+        except RunExecutionFault as exc:
+            await self._fail_from(identity)
+            self._emit_fault(identity, exc.category)
+        except Exception:  # noqa: BLE001 - consumed, never re-raised
+            await self._fail_from(identity)
+            self._emit_fault(identity, FaultCategory.UNEXPECTED)
 
     async def _run_turn(self, record: Any) -> None:
         identity = record.identity
@@ -154,6 +213,10 @@ class RunExecutor:
             run_id=identity.run_id,
             channel=Channel(snapshot.channel),
             normalized_input=snapshot.text,
+            # the configured RUN budget actually applies: the Manager reads the
+            # deadline for every engagement (runner / verifier) and the
+            # executor maps an exceeded budget onto a terminal FAILED
+            deadline=self._clock() + timedelta(milliseconds=self._run_timeout_ms),
         )
 
         # the executor's OWN view of the run state: every write CASes from it,
@@ -162,17 +225,21 @@ class RunExecutor:
         aborted = False
 
         async def advance(target: RunState, data: dict[str, Any] | None) -> bool:
-            """One CAS transition from the executor's current state."""
+            """One CAS transition from the executor's current state.
+
+            A CAS loss stands down only when the durable run is confirmed
+            terminal; anything else (including a lost race against a LIVE run)
+            is an explicit fault."""
             nonlocal state, aborted
             try:
                 await self._repository.commit_transition(
                     identity, expected_state=state, next_state=target, data=data
                 )
             except RunRepositoryError as exc:
-                if exc.fault in _STOP_FAULTS:
+                if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
                     aborted = True
                     return False
-                raise
+                raise RunExecutionFault(FaultCategory.STORAGE_TRANSITION) from None
             state = target
             return True
 
@@ -195,7 +262,23 @@ class RunExecutor:
                     return
                 await advance(RunState.VERIFYING, _stage_message("verifying"))
 
-        result = await self._manager.execute(context, snapshot.text, on_stage=on_stage)
+        try:
+            result = await self._manager.execute(
+                context, snapshot.text, on_stage=on_stage
+            )
+        except ManagerAgentError as exc:
+            # a budget/deadline/routing refusal is a normal terminal outcome:
+            # no answer, exactly one terminal event, no late deltas
+            if aborted:
+                return
+            marker = (
+                RESULT_DEADLINE
+                if exc.code is ErrorCode.TIMEOUT_AGENT
+                else RESULT_NO_ANSWER
+            )
+            await self._close_without_answer(identity, RunState.FAILED, marker, advance)
+            return
+
         if aborted:
             return
 
@@ -204,7 +287,7 @@ class RunExecutor:
         try:
             durable = await self._repository.state(identity)
         except RunRepositoryError:
-            return
+            raise RunExecutionFault(FaultCategory.STORAGE_TRANSITION) from None
         if is_terminal_state(durable):
             return
         state = durable
@@ -213,7 +296,8 @@ class RunExecutor:
         if safety == "verified" and result.answer_candidate:
             await self._stream_answer(identity, result, advance)
             return
-        await self._close_without_answer(identity, safety, advance)
+        target, marker = _refusal_outcome(safety)
+        await self._close_without_answer(identity, target, marker, advance)
 
     # -- delivery -----------------------------------------------------------------
 
@@ -241,6 +325,7 @@ class RunExecutor:
                     "source_id": item.source_id,
                     "title": item.title,
                     "knowledge_version": item.knowledge_version,
+                    "content_hash": item.content_hash,
                     "source_uri": item.source_uri,
                 }
                 for item in result.evidence
@@ -259,21 +344,22 @@ class RunExecutor:
     async def _close_without_answer(
         self,
         identity: Any,
-        safety: str,
+        target: RunState,
+        marker: str,
         advance: Callable[[RunState, dict[str, Any] | None], Awaitable[bool]],
     ) -> None:
-        """Refusal / escalation: no answer is delivered, by design."""
-        if safety == "escalated":
-            target, result = RunState.HANDOFF, RESULT_ESCALATED
-        elif safety == "blocked":
-            target, result = RunState.FAILED, RESULT_BLOCKED
-        elif safety == "revised":
-            target, result = RunState.FAILED, RESULT_REVISED
-        else:
-            target, result = RunState.FAILED, RESULT_NO_ANSWER
-        await advance(target, {"result": result})
+        """Refusal / escalation / timeout: no answer is delivered, by design."""
+        await advance(target, {"result": marker})
 
-    # -- helpers --------------------------------------------------------------------
+    # -- fault machinery ------------------------------------------------------------
+
+    async def _stand_down(self, identity: Any) -> bool:
+        """True when the durable run is confirmed TERMINAL (safe to abandon)."""
+        try:
+            state = await self._repository.state(identity)
+        except RunRepositoryError:
+            return False  # cannot confirm: this is a fault, not a yield
+        return is_terminal_state(state)
 
     async def _append(
         self, identity: Any, event_type: SSEEventType, data: dict[str, Any]
@@ -284,19 +370,22 @@ class RunExecutor:
                 identity, event_type=event_type, data=data
             )
         except RunRepositoryError as exc:
-            if exc.fault in _STOP_FAULTS:
+            if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
                 return False
-            raise
+            raise RunExecutionFault(FaultCategory.STORAGE_APPEND) from None
         return True
 
-    async def _fail_from(self, identity: Any) -> None:
-        """Best-effort terminal move after an unexpected executor fault."""
+    async def _fail_from(self, identity: Any) -> bool:
+        """Best-effort terminal move; ``True`` when the run IS terminal now.
+
+        Exactly one terminal ``FAILED`` / ``run.completed`` is committed when the
+        repository is still writable; an already-terminal run is left alone."""
         try:
             state = await self._repository.state(identity)
         except RunRepositoryError:
-            return
+            return False
         if is_terminal_state(state):
-            return
+            return True
         try:
             await self._repository.commit_transition(
                 identity,
@@ -305,4 +394,33 @@ class RunExecutor:
                 data={"result": RESULT_NO_ANSWER},
             )
         except RunRepositoryError:
-            return
+            return False
+        return True
+
+    def _emit_fault(self, identity: Any, category: FaultCategory) -> None:
+        """Report a fault through the sink with the FIXED category only."""
+        try:
+            self._fault_sink(category, identity.run_id)
+        except Exception:  # noqa: BLE001 - a broken sink must not mask the run
+            _LOGGER.warning(
+                "run executor fault category=%s run_id=%s (sink failed)",
+                FaultCategory.UNEXPECTED.value,
+                identity.run_id,
+            )
+
+    @staticmethod
+    def _default_fault_sink(category: FaultCategory, run_id: str) -> None:
+        _LOGGER.warning(
+            "run executor fault category=%s run_id=%s", category.value, run_id
+        )
+
+
+def _refusal_outcome(safety: str) -> tuple[RunState, str]:
+    """Map the Manager's non-delivering outcome onto a terminal state."""
+    if safety == "escalated":
+        return RunState.HANDOFF, RESULT_ESCALATED
+    if safety == "blocked":
+        return RunState.FAILED, RESULT_BLOCKED
+    if safety == "revised":
+        return RunState.FAILED, RESULT_REVISED
+    return RunState.FAILED, RESULT_NO_ANSWER

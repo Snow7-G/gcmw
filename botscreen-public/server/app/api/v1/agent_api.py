@@ -550,7 +550,13 @@ class RunAdmissionService:
     ) -> RunStatusSnapshot:
         async with self._session_guard(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
-            return self._snapshot(record, await self._cancel_record(record))
+            state = await self._cancel_record(record)
+            if self.executor is not None:
+                # #55A: the terminal state is committed by the CAS above; this
+                # only interrupts the SLOW WORK behind it (a model call), so no
+                # late answer can ever be produced after the cancel
+                self.executor.cancel(run_id)
+            return self._snapshot(record, state)
 
     async def cancel_for_disconnect(self, run_id: str) -> None:
         """Cancel a run whose LAST subscriber left (lease grace expired).
@@ -574,6 +580,8 @@ class RunAdmissionService:
                 await self._cancel_record(record)
             except AppError:
                 return
+            if self.executor is not None:
+                self.executor.cancel(run_id)
 
     # -- streaming ---------------------------------------------------------------
 

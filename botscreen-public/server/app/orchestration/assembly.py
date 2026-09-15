@@ -156,7 +156,14 @@ def build_agent_executor(*, repository: Any, settings: Settings) -> RunExecutor 
         red_flag_rules=red_flags,
         risk_rules=risk_rules,
     )
-    return RunExecutor(repository=repository, manager=manager)
+    return RunExecutor(
+        repository=repository,
+        manager=manager,
+        # the configured RUN budget: the executor writes it into the
+        # AgentContext deadline, so the Manager enforces it per engagement and
+        # an exceeded budget lands as a terminal FAILED — never a stuck run
+        run_timeout_ms=settings.run_timeout_ms,
+    )
 
 
 __all__ = ["DEMO_TENANT_ID", "build_agent_executor"]
