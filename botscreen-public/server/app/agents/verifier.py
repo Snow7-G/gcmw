@@ -32,20 +32,31 @@ vocabulary.
 EXACT-MATCH SUPPORT GATE (honest scope): with the citation markers removed the
 answer is split into claims. A claim counts only if it actually asserts
 something (a markers-only body does not). Every claim must carry a citation and
-its normalized body must be EQUAL to a complete unit of the evidence it cites —
+its normalized body must be EQUAL to a complete unit of EVERY source it cites —
 the WHOLE normalized ``content`` of a short FAQ entry, or one of that content's
 COMPLETE sentences. Never a substring: substring matching let 「使用激素」 be
 lifted out of 「不建议患者使用激素」 / 「仅在医生指导下使用激素」 and pass as
-verified, silently deleting a contraindication or a precondition. Consequences
-of equality, stated plainly: a paraphrase is refused, and so is a claim that is
-merely part of a longer evidence sentence. This gate performs NO entailment, NO
-polarity inference and NO medical semantic verification, and must never be
-described as such.
+verified, silently deleting a contraindication or a precondition. Never a
+subset of the cited sources either: when a claim cites two items, BOTH must
+contain it, because the front end presents each cited item as the basis of that
+conclusion. Consequences of equality, stated plainly: a paraphrase is refused,
+and so is a claim that is merely part of a longer evidence sentence. This gate
+performs NO entailment, NO polarity inference and NO medical semantic
+verification, and must never be described as such.
 
-The citation protocol is ONE form, matching the #53 prompt: ``资料[N]``
-(1-based index into the delivered evidence) and ``来源 <source_id>``. A bare
-``[N]``, ``参考[N]``, ``依据[N]`` or ``出处[N]`` is not a marker, so
-「参考[2024]版指南」 is not read as citing item 2024.
+CITATION GRAMMAR — two forms are accepted by this verifier:
+
+* ``资料[N]`` (1-based index into the delivered evidence) — the ONLY form the
+  #53 model output may use;
+* ``来源 <source_id>`` — the form the medical QA agent renders for its evidence,
+  also accepted here.
+
+A bare ``[N]``, ``参考[N]``, ``依据[N]``, ``出处[N]`` or ``资料[#N]`` is not a
+marker, so 「参考[2024]版指南」 is not read as citing item 2024.
+
+Coverage is computed from the CLAIMS, never from the raw answer text: a
+markers-only sentence cannot give an otherwise uncited evidence item a coverage
+credit.
 
 TRUST: the candidate output is untrusted input. It is accepted only as the
 #52 contract type — a fresh, strictly re-validated ``AgentExecution`` whose
@@ -84,19 +95,22 @@ from app.agents.manager import (
 )
 from app.contracts.agent import AgentContext, AgentStatus, Evidence, RiskLevel
 
-#: The ONE citation protocol, matching the #53 prompt (``资料[1]``) and the
-#: ``来源 <source_id>`` form the medical QA agent renders:
+#: The citation grammar accepted by the verifier. There are exactly two forms:
 #:
-#:   ``资料[N]``  — 1-based index into the delivered evidence list
-#:   ``来源 <source_id>``
+#:   ``资料[N]``          — 1-based index into the delivered evidence list.
+#:                          This is the ONLY form the #53 model output may use
+#:                          (see ``_GROUNDED_HEADER`` in ``medical_qa``).
+#:   ``来源 <source_id>`` — the form the medical QA agent renders when it lists
+#:                          evidence, also accepted here.
 #:
 #: Nothing else is a citation. A bare ``[N]``, ``参考[N]``, ``依据[N]``,
-#: ``出处[N]`` are NOT markers: an answer containing 「参考[2024]版指南」 must not
-#: be read as citing item 2024 (that produced a spurious ``citation_unknown``
-#: REVISE on an otherwise supported answer).
+#: ``出处[N]`` and ``资料[#N]`` are NOT markers: an answer containing
+#: 「参考[2024]版指南」 must not be read as citing item 2024 (that produced a
+#: spurious ``citation_unknown`` REVISE on an otherwise supported answer), and
+#: the ``#`` variant is not part of the protocol at all.
 _CITATION_RE = re.compile(
     r"来源\s+([A-Za-z0-9][A-Za-z0-9._-]*)"
-    r"|资料\[#?(\d+)\]"
+    r"|资料\[(\d+)\]"
 )
 _PRIVACY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[A-Za-z0-9]{16,}"),
@@ -282,8 +296,13 @@ def _check_extractive_support(
     ``empty_answer``: there is no substantive claim at all, so there is no
     deliverable answer to PASS. ``citation_missing``: a substantive claim carries
     no marker. ``citation_unknown``: a marker that does not resolve.
-    ``evidence_unsupported``: a cited claim whose normalized body is not EQUAL to
-    one of its evidence units.
+    ``evidence_unsupported``: a cited claim is not EQUAL to a unit of EVERY one
+    of its cited sources.
+
+    EVERY source matters: a claim that cites two items is supported only when
+    BOTH items contain the claim, because the front end shows each cited item as
+    the basis of that conclusion. Testing "any one of them" let a wholly
+    unrelated item be displayed as verified support.
     """
     if not claims:
         return False, "empty_answer"
@@ -303,7 +322,7 @@ def _check_extractive_support(
                 targets.append(evidence[index - 1])
             else:
                 return False, "citation_unknown"
-        if not any(body in units[id(target)] for target in targets):
+        if not all(body in units[id(target)] for target in targets):
             return False, "evidence_unsupported"
     return True, ""
 
@@ -390,24 +409,33 @@ def _citations_in(answer: str) -> list[tuple[str | None, int | None]]:
     return found
 
 
-def _resolve_citations(answer: str, evidence: list[Evidence]) -> tuple[list[str], bool]:
-    """Resolve citation markers onto evidence source ids.
+def _resolve_claim_citations(
+    claims: list[tuple[str, list[tuple[str | None, int | None]]]],
+    evidence: list[Evidence],
+) -> tuple[set[str], bool]:
+    """Resolve the citations that are ATTACHED TO a substantive claim.
 
-    Returns (resolved_ids, all_known): an out-of-range ``资料[N]`` marker is an
-    unknown citation, never a silent pass.
+    Coverage must never be computed from the raw answer text. Extracting markers
+    from the whole answer let a markers-only sentence such as 「资料[2]」 give the
+    unrelated evidence item 2 a coverage credit it never earned, and the item was
+    then delivered as a verified source. Markers reach coverage only through a
+    claim that carries a body, because a citation is a statement about a
+    conclusion, not a free-standing token.
+
+    Returns (cited_source_ids, all_known): an out-of-range ``资料[N]`` marker is
+    an unknown citation, never a silent pass.
     """
-    resolved: list[str] = []
+    cited: set[str] = set()
     all_known = True
-    for source_id, index in _citations_in(answer):
-        if source_id is not None:
-            resolved.append(source_id)
-            continue
-        if index is not None and 1 <= index <= len(evidence):
-            resolved.append(evidence[index - 1].source_id)
-        else:
-            all_known = False
-            resolved.append(f"#{index}")
-    return resolved, all_known
+    for _body, markers in claims:
+        for source_id, index in markers:
+            if source_id is not None:
+                cited.add(source_id)
+            elif index is not None and 1 <= index <= len(evidence):
+                cited.add(evidence[index - 1].source_id)
+            else:
+                all_known = False
+    return cited, all_known
 
 
 def _contains_red_flag(text: str, rules: RedFlagRules) -> bool:
@@ -497,12 +525,14 @@ class SafetyEvidenceVerifier:
 
         grounded = bool(evidence)
         duplicate_source = _has_duplicate_source_ids(evidence)
-        # ONE split of the answer: the same claim list answers both "does a
-        # deliverable answer exist?" (answer_present) and "is it supported?"
+        # ONE split of the answer: the same claim list answers "does a
+        # deliverable answer exist?" (answer_present), "which sources does the
+        # answer actually cite?" (coverage) and "is it supported?" (the gate)
         claims = _claim_bodies(answer)
-        resolved, citations_known = _resolve_citations(answer, evidence)
         known_ids = {item.source_id for item in evidence}
-        cited_ids = set(resolved)
+        # coverage comes from the CLAIMS, never from the raw answer text: a
+        # markers-only sentence must not earn coverage for an uncited item
+        cited_ids, citations_known = _resolve_claim_citations(claims, evidence)
         provenance_complete = all(
             item.source_id and item.knowledge_version and item.content_hash
             for item in evidence

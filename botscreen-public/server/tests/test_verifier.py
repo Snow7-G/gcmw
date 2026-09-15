@@ -191,11 +191,18 @@ class TestPassAndFastPath:
         assert decision.revision_instructions == "red_flag_escalate"
 
     def test_full_path_passes_multisource_with_citations(self):
+        """Two sources cited by ONE claim: both must contain the conclusion.
+
+        This test used to pair 「建议就诊」 with a second item that only held
+        「建议就诊，必要时转诊。」 and still expect PASS — it locked in the
+        "any one source is enough" bug, which let an item that does not support
+        the conclusion be displayed as its verified basis.
+        """
         execution = _execution(
             answer="建议就诊（来源 a、来源 b）。",
             evidence=[
                 _evidence("a", "建议就诊。"),
-                _evidence("b", "建议就诊，必要时转诊。", source_type="document"),
+                _evidence("b", "建议就诊。", source_type="document"),
             ],
         )
         decision = _verifier().decide(_context(), execution)
@@ -933,6 +940,130 @@ class TestExtractiveSupportGate:
         )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "evidence_unsupported"
+
+
+class TestClaimToSourceAssociation:
+    """Review scope: EVERY cited source must support the claim it is attached to,
+    and coverage must come from claims — not from markers floating in the text.
+
+    Both bugs let an unrelated item be presented to the user as the verified
+    basis of a conclusion, which breaks the 结论—来源 correspondence the medical
+    evidence model depends on."""
+
+    def test_one_unrelated_source_cited_alongside_a_supporting_one_revises(self):
+        """「结论A（资料[1]）（资料[2]）」 with 资料2 unrelated must not PASS:
+        otherwise 资料2 ships as verified support for 结论A."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）（资料[2]）。",
+                evidence=[
+                    _evidence("doc-1", "结论A。"),
+                    _evidence("doc-2", "完全无关内容。", source_type="document"),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+        assert decision.evidence_supported is False
+
+    def test_a_markers_only_sentence_cannot_cover_an_unrelated_item(self):
+        """「结论A（资料[1]）。资料[2]」: 资料2 is cited by a sentence with no
+        claim, so it must not earn coverage nor count as verified evidence."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。资料[2]",
+                evidence=[
+                    _evidence("doc-1", "结论A。"),
+                    _evidence("doc-2", "完全无关内容。", source_type="document"),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        # 资料2 contributes nothing, so the delivered set is not covered
+        assert decision.revision_instructions == "citation_mismatch"
+        assert decision.citation_coverage is False
+
+    def test_two_sources_that_both_contain_the_conclusion_pass(self):
+        """Positive ability kept: identical complete conclusion in both items."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）（资料[2]）。",
+                evidence=[
+                    _evidence("doc-1", "结论A。"),
+                    _evidence("doc-2", "结论A。", source_type="document"),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+        assert decision.evidence_supported is True
+
+    def test_two_claims_each_bound_to_their_own_source_pass(self):
+        """Positive ability kept: standard one-claim-one-source answers."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）。结论B（资料[2]）。",
+                evidence=[
+                    _evidence("doc-1", "结论A。"),
+                    _evidence("doc-2", "结论B。", source_type="document"),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+        assert decision.evidence_supported is True
+
+    def test_a_claim_citing_its_own_source_twice_still_needs_that_source(self):
+        """Repeating a marker does not weaken the requirement."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="结论A（资料[1]）（资料[1]）。",
+                evidence=[_evidence("doc-1", "别的内容。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+
+
+class TestCitationGrammar:
+    """Review scope: exactly two forms — ``资料[N]`` and ``来源 <source_id>``."""
+
+    @mark.parametrize(
+        "answer",
+        [
+            "建议门诊就诊（资料[#1]）。",
+            "建议门诊就诊（资料[ #1]）。",
+            "建议门诊就诊（[1]）。",
+            "建议门诊就诊（参考[1]）。",
+        ],
+    )
+    def test_the_hash_and_bare_variants_are_not_citations(self, answer):
+        """``资料[#1]`` used to be accepted (a stray ``#?`` in the regex) while
+        the prompt only sanctions ``资料[N]``. None of these may resolve."""
+        assert _citations_in(answer) == []
+        decision = _verifier().decide(
+            _context(), _execution(answer=answer, evidence=[_evidence()])
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+
+    def test_the_two_sanctioned_forms_still_resolve(self):
+        assert _citations_in("建议门诊就诊（资料[1]）。") == [(None, 1)]
+        assert _citations_in("建议门诊就诊（来源 faq-fever）。") == [
+            ("faq-fever", None)
+        ]
+
+    def test_both_sanctioned_forms_pass_when_the_source_supports_them(self):
+        for answer in ("建议门诊就诊（资料[1]）。", "建议门诊就诊（来源 faq-fever）。"):
+            decision = _verifier().decide(
+                _context(),
+                _execution(
+                    answer=answer, evidence=[_evidence("faq-fever", "建议门诊就诊。")]
+                ),
+            )
+            assert decision.outcome is VerifierOutcome.PASS
 
 
 class TestFailClosedRedFlagRules:
