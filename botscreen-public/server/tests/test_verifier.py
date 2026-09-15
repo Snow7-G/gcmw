@@ -13,16 +13,22 @@ Coverage:
 - citation consistency: unknown/out-of-range ids, missing citations, uncited
   evidence, a duplicated source_id and incomplete
   source_id/knowledge_version/content_hash all fail;
-- EXTRACTIVE support gate: a correctly cited but unrelated or negation-inverted
-  answer is refused, a legitimate extractive answer passes, and a paraphrase is
-  refused by design (deterministic containment, not semantic entailment);
+- EXACT-MATCH support gate: every substantive claim must EQUAL a complete unit
+  of the evidence it cites, so a claim carved out of a negated or
+  preconditioned instruction (「不建议患者使用激素」, 「仅在医生指导下使用激素」)
+  is refused; a markers-only answer is ``empty_answer``; a legitimate
+  full-sentence answer passes; a paraphrase is refused by design;
+- the citation protocol is ONE form (``资料[N]`` / ``来源 <source_id>``): a bare
+  ``[1]`` or ``参考[2024]`` is not a marker and never reported as
+  ``citation_unknown``;
 - safety boundary: red flags escalate to a human from the answer OR the
   evidence, privacy leaks block — including sensitive text parked in title,
   source_uri, source_id or knowledge_version — and non-PASS never returns
   candidate content;
-- fail-closed assembly: a verifier cannot exist without an APPROVED rule set;
-- pure and side-effect free: repeated decisions are identical, the input is not
-  mutated, and a cancellation/exception from an injected scanner propagates;
+- fail-closed assembly: a verifier cannot exist without an APPROVED rule set,
+  and cannot be given a synchronous scan hook;
+- pure and side-effect free: repeated decisions are identical and the input is
+  not mutated;
 - no chain-of-thought: decisions carry fixed flags and a fixed marker only.
 """
 
@@ -48,6 +54,7 @@ from app.agents.verifier import (
     REVISION_INSTRUCTIONS,
     SafetyEvidenceVerifier,
     VerifierDecision,
+    _citations_in,
 )
 from app.contracts.agent import AgentContext, AgentStatus, Evidence, RiskLevel
 from app.contracts.common import Channel
@@ -65,10 +72,8 @@ def _rules(*patterns):
     )
 
 
-def _verifier(contradiction_scan=None):
-    return SafetyEvidenceVerifier(
-        red_flag_rules=_rules("自杀"), contradiction_scan=contradiction_scan
-    )
+def _verifier():
+    return SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
 
 
 def _context(risk=RiskLevel.LOW, **overrides):
@@ -137,7 +142,6 @@ class TestFourStateOutcome:
                 "medical_scope_ok",
                 "privacy_ok",
                 "unsupported_claims",
-                "contradictions",
                 "red_flags",
                 "fast_path",
                 "evidence_supported",
@@ -200,8 +204,10 @@ class TestPassAndFastPath:
         assert decision.evidence_supported is True
 
     def test_faq_marker_style_citation_parsed(self):
+        """The ONE protocol: ``资料[N]`` resolves onto the cited evidence."""
         execution = _execution(
-            answer="建议门诊就诊（资料[1]）。", evidence=[_evidence()]
+            answer="建议门诊就诊（资料[1]）。",
+            evidence=[_evidence(content="建议门诊就诊。")],
         )
         decision = _verifier().decide(_context(), execution)
         assert decision.outcome is VerifierOutcome.PASS
@@ -287,20 +293,6 @@ class TestCitationConsistency:
         )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "citation_missing"
-
-    def test_contradiction_scan_hit_revises(self):
-        def scan(answer, evidence):
-            return "矛盾" in answer
-
-        execution = _execution(
-            answer="内容矛盾（来源 a）。", evidence=[_evidence("a", "正文")]
-        )
-        decision = SafetyEvidenceVerifier(
-            red_flag_rules=_rules("自杀"), contradiction_scan=scan
-        ).decide(_context(), execution)
-        assert decision.contradictions is True
-        assert decision.outcome is VerifierOutcome.REVISE
-        assert decision.revision_instructions == "contradiction"
 
 
 class TestBlockAndEscalate:
@@ -705,18 +697,20 @@ class TestPurityAndNoChainOfThought:
             decision = verifier.decide(_context(), case)
             assert decision.revision_instructions in REVISION_INSTRUCTIONS
 
-    @mark.asyncio
-    async def test_cancellation_propagates_unchanged(self):
-        """A cancellation inside an injected scanner is never swallowed."""
+    def test_no_synchronous_hook_can_be_injected(self):
+        """The injectable scan is GONE, not wrapped.
 
-        def scan(answer, evidence):
-            raise asyncio.CancelledError
-
-        verifier = SafetyEvidenceVerifier(
-            red_flag_rules=_rules("自杀"), contradiction_scan=scan
-        )
-        with pytest.raises(asyncio.CancelledError):
-            await verifier(_context(), _faq_answer())
+        A synchronous callback executed inside the event loop, so a slow one
+        blocked the loop and made the Manager's deadline unenforceable
+        (``asyncio.wait_for(..., 10ms)`` still returned PASS after ~155ms).
+        Nothing outside tests used it, so the extension point was deleted rather
+        than dressed up with a thread pool; this guards against re-adding it.
+        """
+        with pytest.raises(TypeError):
+            SafetyEvidenceVerifier(
+                red_flag_rules=_rules("自杀"),
+                contradiction_scan=lambda _answer, _evidence: False,
+            )
 
     @mark.asyncio
     async def test_cancellation_after_a_decision_changes_nothing(self):
@@ -771,8 +765,10 @@ class TestSingleDecisionEntry:
 class TestExtractiveSupportGate:
     """Review scope: correct citations are NOT the same as a supported answer.
 
-    The gate is deterministic and EXTRACTIVE — it never claims medical semantic
-    verification, and it refuses a correct-but-paraphrased answer on purpose."""
+    The gate is deterministic and EXACT-MATCH: a claim must equal a complete
+    evidence unit, never a substring of one. It performs no entailment and no
+    polarity inference, and it refuses a correct-but-paraphrased answer on
+    purpose."""
 
     def test_a_legitimate_extractive_answer_passes(self):
         decision = _verifier().decide(
@@ -789,7 +785,7 @@ class TestExtractiveSupportGate:
         decision = _verifier().decide(
             _context(),
             _execution(
-                answer="近视与遗传因素密切相关[1]。",
+                answer="近视与遗传因素密切相关（资料[1]）。",
                 evidence=[_evidence()],
             ),
         )
@@ -798,39 +794,108 @@ class TestExtractiveSupportGate:
         assert decision.evidence_supported is False
         assert decision.citation_coverage is True  # the citation was fine
 
-    def test_a_correctly_cited_but_negation_inverted_answer_revises(self):
-        """«不应使用激素类眼药水» can never support «应使用激素类眼药水»."""
+    # -- the four substring bugs this gate exists to close ---------------------
+    # A substring rule reported every one of these as SUPPORTED, deleting a
+    # contraindication or a precondition from a medical instruction.
+
+    @mark.parametrize(
+        ("content", "claim"),
+        [
+            ("不建议患者使用激素。", "使用激素（资料[1]）。"),
+            ("没有必要使用激素。", "使用激素（资料[1]）。"),
+            ("严禁儿童自行服用阿司匹林。", "服用阿司匹林（资料[1]）。"),
+            ("仅在医生指导下使用激素。", "使用激素（资料[1]）。"),
+            ("不应使用激素类眼药水，需及时复诊。", "应使用激素类眼药水（资料[1]）。"),
+        ],
+    )
+    def test_a_carved_out_substring_never_passes(self, content, claim):
+        """Distant negation (不合适 / 没有必要 / 严禁 / 不应) and a deleted
+        precondition (仅在…指导下) must all be refused: the claim has to EQUAL a
+        complete evidence unit, not be lifted out of the middle of one."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(answer=claim, evidence=[_evidence("doc-1", content)]),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+        assert decision.evidence_supported is False
+
+    @mark.parametrize(
+        "answer", ["[1]", "资料[1]", "（资料[1]）", "（资料[1]）（资料[1]）"]
+    )
+    def test_a_markers_only_answer_is_empty_answer(self, answer):
+        """PASS must mean a deliverable answer existed. A body with no assertion
+        is not one, so the gate reports ``empty_answer`` rather than passing."""
+        decision = _verifier().decide(
+            _context(), _execution(answer=answer, evidence=[_evidence()])
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "empty_answer"
+        assert decision.evidence_supported is False
+
+    def test_a_bare_source_id_answer_is_empty_answer(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(answer="来源 faq-fever", evidence=[_evidence()]),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "empty_answer"
+
+    def test_a_complete_sentence_with_marker_passes(self):
         decision = _verifier().decide(
             _context(),
             _execution(
-                answer="应使用激素类眼药水[1]。",
-                evidence=[_evidence("eye-1", "不应使用激素类眼药水，需及时复诊。")],
+                answer="体温超过38.5建议门诊就诊（资料[1]）。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+        assert decision.evidence_supported is True
+
+    @mark.parametrize("answer", ["参考[2024]版指南建议复查。", "依据[2]给出的建议。"])
+    def test_a_bracketed_number_is_not_a_citation(self, answer):
+        """Only ``资料[N]`` and ``来源 <id>`` are protocol. A year or a section
+        number must not become ``citation_unknown`` on an otherwise fine answer."""
+        assert _citations_in(answer) == []
+        decision = _verifier().decide(
+            _context(), _execution(answer=answer, evidence=[_evidence()])
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions != "citation_unknown"
+
+    def test_two_complete_claims_each_bound_to_their_own_evidence(self):
+        """Two sentences, two citations, each resolved against its own item."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="体温超过38.5建议门诊就诊（资料[1]）。眼部不适需及时就诊（资料[2]）。",
+                evidence=[
+                    _evidence("faq-fever", "体温超过38.5建议门诊就诊。"),
+                    _evidence(
+                        "faq-eye", "眼部不适需及时就诊。", source_type="document"
+                    ),
+                ],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+        assert decision.evidence_supported is True
+
+    def test_a_claim_bound_to_the_wrong_evidence_revises(self):
+        """Same two sentences, but each cites the OTHER item."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="体温超过38.5建议门诊就诊（资料[2]）。眼部不适需及时就诊（资料[1]）。",
+                evidence=[
+                    _evidence("faq-fever", "体温超过38.5建议门诊就诊。"),
+                    _evidence(
+                        "faq-eye", "眼部不适需及时就诊。", source_type="document"
+                    ),
+                ],
             ),
         )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "evidence_unsupported"
-
-    def test_the_negated_claim_itself_is_supported(self):
-        """The same evidence DOES support the claim it actually makes."""
-        decision = _verifier().decide(
-            _context(),
-            _execution(
-                answer="需及时复诊[1]。",
-                evidence=[_evidence("eye-1", "不应使用激素类眼药水，需及时复诊。")],
-            ),
-        )
-        assert decision.outcome is VerifierOutcome.PASS
-
-    def test_a_negation_look_alike_is_not_an_inversion(self):
-        """«眼部不适» is not a negation of «需及时就诊» — no false escalation."""
-        decision = _verifier().decide(
-            _context(),
-            _execution(
-                answer="需及时就诊[1]。",
-                evidence=[_evidence("eye-2", "眼部不适需及时就诊。")],
-            ),
-        )
-        assert decision.outcome is VerifierOutcome.PASS
 
     def test_an_uncited_second_claim_never_passes(self):
         decision = _verifier().decide(
@@ -844,12 +909,25 @@ class TestExtractiveSupportGate:
         assert decision.revision_instructions == "citation_missing"
 
     def test_a_paraphrase_is_refused_by_design(self):
-        """Honest scope: extractive containment, not entailment. A correct but
-        rewritten answer is refused rather than silently accepted."""
+        """Honest scope: exact-match against the evidence, not entailment. A
+        correct but rewritten answer is refused rather than silently accepted."""
         decision = _verifier().decide(
             _context(),
             _execution(
                 answer="发烧应尽快看医生（来源 faq-fever）。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+
+    def test_a_partial_sentence_is_not_support(self):
+        """Even a true fragment is refused: support is equality with a complete
+        unit, so 「建议门诊就诊」 cannot be carved out of the full sentence."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="建议门诊就诊（来源 faq-fever）。",
                 evidence=[_evidence()],
             ),
         )
@@ -1020,7 +1098,7 @@ class TestManagerFourStates:
     @mark.asyncio
     async def test_revise_delivers_nothing(self):
         execution = _execution(
-            answer="近视与遗传因素密切相关[1]。", evidence=[_evidence()]
+            answer="近视与遗传因素密切相关（资料[1]）。", evidence=[_evidence()]
         )
         result = await self._manager(execution, _verifier()).execute(
             _context(), "发热怎么办"

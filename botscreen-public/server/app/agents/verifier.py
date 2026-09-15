@@ -13,8 +13,9 @@ FOUR-STATE DECISION (V2.3 §6.3), returned to the Manager as
 
 * ``PASS``     — the only outcome that may deliver an answer;
 * ``REVISE``   — a fixable defect (missing/unknown/incomplete citations, a
-                 duplicated source, an unsupported or empty answer, contradiction
-                 scan hit): the Manager runs its ONE controlled revision;
+                 duplicated source, an answer with no substantive claim, an
+                 unsupported answer): the Manager runs its ONE controlled
+                 revision;
 * ``BLOCK``    — stop and deliver nothing (privacy leak, invalid candidate
                  output, non-completed run);
 * ``ESCALATE`` — hand the case to a human (red flags, clinician-only scope):
@@ -24,19 +25,27 @@ Checks are deterministic (no model call, no chain-of-thought) and cover:
 grounding, citation COVERAGE *and* CONSISTENCY (every marker resolves to a
 delivered evidence item, every cited id exists, every delivered item is cited,
 ``source_id``/``knowledge_version``/``content_hash`` present, ``source_id``
-unique), an EXTRACTIVE support gate (below), privacy patterns over the WHOLE
+unique), an EXACT-MATCH support gate (below), privacy patterns over the WHOLE
 delivered payload, approved red-flag rules, and a clinician-only action
 vocabulary.
 
-EXTRACTIVE SUPPORT GATE (honest scope): with the citation markers removed the
-answer is split into claims; every substantive claim must carry a citation and
-its NORMALIZED body must be found VERBATIM inside the ``content`` of the
-evidence it cites, with a polarity guard that refuses an assertion the cited
-evidence actually negates. This is a *deterministic extractive* gate — a
-containment test, never token overlap masquerading as semantics. It does NOT
-perform medical semantic verification, entailment or paraphrase recognition: a
-correct but legitimately PARAPHRASED answer is refused with
-``REVISE(evidence_unsupported)``. Do not describe it as medical validation.
+EXACT-MATCH SUPPORT GATE (honest scope): with the citation markers removed the
+answer is split into claims. A claim counts only if it actually asserts
+something (a markers-only body does not). Every claim must carry a citation and
+its normalized body must be EQUAL to a complete unit of the evidence it cites —
+the WHOLE normalized ``content`` of a short FAQ entry, or one of that content's
+COMPLETE sentences. Never a substring: substring matching let 「使用激素」 be
+lifted out of 「不建议患者使用激素」 / 「仅在医生指导下使用激素」 and pass as
+verified, silently deleting a contraindication or a precondition. Consequences
+of equality, stated plainly: a paraphrase is refused, and so is a claim that is
+merely part of a longer evidence sentence. This gate performs NO entailment, NO
+polarity inference and NO medical semantic verification, and must never be
+described as such.
+
+The citation protocol is ONE form, matching the #53 prompt: ``资料[N]``
+(1-based index into the delivered evidence) and ``来源 <source_id>``. A bare
+``[N]``, ``参考[N]``, ``依据[N]`` or ``出处[N]`` is not a marker, so
+「参考[2024]版指南」 is not read as citing item 2024.
 
 TRUST: the candidate output is untrusted input. It is accepted only as the
 #52 contract type — a fresh, strictly re-validated ``AgentExecution`` whose
@@ -62,7 +71,6 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -76,13 +84,19 @@ from app.agents.manager import (
 )
 from app.contracts.agent import AgentContext, AgentStatus, Evidence, RiskLevel
 
-#: citation marker grammar: ``来源 <source_id>`` or ``[N]`` (1-based index into
-#: the evidence list), optionally written with an explicit label (``资料[1]``).
-#: The label is part of the MARKER, so the extractive gate must strip it too —
-#: otherwise the residual word 「资料」 would be treated as claim content.
+#: The ONE citation protocol, matching the #53 prompt (``资料[1]``) and the
+#: ``来源 <source_id>`` form the medical QA agent renders:
+#:
+#:   ``资料[N]``  — 1-based index into the delivered evidence list
+#:   ``来源 <source_id>``
+#:
+#: Nothing else is a citation. A bare ``[N]``, ``参考[N]``, ``依据[N]``,
+#: ``出处[N]`` are NOT markers: an answer containing 「参考[2024]版指南」 must not
+#: be read as citing item 2024 (that produced a spurious ``citation_unknown``
+#: REVISE on an otherwise supported answer).
 _CITATION_RE = re.compile(
     r"来源\s+([A-Za-z0-9][A-Za-z0-9._-]*)"
-    r"|(?:资料|参考|依据|出处)?\[#?(\d+)\]"
+    r"|资料\[#?(\d+)\]"
 )
 _PRIVACY_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-[A-Za-z0-9]{16,}"),
@@ -106,49 +120,6 @@ _CLAIM_SPLIT_RE = re.compile(r"[。！？；!?;\n]+")
 #: claim still matches across 「，」/「（）」 style differences. ``.`` is kept for
 #: the same reason as above.
 _TRIVIAL_PUNCT = frozenset("，、：（）()【】[]「」『』“”‘’\"'·—…《》~～")
-#: negation markers: an assertion preceded by one of these in the cited evidence
-#: is NEGATED there, so a claim that asserts the positive form is an inversion.
-_NEGATION_MARKERS: tuple[str, ...] = (
-    "不",
-    "未",
-    "无",
-    "勿",
-    "莫",
-    "别",
-    "禁",
-    "非",
-    "避免",
-    "切莫",
-    "切勿",
-    "切忌",
-    "不得",
-    "严禁",
-    "禁止",
-    "不应",
-    "不可",
-)
-#: compounds that START with a negation character but are NOT negations of what
-#: follows. Without this list, 「眼部不适需就诊」 would make the extractable claim
-#: 「需就诊」 look negated and refuse a perfectly supported answer.
-_NEGATION_FALSE_FRIENDS: frozenset[str] = frozenset(
-    {
-        "不适",
-        "不良",
-        "不久",
-        "不仅",
-        "不同",
-        "不断",
-        "不足",
-        "不明",
-        "不齐",
-        "不全",
-        "无痛",
-        "无创",
-        "无异",
-        "无关",
-        "非接触",
-    }
-)
 
 #: FIXED audit vocabulary. Every reason a decision can carry is one of these
 #: markers: nothing derived from the answer, the prompt, tool arguments or model
@@ -161,7 +132,6 @@ REVISION_INSTRUCTIONS: frozenset[str] = frozenset(
         "privacy_leak",
         "red_flag_escalate",
         "medical_scope_out_of_ai_boundary",
-        "contradiction",
         "ungrounded",
         "empty_answer",
         "citation_missing",
@@ -202,7 +172,6 @@ class VerifierDecision:
     medical_scope_ok: bool = True
     privacy_ok: bool = True
     unsupported_claims: bool = False
-    contradictions: bool = False
     red_flags: bool = False
     fast_path: bool = False
     evidence_supported: bool = False
@@ -245,7 +214,7 @@ def _normalize(text: str) -> str:
 
 
 def _strip_citation_markers(text: str) -> str:
-    """The claim body: the sentence with its ``来源 X`` / ``[N]`` markers gone."""
+    """The claim body: the sentence with its citation markers removed."""
     return _CITATION_RE.sub(" ", text or "")
 
 
@@ -254,55 +223,73 @@ def _split_claims(answer: str) -> list[str]:
     return [part for part in _CLAIM_SPLIT_RE.split(answer or "") if part.strip()]
 
 
-def _is_negated_at(text: str, start: int) -> bool:
-    """True when ``text[start:]`` is negated by what immediately precedes it."""
-    window = text[max(0, start - 2) : start]
-    wider = text[max(0, start - 3) : start]
-    if window in _NEGATION_FALSE_FRIENDS or wider in _NEGATION_FALSE_FRIENDS:
-        return False
-    return any(marker in window for marker in _NEGATION_MARKERS)
+def _is_substantive(body: str) -> bool:
+    """True when a claim body actually ASSERTS something.
 
-
-def _starts_negated(claim: str) -> bool:
-    """True when the claim itself asserts a negation (so no inversion exists)."""
-    return any(claim.startswith(marker) for marker in _NEGATION_MARKERS)
-
-
-def _extractable_from(body: str, targets: list[Evidence]) -> bool:
-    """True when ``body`` is found VERBATIM in the cited evidence ``content``.
-
-    Verbatim containment — not token overlap, not similarity. An occurrence that
-    the evidence NEGATES does not count as support (「不应使用激素」 cannot
-    support 「应使用激素」), and no other occurrence is searched for, so an
-    inverted claim is refused outright.
+    A body that is empty, or that is nothing but the residue of markers and
+    digits (``[1]`` normalizes to ``"1"``), asserts nothing: it can neither be
+    verified nor count as an answer. Without this check a markers-only answer
+    such as ``[1]`` walked through the gate and came out PASS.
     """
-    for item in targets:
-        haystack = _normalize(item.content)
-        index = haystack.find(body)
-        if index < 0:
-            continue
-        if _is_negated_at(haystack, index) and not _starts_negated(body):
-            continue
-        return True
-    return False
+    return any(char.isalpha() for char in body)
+
+
+def _claim_bodies(answer: str) -> list[tuple[str, list[tuple[str | None, int | None]]]]:
+    """Split the answer into SUBSTANTIVE claims: (normalized body, its markers).
+
+    Sentences that assert nothing — empty, or nothing but the residue of markers
+    and digits (``[1]`` normalizes to ``"1"``) — are dropped here, in ONE place,
+    so that "does a deliverable answer exist at all?" and "is every claim
+    supported?" can never disagree. A markers-only answer used to walk through
+    the gate and come out PASS.
+    """
+    claims: list[tuple[str, list[tuple[str | None, int | None]]]] = []
+    for sentence in _split_claims(answer):
+        body = _normalize(_strip_citation_markers(sentence))
+        if _is_substantive(body):
+            claims.append((body, _citations_in(sentence)))
+    return claims
+
+
+def _supported_units(content: str) -> frozenset[str]:
+    """The normalized strings a claim is allowed to EQUAL.
+
+    EQUALITY, never arbitrary substring containment. A substring rule let
+    「使用激素」 be extracted from 「不建议患者使用激素」, 「没有必要使用激素」,
+    「严禁儿童自行服用阿司匹林」 or 「仅在医生指导下使用激素」 and be reported as
+    supported — i.e. a contraindication or a precondition was silently deleted
+    and the answer still shipped as verified. The allowed units are the WHOLE
+    normalized content (a short FAQ entry) and each of its COMPLETE sentences;
+    anything narrower is not support.
+    """
+    units: set[str] = set()
+    whole = _normalize(_strip_citation_markers(content))
+    if whole:
+        units.add(whole)
+    for sentence in _split_claims(content):
+        unit = _normalize(_strip_citation_markers(sentence))
+        if unit:
+            units.add(unit)
+    return frozenset(units)
 
 
 def _check_extractive_support(
-    answer: str, evidence: list[Evidence]
+    claims: list[tuple[str, list[tuple[str | None, int | None]]]],
+    evidence: list[Evidence],
 ) -> tuple[bool, str]:
-    """The deterministic extractive gate. Returns ``(supported, reason)``.
+    """The deterministic exact-match gate. Returns ``(supported, reason)``.
 
-    Per claim: a substantive claim with no citation is ``citation_missing``; a
-    citation that does not resolve is ``citation_unknown``; a cited claim whose
-    normalized body cannot be found in its own evidence (unrelated answer,
-    polarity inversion, unverifiable paraphrase) is ``evidence_unsupported``.
+    ``empty_answer``: there is no substantive claim at all, so there is no
+    deliverable answer to PASS. ``citation_missing``: a substantive claim carries
+    no marker. ``citation_unknown``: a marker that does not resolve.
+    ``evidence_unsupported``: a cited claim whose normalized body is not EQUAL to
+    one of its evidence units.
     """
+    if not claims:
+        return False, "empty_answer"
     by_id = {item.source_id: item for item in evidence}
-    for sentence in _split_claims(answer):
-        markers = _citations_in(sentence)
-        body = _normalize(_strip_citation_markers(sentence))
-        if not body:
-            continue
+    units = {id(item): _supported_units(item.content) for item in evidence}
+    for body, markers in claims:
         if not markers:
             return False, "citation_missing"
         targets: list[Evidence] = []
@@ -316,7 +303,7 @@ def _check_extractive_support(
                 targets.append(evidence[index - 1])
             else:
                 return False, "citation_unknown"
-        if not _extractable_from(body, targets):
+        if not any(body in units[id(target)] for target in targets):
             return False, "evidence_unsupported"
     return True, ""
 
@@ -392,7 +379,7 @@ def _validated_execution(execution: Any) -> AgentExecution | None:
 
 
 def _citations_in(answer: str) -> list[tuple[str | None, int | None]]:
-    """Parse citation markers: ``来源 <source_id>`` or ``[N]`` (1-based index
+    """Parse citation markers: ``来源 <source_id>`` or ``资料[N]`` (1-based index
     into the evidence list). Returns (source_id, index) pairs."""
     found: list[tuple[str | None, int | None]] = []
     for match in _CITATION_RE.finditer(answer or ""):
@@ -406,7 +393,7 @@ def _citations_in(answer: str) -> list[tuple[str | None, int | None]]:
 def _resolve_citations(answer: str, evidence: list[Evidence]) -> tuple[list[str], bool]:
     """Resolve citation markers onto evidence source ids.
 
-    Returns (resolved_ids, all_known): an out-of-range ``[N]`` marker is an
+    Returns (resolved_ids, all_known): an out-of-range ``资料[N]`` marker is an
     unknown citation, never a silent pass.
     """
     resolved: list[str] = []
@@ -446,7 +433,6 @@ class SafetyEvidenceVerifier:
         self,
         *,
         red_flag_rules: RedFlagRules,
-        contradiction_scan: Callable[[str, list[Evidence]], bool] | None = None,
     ) -> None:
         """``red_flag_rules`` is REQUIRED and must be the Manager's own approved
         :class:`RedFlagRules` instance.
@@ -457,6 +443,14 @@ class SafetyEvidenceVerifier:
         object, an empty rule set or an unapproved one fails HERE, at assembly
         time, because ``RedFlagRules.__post_init__`` refuses to represent such a
         set at all.
+
+        There is also deliberately NO injectable scan hook. A synchronous
+        callback ran inside the event loop, so a slow one blocked the loop and
+        made the Manager's deadline unenforceable (``asyncio.wait_for(..., 10ms)``
+        could still return PASS after ~155ms). Nothing in the repository used it
+        outside tests, so the extension point is gone rather than wrapped in a
+        thread pool: real medical semantic/contradiction analysis is a separate
+        task, not a hook on this deterministic gate.
         """
         if not isinstance(red_flag_rules, RedFlagRules):
             raise TypeError(
@@ -465,7 +459,6 @@ class SafetyEvidenceVerifier:
                 "no red flag found)"
             )
         self._red_flag_rules = red_flag_rules
-        self._contradiction_scan = contradiction_scan
 
     # -- core decision --------------------------------------------------------
 
@@ -504,6 +497,9 @@ class SafetyEvidenceVerifier:
 
         grounded = bool(evidence)
         duplicate_source = _has_duplicate_source_ids(evidence)
+        # ONE split of the answer: the same claim list answers both "does a
+        # deliverable answer exist?" (answer_present) and "is it supported?"
+        claims = _claim_bodies(answer)
         resolved, citations_known = _resolve_citations(answer, evidence)
         known_ids = {item.source_id for item in evidence}
         cited_ids = set(resolved)
@@ -532,29 +528,24 @@ class SafetyEvidenceVerifier:
                 citation_coverage = False
                 citation_reason = "citation_mismatch"
 
-        # the extractive gate only runs on an otherwise clean answer: a
+        # the exact-match gate only runs on an otherwise clean answer: a
         # structural citation defect is reported as such
         evidence_supported = False
         support_reason = ""
-        if answer and grounded and citation_coverage:
+        if grounded and citation_coverage:
             evidence_supported, support_reason = _check_extractive_support(
-                answer, evidence
+                claims, evidence
             )
         if not evidence_supported:
             unsupported = True
-
-        contradictions = False
-        if self._contradiction_scan is not None:
-            contradictions = bool(self._contradiction_scan(answer, evidence))
 
         outcome, instructions = _classify(
             privacy_ok=privacy_ok,
             red=red,
             scope_ok=scope_ok,
             duplicate_source=duplicate_source,
-            contradictions=contradictions,
             grounded=grounded,
-            answer_present=bool(answer),
+            answer_present=bool(claims),
             citation_coverage=citation_coverage,
             citation_reason=citation_reason,
             evidence_supported=evidence_supported,
@@ -568,7 +559,6 @@ class SafetyEvidenceVerifier:
             medical_scope_ok=scope_ok,
             privacy_ok=privacy_ok,
             unsupported_claims=unsupported,
-            contradictions=contradictions,
             red_flags=red,
             fast_path=fast,
             evidence_supported=evidence_supported,
@@ -611,7 +601,6 @@ def _refused(instructions: str) -> VerifierDecision:
         medical_scope_ok=True,
         privacy_ok=True,
         unsupported_claims=False,
-        contradictions=False,
         red_flags=False,
         fast_path=False,
         evidence_supported=False,
@@ -625,7 +614,6 @@ def _classify(
     red: bool,
     scope_ok: bool,
     duplicate_source: bool,
-    contradictions: bool,
     grounded: bool,
     answer_present: bool,
     citation_coverage: bool,
@@ -647,8 +635,6 @@ def _classify(
         return VerifierOutcome.ESCALATE, "medical_scope_out_of_ai_boundary"
     if duplicate_source:
         return VerifierOutcome.REVISE, "duplicate_source"
-    if contradictions:
-        return VerifierOutcome.REVISE, "contradiction"
     if not grounded:
         return VerifierOutcome.REVISE, "ungrounded"
     if not answer_present:
