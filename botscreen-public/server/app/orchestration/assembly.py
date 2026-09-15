@@ -24,6 +24,8 @@ a run from any other tenant finds no evidence and is refused.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -68,6 +70,16 @@ _DEMO_KNOWLEDGE: tuple[dict[str, str], ...] = (
 _DEMO_RED_FLAGS: tuple[str, ...] = ("自杀",)
 _DEMO_RISK_MARKERS: tuple[str, ...] = ("剧烈", "出血")
 
+#: the demo slice's OWN tool-audit logger — the same "gcmw.audit" channel the
+#: server's rate limiter and top-level gateway write to. A silent ``lambda
+#: _: None`` would make tool calls LOOK audited while nothing was recorded.
+_AUDIT_LOGGER = logging.getLogger("gcmw.audit")
+
+
+def _tool_audit_sink(record: Any) -> None:
+    """One structured JSON line per tool call (routable to file/SIEM)."""
+    _AUDIT_LOGGER.warning(record.model_dump_json())
+
 
 def _cite(sentence: str) -> str:
     """Compose a model reply whose citation sits INSIDE the sentence.
@@ -102,11 +114,20 @@ def _publish(store: KnowledgeStore, source_id: str, title: str, content: str) ->
     )
 
 
-def build_agent_executor(*, repository: Any, settings: Settings) -> RunExecutor | None:
+def build_agent_executor(
+    *,
+    repository: Any,
+    settings: Settings,
+    audit_sink: Callable[[Any], None] | None = None,
+) -> RunExecutor | None:
     """Assemble the demo agent stack, or ``None`` where it must not run.
 
     The returned executor is the ONLY thing that moves an admitted run forward;
-    the admission service schedules it right after a run is created."""
+    the admission service schedules it right after a run is created. The
+    internal ToolGateway's audit sink defaults to the structured ``gcmw.audit``
+    logger (an injected sink wins) and the gateway itself is attached to the
+    executor as ``tool_gateway`` so the application lifecycle can release its
+    worker pool on shutdown."""
     if settings.environment not in {"development", "test"}:
         return None
 
@@ -118,7 +139,9 @@ def build_agent_executor(*, repository: Any, settings: Settings) -> RunExecutor 
         # the exact-match support gate passes honestly (no paraphrase)
         canned[entry["question"]] = _cite(entry["content"])
 
-    tools = build_gateway(knowledge_store=store, audit_sink=lambda _record: None)
+    tools = build_gateway(
+        knowledge_store=store, audit_sink=audit_sink or _tool_audit_sink
+    )
     models = ModelGateway(active_provider_id="mock")
     models.register(MockProvider(canned=canned))
 
@@ -156,7 +179,7 @@ def build_agent_executor(*, repository: Any, settings: Settings) -> RunExecutor 
         red_flag_rules=red_flags,
         risk_rules=risk_rules,
     )
-    return RunExecutor(
+    executor = RunExecutor(
         repository=repository,
         manager=manager,
         # the configured RUN budget: the executor writes it into the
@@ -164,6 +187,9 @@ def build_agent_executor(*, repository: Any, settings: Settings) -> RunExecutor 
         # an exceeded budget lands as a terminal FAILED — never a stuck run
         run_timeout_ms=settings.run_timeout_ms,
     )
+    # the app lifecycle releases this gateway's worker pool on shutdown
+    executor.tool_gateway = tools
+    return executor
 
 
 __all__ = ["DEMO_TENANT_ID", "build_agent_executor"]

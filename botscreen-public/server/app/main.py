@@ -194,6 +194,9 @@ def create_app(
         finally:
             if executor is not None:
                 await executor.shutdown()  # stop in-flight run tasks first
+                if executor.tool_gateway is not None:
+                    # the demo assembly's OWN gateway: release its worker pool
+                    executor.tool_gateway.shutdown()
             await leases.shutdown()
             tool_gateway.shutdown()  # release the bounded tool worker pool
             app.state.agent_service = None

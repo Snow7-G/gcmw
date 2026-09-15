@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pytest import mark
 
@@ -98,7 +98,9 @@ def _stack(
     red_flags: tuple[str, ...] = ("自杀",),
     repository: MemoryRunRepository | None = None,
     run_timeout_ms: int = 15_000,
+    terminalization_grace_s: float = 2.0,
     fault_sink=None,
+    clock=None,
 ) -> Stack:
     from app.agents.manager import ManagerAgent, RedFlagRules, RiskRules
     from app.agents.medical_qa import MedicalQAAgent
@@ -177,7 +179,9 @@ def _stack(
         repository=repository,
         manager=manager,
         run_timeout_ms=run_timeout_ms,
+        terminalization_grace_s=terminalization_grace_s,
         fault_sink=fault_sink,
+        clock=clock,
     )
     return Stack(repository=repository, executor=executor)
 
@@ -598,3 +602,301 @@ class TestDeadlineCoversDelivery:
         terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
         assert len(terminal) == 1
         assert terminal[0].data["result"] == RESULT_DEADLINE
+
+
+# -- third-review counterexamples: bounded terminalization + write reconciliation
+
+
+class _UnavailableCleanupRepository(_FaultyRepository):
+    """Fires ONE invariant fault, then every commit raises UNAVAILABLE —
+    i.e. the CLEANUP itself cannot write."""
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if self.spent:
+            raise RunRepositoryError(RunRepositoryFault.UNAVAILABLE)
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class _OneConflictOnFailedRepository(MemoryRunRepository):
+    """The FIRST ``FAILED`` commit hits a CAS conflict, then behaves."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conflicted = False
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if next_state is RunState.FAILED and not self.conflicted:
+            self.conflicted = True
+            raise RunRepositoryError(RunRepositoryFault.CAS_CONFLICT)
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class _FaultThenHangRepository(MemoryRunRepository):
+    """One INVARIANT fault on the first transition; the cleanup's FIRST
+    ``state()`` read then hangs for 30 s (a stalled store)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spent = False
+        self.fired = False
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if not self.spent:
+            self.spent = True
+            raise RunRepositoryError(RunRepositoryFault.INVARIANT)
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+    async def state(self, identity):
+        if self.spent and not self.fired:
+            self.fired = True
+            await asyncio.sleep(30)
+        return await super().state(identity)
+
+
+class _OneConflictFromTurnRepository(MemoryRunRepository):
+    """The executor's very FIRST transition loses a CAS race while the run is
+    still LIVE — the old code swallowed this; it must be surfaced and sealed."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.conflicted = False
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if not self.conflicted:
+            self.conflicted = True
+            raise RunRepositoryError(RunRepositoryFault.CAS_CONFLICT)
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class _LateConfirmAppendRepository(MemoryRunRepository):
+    """The ``answer.completed`` write COMMITS, then is slow to return —
+    the client's wait_for expires on a write that actually landed."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.armed = True
+
+    async def append_event(self, identity, *, event_type, data=None):
+        if event_type is SSEEventType.ANSWER_COMPLETED and self.armed:
+            self.armed = False
+            seq = await super().append_event(identity, event_type=event_type, data=data)
+            await asyncio.sleep(self.delay_s)
+            return seq
+        return await super().append_event(identity, event_type=event_type, data=data)
+
+
+class _LateConfirmTransitionRepository(MemoryRunRepository):
+    """The ``STREAMING`` transition COMMITS, then is slow to return."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.armed = True
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if next_state is RunState.STREAMING and self.armed:
+            self.armed = False
+            seq = await super().commit_transition(
+                identity,
+                expected_state=expected_state,
+                next_state=next_state,
+                data=data,
+            )
+            await asyncio.sleep(self.delay_s)
+            return seq
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class TestBoundedTerminalization:
+    """The cleanup can never fail silently and can never wait forever."""
+
+    @mark.asyncio
+    async def test_an_unavailable_cleanup_is_reported_never_silent(self):
+        faults: list = []
+        repository = _UnavailableCleanupRepository(transition_to=RunState.VERIFYING)
+        stack = _stack(
+            repository=repository, fault_sink=lambda c, r: faults.append((c, r))
+        )
+        identity = RunIdentity(
+            run_id="r-term-unavail",
+            tenant_id=TENANT,
+            device_id=DEVICE,
+            session_id=SESSION,
+        )
+        await stack.repository.create(identity)
+        task = asyncio.create_task(
+            stack.executor.execute(_FakeRecord(identity=identity, text="发热怎么办"))
+        )
+        await asyncio.wait_for(task, timeout=10)
+        assert task.exception() is None
+        categories = [c for c, _ in faults]
+        assert FaultCategory.STORAGE_TRANSITION in categories  # the original fault
+        assert FaultCategory.TERMINALIZATION in categories  # the cleanup said NO
+
+    @mark.asyncio
+    async def test_a_failed_commit_retries_one_cas_conflict(self):
+        """The FAILED commit loses ONE CAS race: terminalize re-reads and
+        retries, and the run IS sealed — no orphan, no false fault."""
+        faults: list = []
+        repository = _OneConflictOnFailedRepository()
+        stack = _stack(
+            repository=repository, fault_sink=lambda c, r: faults.append((c, r))
+        )
+        identity = RunIdentity(
+            run_id="r-term-cas", tenant_id=TENANT, device_id=DEVICE, session_id=SESSION
+        )
+        await stack.repository.create(identity)
+        await stack.executor._terminalize(identity, marker=RESULT_DEADLINE)
+        assert await stack.repository.state(identity) is RunState.FAILED
+        assert faults == []  # the retry succeeded: nothing to report
+        events = await stack.events(identity)
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_DEADLINE
+
+    @mark.asyncio
+    async def test_a_cas_conflict_against_a_live_run_is_surfaced_then_sealed(self):
+        faults: list = []
+        repository = _OneConflictFromTurnRepository()
+        stack = _stack(
+            repository=repository, fault_sink=lambda c, r: faults.append((c, r))
+        )
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-term-live")
+        state = await _drain(stack, identity)
+        assert state is RunState.FAILED  # sealed via re-read + retry
+        events = await stack.events(identity)
+        assert len(_by_type(events, SSEEventType.RUN_COMPLETED)) == 1
+        assert FaultCategory.STORAGE_TRANSITION in [c for c, _ in faults]
+
+    @mark.asyncio
+    async def test_a_hanging_cleanup_read_cannot_keep_the_task_alive(self):
+        """One invariant fault mid-turn; the cleanup's FIRST state() read then
+        hangs for 30 s. The grace must cut it and the task must EXIT — with the
+        terminalization fault REPORTED, not swallowed."""
+        faults: list = []
+        repository = _FaultThenHangRepository()
+        stack = _stack(
+            terminalization_grace_s=0.3,
+            repository=repository,
+            fault_sink=lambda c, r: faults.append((c, r)),
+        )
+        await stack.admit_and_drive("发热怎么办", run_id="r-term-hang")
+        started = time.monotonic()
+        deadline = started + 3.0
+        while stack.executor._tasks and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
+        elapsed = time.monotonic() - started
+        assert not stack.executor._tasks  # the task EXITED, bounded by the grace
+        assert elapsed < 2.0  # not 30 s: the grace cut the hang short
+        categories = [c for c, _ in faults]
+        assert FaultCategory.TERMINALIZATION in categories  # the hang was reported
+        assert FaultCategory.STORAGE_TRANSITION in categories  # the original too
+
+
+class TestWriteTimeoutReconciliation:
+    """A timed-out write is an UNKNOWN result: reconcile, never assume."""
+
+    @mark.asyncio
+    async def test_a_late_answer_completed_is_completed_not_failed(self):
+        repository = _LateConfirmAppendRepository(delay_s=0.3)
+        stack = _stack(repository=repository, run_timeout_ms=80)
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-late-ans")
+        state = await _drain(stack, identity, timeout_s=5)
+        assert state is RunState.COMPLETED  # consistently finished, never FAILED
+        events = await stack.events(identity)
+        assert len(_by_type(events, SSEEventType.ANSWER_COMPLETED)) == 1  # no duplicate
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_ANSWERED
+        seqs = sorted(e.seq for e in events)
+        assert seqs == list(range(1, len(seqs) + 1))  # no gap, one terminal
+
+    @mark.asyncio
+    async def test_a_late_streaming_transition_is_not_retried(self):
+        repository = _LateConfirmTransitionRepository(delay_s=0.3)
+        stack = _stack(repository=repository, run_timeout_ms=80)
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-late-tr")
+        state = await _drain(stack, identity, timeout_s=5)
+        assert state is RunState.FAILED  # the budget is gone either way
+        events = await stack.events(identity)
+        # the late transition was ADOPTED, never retried: exactly one STREAMING
+        streaming = _by_type(events, SSEEventType.PROCESS_STATUS)
+        assert len([e for e in streaming if e.data["stage"] == "streaming"]) == 1
+        assert not _by_type(events, SSEEventType.ANSWER_COMPLETED)
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_DEADLINE
+
+
+class TestSharedDeadline:
+    @mark.asyncio
+    async def test_the_manager_deadline_is_built_from_one_clock_read(self):
+        readings: list[datetime] = []
+        base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        def clock():
+            # each read advances 1 ms: a SECOND deadline construction would
+            # produce a deadline 1 ms later than the Manager's — detectable
+            readings.append(base + timedelta(milliseconds=len(readings)))
+            return readings[-1]
+
+        stack = _stack(clock=clock)
+        captured: dict = {}
+        original = stack.executor._manager.execute
+
+        async def spy(ctx, text, on_stage=None):
+            captured["deadline"] = ctx.deadline
+            return await original(ctx, text, on_stage=on_stage)
+
+        stack.executor._manager.execute = spy
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-clock")
+        await _drain(stack, identity)
+        assert captured["deadline"] == (readings[0] + timedelta(milliseconds=15_000))
+
+
+class TestDemoGatewayLifecycle:
+    def test_the_demo_gateway_audits_and_is_releasable(self):
+        from app.config import Settings
+        from app.orchestration.assembly import _tool_audit_sink, build_agent_executor
+
+        records: list = []
+        repository = MemoryRunRepository()
+        executor = build_agent_executor(
+            repository=repository,
+            settings=Settings(environment="test"),
+            audit_sink=records.append,
+        )
+        assert executor is not None
+        assert executor.tool_gateway is not None
+        assert executor.tool_gateway._audit_sink == records.append  # injected wins
+        executor.tool_gateway.shutdown()  # must be safe to call at teardown
+
+        default_executor = build_agent_executor(
+            repository=repository, settings=Settings(environment="test")
+        )
+        assert default_executor is not None
+        assert default_executor.tool_gateway is not None
+        # the default is the structured gcmw.audit logger — never a silent drop
+        assert default_executor.tool_gateway._audit_sink is _tool_audit_sink
+        default_executor.tool_gateway.shutdown()
