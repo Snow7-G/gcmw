@@ -248,7 +248,9 @@ class RunAdmissionService:
         for run_id in [
             r for r in list(self.runs) if self.runs[r].session_id == session_id
         ]:
-            del self.runs[run_id]
+            # via the choke point: the run's executor task is interrupted too,
+            # so an expired session cannot leave a slow task running
+            self._forget_run(run_id)
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
         # NOTE: the session guard is deliberately NOT touched here. Purging
@@ -346,10 +348,16 @@ class RunAdmissionService:
         )
 
     def _forget_run(self, run_id: str) -> None:
-        """Drop a run this process can no longer reach durably."""
+        """Drop a run this process can no longer reach durably.
+
+        The executor task is interrupted HERE, at the single choke point every
+        "this run is unreachable" path goes through — a deleted session must not
+        leave a background task answering a question nobody can read."""
         self.runs.pop(run_id, None)
         for key in [k for k, v in list(self.idempotency.items()) if v[0] == run_id]:
             del self.idempotency[key]
+        if self.executor is not None:
+            self.executor.cancel(run_id)
 
     # -- durable state reads -----------------------------------------------------
 

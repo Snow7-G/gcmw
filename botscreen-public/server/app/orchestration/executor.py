@@ -187,21 +187,35 @@ class RunExecutor:
     async def execute(self, record: Any) -> None:
         """Drive one run from ``ACCEPTED`` to a terminal state.
 
-        Faults are CONSUMED here (this coroutine is a fire-and-forget task) and
-        reduced to a fixed category; the run itself is driven to a terminal
-        state whenever the repository is still writable."""
+        Faults are CONSUMED here — including faults raised BY the cleanup
+        itself. This coroutine is a fire-and-forget background task, so an
+        escaping exception lands in the event loop's unhandled-task log with
+        its raw text; nothing may escape. Only fixed categories reach the
+        fault sink, never an original message."""
         identity = record.identity
+        category: FaultCategory | None = None
         try:
             await self._run_turn(record)
         except asyncio.CancelledError:
-            await self._fail_from(identity)
-            self._emit_fault(identity, FaultCategory.CANCELLED)
+            category = FaultCategory.CANCELLED
         except RunExecutionFault as exc:
-            await self._fail_from(identity)
-            self._emit_fault(identity, exc.category)
+            category = exc.category
         except Exception:  # noqa: BLE001 - consumed, never re-raised
+            category = FaultCategory.UNEXPECTED
+
+        if category is None:
+            return
+
+        cleanup_fault: FaultCategory | None = None
+        try:
             await self._fail_from(identity)
-            self._emit_fault(identity, FaultCategory.UNEXPECTED)
+        except asyncio.CancelledError:
+            cleanup_fault = FaultCategory.CANCELLED
+        except Exception:  # noqa: BLE001 - the way down must not leak either
+            cleanup_fault = FaultCategory.UNEXPECTED
+        self._emit_fault(identity, category)
+        if cleanup_fault is not None:
+            self._emit_fault(identity, cleanup_fault)
 
     async def _run_turn(self, record: Any) -> None:
         identity = record.identity
@@ -223,6 +237,37 @@ class RunExecutor:
         # and a lost race flips `aborted`, ending the whole turn
         state = RunState.ACCEPTED
         aborted = False
+        # the SAME budget bounds the whole turn — the Manager's engagements AND
+        # every state write / SSE append this executor performs afterwards
+        deadline = self._clock() + timedelta(milliseconds=self._run_timeout_ms)
+
+        async def _deadline_stop() -> None:
+            """Commit the ONE terminal FAILED for an exhausted budget.
+
+            After this point no ``answer.completed`` (and no further write) is
+            produced by this executor; the terminal stays unique because it is
+            CASed from the durable state."""
+            nonlocal aborted
+            aborted = True
+            try:
+                durable = await self._repository.state(identity)
+            except RunRepositoryError:
+                return
+            if is_terminal_state(durable):
+                return
+            try:
+                await self._repository.commit_transition(
+                    identity,
+                    expected_state=durable,
+                    next_state=RunState.FAILED,
+                    data={"result": RESULT_DEADLINE},
+                )
+            except RunRepositoryError:
+                return
+            self._emit_fault(identity, FaultCategory.DEADLINE)
+
+        def _remaining_s() -> float:
+            return (deadline - self._clock()).total_seconds()
 
         async def advance(target: RunState, data: dict[str, Any] | None) -> bool:
             """One CAS transition from the executor's current state.
@@ -231,16 +276,52 @@ class RunExecutor:
             terminal; anything else (including a lost race against a LIVE run)
             is an explicit fault."""
             nonlocal state, aborted
+            if aborted:
+                return False
+            if _remaining_s() <= 0:
+                await _deadline_stop()
+                return False
             try:
-                await self._repository.commit_transition(
-                    identity, expected_state=state, next_state=target, data=data
+                await asyncio.wait_for(
+                    self._repository.commit_transition(
+                        identity, expected_state=state, next_state=target, data=data
+                    ),
+                    timeout=max(_remaining_s(), 0.001),
                 )
+            except asyncio.TimeoutError:
+                await _deadline_stop()
+                return False
             except RunRepositoryError as exc:
                 if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
                     aborted = True
                     return False
                 raise RunExecutionFault(FaultCategory.STORAGE_TRANSITION) from None
             state = target
+            return True
+
+        async def append(event_type: SSEEventType, data: dict[str, Any]) -> bool:
+            """State-preserving append under the same budget."""
+            nonlocal aborted
+            if aborted:
+                return False
+            if _remaining_s() <= 0:
+                await _deadline_stop()
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._repository.append_event(
+                        identity, event_type=event_type, data=data
+                    ),
+                    timeout=max(_remaining_s(), 0.001),
+                )
+            except asyncio.TimeoutError:
+                await _deadline_stop()
+                return False
+            except RunRepositoryError as exc:
+                if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
+                    aborted = True
+                    return False
+                raise RunExecutionFault(FaultCategory.STORAGE_APPEND) from None
             return True
 
         async def on_stage(stage: str) -> None:
@@ -294,7 +375,7 @@ class RunExecutor:
 
         safety = result.safety_status
         if safety == "verified" and result.answer_candidate:
-            await self._stream_answer(identity, result, advance)
+            await self._stream_answer(identity, result, advance, append)
             return
         target, marker = _refusal_outcome(safety)
         await self._close_without_answer(identity, target, marker, advance)
@@ -306,6 +387,7 @@ class RunExecutor:
         identity: Any,
         result: Any,
         advance: Callable[[RunState, dict[str, Any] | None], Awaitable[bool]],
+        append: Callable[[SSEEventType, dict[str, Any]], Awaitable[bool]],
     ) -> None:
         """VERIFYING → STREAMING → deltas → answer.completed → COMPLETED."""
         if not await advance(RunState.STREAMING, _stage_message("streaming")):
@@ -314,9 +396,7 @@ class RunExecutor:
         answer = result.answer_candidate
         for start in range(0, len(answer), self._delta_chunk_chars):
             chunk = answer[start : start + self._delta_chunk_chars]
-            if not await self._append(
-                identity, SSEEventType.ANSWER_DELTA, {"delta": chunk}
-            ):
+            if not await append(SSEEventType.ANSWER_DELTA, {"delta": chunk}):
                 return
 
         completed = {
@@ -333,7 +413,7 @@ class RunExecutor:
             "actions": list(result.actions),
             "content_origin": ContentOrigin.APPROVED_FAQ.value,
         }
-        if not await self._append(identity, SSEEventType.ANSWER_COMPLETED, completed):
+        if not await append(SSEEventType.ANSWER_COMPLETED, completed):
             return
 
         await advance(
@@ -360,20 +440,6 @@ class RunExecutor:
         except RunRepositoryError:
             return False  # cannot confirm: this is a fault, not a yield
         return is_terminal_state(state)
-
-    async def _append(
-        self, identity: Any, event_type: SSEEventType, data: dict[str, Any]
-    ) -> bool:
-        """State-preserving append; ``False`` means the run moved or sealed."""
-        try:
-            await self._repository.append_event(
-                identity, event_type=event_type, data=data
-            )
-        except RunRepositoryError as exc:
-            if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
-                return False
-            raise RunExecutionFault(FaultCategory.STORAGE_APPEND) from None
-        return True
 
     async def _fail_from(self, identity: Any) -> bool:
         """Best-effort terminal move; ``True`` when the run IS terminal now.

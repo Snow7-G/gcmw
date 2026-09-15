@@ -246,3 +246,98 @@ class TestStreamAuthorisationOverHttp:
                 res = harness.client.get(f"/api/v1/agent/runs/{run['run_id']}/events")
             assert res.status_code == 403
             assert "data:" not in res.text  # zero stream bytes
+
+
+class TestSessionTeardownStopsTheExecutor:
+    """A deleted or expired session must not leave a background task answering
+    a question nobody can read any more."""
+
+    @staticmethod
+    def _pending_run_tasks(harness, run_id: str) -> int:
+        name = f"gcmw-run:{run_id}"
+        return len(
+            [t for t in harness.app.state.run_executor._tasks if t.get_name() == name]
+        )
+
+    def _slow_stall_repository(self) -> MemoryRunRepository:
+        stall = {"armed": True}
+
+        class _StallRepository(MemoryRunRepository):
+            async def commit_transition(
+                self, identity, *, expected_state, next_state, data=None
+            ):
+                if stall["armed"] and next_state.value == "VERIFYING":
+                    stall["armed"] = False
+                    await asyncio.sleep(1.5)
+                return await super().commit_transition(
+                    identity,
+                    expected_state=expected_state,
+                    next_state=next_state,
+                    data=data,
+                )
+
+        return _StallRepository()
+
+    def test_deleting_the_session_interrupts_the_run_task(self):
+        with running_app(
+            repository=self._slow_stall_repository(), agent_executor=True
+        ) as harness:
+            session = harness.client.post(
+                "/api/v1/sessions", json={"channel": "text"}
+            ).json()
+            run = harness.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "发热怎么办"},
+                    "idempotency_key": "k7",
+                },
+            ).json()
+            run_id = run["run_id"]
+            time.sleep(0.15)  # the task is inside the stalled transition now
+            assert self._pending_run_tasks(harness, run_id) == 1
+
+            res = harness.client.delete(f"/api/v1/sessions/{session['session_id']}")
+            assert res.status_code == 204
+
+            # the durable run and every index are gone...
+            assert harness.client.get(f"/api/v1/agent/runs/{run_id}").status_code == 404
+            # ...and the task did NOT survive the delete: it must unwind well
+            # before the stall (1.5 s) would have elapsed
+            deadline = time.monotonic() + 1.0
+            while (
+                self._pending_run_tasks(harness, run_id) and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            assert self._pending_run_tasks(harness, run_id) == 0
+
+    def test_an_expired_session_interrupts_the_run_task_too(self):
+        with running_app(
+            repository=self._slow_stall_repository(),
+            agent_executor=True,
+        ) as harness:
+            session = harness.client.post(
+                "/api/v1/sessions", json={"channel": "text"}
+            ).json()
+            run = harness.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "发热怎么办"},
+                    "idempotency_key": "k8",
+                },
+            ).json()
+            run_id = run["run_id"]
+            time.sleep(0.15)
+            assert self._pending_run_tasks(harness, run_id) == 1
+
+            harness.clock.advance(1801)  # the session TTL (1800 s) has passed
+            res = harness.client.get(f"/api/v1/agent/runs/{run_id}")
+            assert res.status_code == 404  # expiry purged the session
+
+            deadline = time.monotonic() + 1.0
+            while (
+                self._pending_run_tasks(harness, run_id) and time.monotonic() < deadline
+            ):
+                time.sleep(0.02)
+            assert self._pending_run_tasks(harness, run_id) == 0

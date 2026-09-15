@@ -525,3 +525,76 @@ class TestRunBudget:
         assert len(_by_type(events, SSEEventType.RUN_COMPLETED)) == 1
         seqs = sorted(e.seq for e in events)
         assert seqs == list(range(1, len(seqs) + 1))  # no gap, terminal once
+
+
+class _LeakingStateRepository(_FaultyRepository):
+    """A repository whose ``state()`` raises a NON-contract exception once the
+    injected fault has fired — i.e. the cleanup path itself faults."""
+
+    async def state(self, identity):
+        if self.spent:
+            raise RuntimeError("synthetic storage crash during cleanup")
+        return await super().state(identity)
+
+
+class _StallAppendRepository(MemoryRunRepository):
+    """Sleeps inside the FIRST answer.delta append, before writing anything."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.stalled = False
+
+    async def append_event(self, identity, *, event_type, data=None):
+        if event_type is SSEEventType.ANSWER_DELTA and not self.stalled:
+            self.stalled = True
+            await asyncio.sleep(self.delay_s)
+        return await super().append_event(identity, event_type=event_type, data=data)
+
+
+class TestCleanupLeak:
+    @mark.asyncio
+    async def test_a_faulting_cleanup_never_leaks_an_exception(self):
+        """The ORIGINAL fault and a faulting CLEANUP must both be consumed:
+        the background task carries nothing out, and the sink sees only fixed
+        categories (the original text never appears anywhere)."""
+        faults: list = []
+        repository = _LeakingStateRepository(transition_to=RunState.VERIFYING)
+        stack = _stack(
+            repository=repository, fault_sink=lambda c, r: faults.append((c, r))
+        )
+        identity = RunIdentity(
+            run_id="r-cleanup-leak",
+            tenant_id=TENANT,
+            device_id=DEVICE,
+            session_id=SESSION,
+        )
+        await stack.repository.create(identity)
+        record = _FakeRecord(identity=identity, text="发热怎么办")
+        task = asyncio.create_task(stack.executor.execute(record))
+        await asyncio.wait_for(task, timeout=10)
+        assert task.exception() is None  # nothing escaped, not even from cleanup
+        categories = [c for c, _ in faults]
+        assert FaultCategory.STORAGE_TRANSITION in categories
+        assert FaultCategory.UNEXPECTED in categories  # the way down reported too
+        assert "synthetic storage crash" not in repr(faults)
+
+
+class TestDeadlineCoversDelivery:
+    @mark.asyncio
+    async def test_a_slow_append_cannot_finish_after_the_budget(self):
+        """Budget 80 ms, first SSE append stalled 300 ms: the run must close
+        FAILED/deadline_exceeded — never COMPLETED, and no answer.completed."""
+        repository = _StallAppendRepository(delay_s=0.3)
+        stack = _stack(repository=repository, run_timeout_ms=80)
+        started = time.monotonic()
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-append-bud")
+        state = await _drain(stack, identity, timeout_s=5)
+        elapsed = time.monotonic() - started
+        assert state is RunState.FAILED
+        assert elapsed < 1.5  # not ~310 ms after a 300 ms append either
+        events = await stack.events(identity)
+        assert not _by_type(events, SSEEventType.ANSWER_COMPLETED)
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_DEADLINE
