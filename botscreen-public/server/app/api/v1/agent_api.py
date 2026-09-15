@@ -192,9 +192,15 @@ class RunAdmissionService:
         self,
         repository: Any | None = None,
         clock: Any | None = None,
+        executor: Any | None = None,
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.repository = repository or MemoryRunRepository()
+        # the #55A run executor, when the environment assembles one: it is the
+        # only thing that moves a run past ACCEPTED. ``None`` (staging /
+        # production, or a test that only exercises admission) keeps the old
+        # behaviour — runs are admitted and simply never progress.
+        self.executor = executor
         # ONE reference-counted guard per session. Idempotency keys and the
         # single-active-run rule are both session-scoped, so per-session locking
         # is sufficient for correctness while keeping unrelated sessions
@@ -499,6 +505,11 @@ class RunAdmissionService:
             )
             self.runs[run_id] = record
             self.idempotency[key] = (run_id, payload_hash)
+            if self.executor is not None:
+                # #55A: hand the admitted run to the executor. The admission
+                # lock protects bookkeeping only — the executor drives the run
+                # in its own task, so this call never awaits a model.
+                self.executor.schedule(record)
             return self._snapshot(record, RunState.ACCEPTED)
 
     async def get_run(
