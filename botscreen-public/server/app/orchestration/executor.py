@@ -11,10 +11,10 @@ and it makes no safety decision of its own:
 
 * every state change goes through the repository's ``commit_transition`` with
   the EXPECTED state (CAS). A lost race means "the run moved elsewhere" and the
-  executor stands down — but ONLY after confirming the durable run really is
-  terminal. A CAS conflict against a live run, or an invariant / illegal
-  transition, is an EXPLICIT fault: the executor surfaces it and then commits
-  exactly one terminal ``FAILED`` (with its ``run.completed``) when the
+  executor stands down — but ONLY after a BOUNDED read confirms the durable
+  run really is terminal. A CAS conflict against a live run, or an invariant /
+  illegal transition, is an EXPLICIT fault: the executor surfaces it and then
+  commits exactly one terminal ``FAILED`` (with its ``run.completed``) when the
   repository is still writable, so no admitted run is ever left as a live
   orphan;
 * staged transitions are driven by the Manager's optional progress hook
@@ -31,30 +31,43 @@ TWO clocks, stated separately — they are NOT the same budget:
   engagements AND every state write / SSE append this executor performs. The
   Manager and the executor share the SAME deadline, read from the clock ONCE
   at turn start;
-* **terminalization grace** (``terminalization_grace_s``): bounds the CLEANUP
-  that runs after a fault — the best-effort drive to a terminal state. It is
-  deliberately independent of the run budget, so an exhausted budget can never
-  starve the cleanup that prevents a live orphan.
+* **terminalization grace** (``terminalization_grace_s``): bounds ONE
+  terminalization PASS as a WHOLE — a single monotonic deadline taken when the
+  pass begins, and every read/write inside it uses only the time that is left.
+  Attempts can never stack (N × grace); when the pass deadline is up, the pass
+  is over. It is independent of the run budget, so an exhausted budget can
+  never starve the cleanup that prevents a live orphan.
 
-A timed-out WRITE is an UNKNOWN result, never a definite failure: a repository
-(or Redis/Lua script) may have committed the write and only been slow to
-return. After a write timeout the executor therefore RECONCILES against the
-durable record before deciding — it never assumes a rollback and never blindly
-retries (a retry could duplicate a persisted event):
+UNKNOWN-RESULT WRITES, stated plainly: a write that either outlived its
+``wait_for`` budget OR came back with the repository's own ``UNAVAILABLE`` has
+an UNKNOWN outcome — a Redis/Lua write may have committed and only been slow or
+noisy to report. The executor never assumes a rollback and never blindly
+retries the original write (a retry could duplicate a persisted event). It
+RECONCILES against the durable record first:
 
-* a transition that durably landed is treated as landed (no duplicate);
-* an ``answer.completed`` that durably landed is completed CONSISTENTLY as
-  ``COMPLETED/answered`` — a sealed answer must never be followed by FAILED;
-* anything else (write not present, run already terminal elsewhere) ends as
-  the budget dictates: ``FAILED/deadline_exceeded``.
+* a transition that durably landed is ADOPTED (no duplicate commit) and the
+  turn continues until the next budget check;
+* an ``answer.completed`` that durably landed is finalized CONSISTENTLY as
+  ``COMPLETED/answered`` — through a RETRYING finalize (bounded attempts, each
+  preceded by a durable re-read) so one transient CAS conflict or UNAVAILABLE
+  can never leave a sealed answer FAILED. A sealed answer must never be
+  followed by a FAILED terminal;
+* anything else ends as the trigger dictates (``FAILED/deadline_exceeded`` for
+  an exhausted budget, ``FAILED/refused_no_answer`` for an unavailable store).
 
-Terminalization itself (``_terminalize``) is THE one bounded entry point for
-every "make this run terminal" need — budget stop, fault epilogue, reconcile
-fallback. It runs under the cleanup grace (a hanging repository read cannot
-keep the task alive), retries a CAS conflict a bounded number of times after a
-re-read, treats ``NOT_FOUND`` and an already-terminal run as a normal exit,
-and reports ``terminalization_fault`` for UNAVAILABLE / INVARIANT / exhausted
-retries — it never silently claims a run was sealed when it was not.
+Reconciliation reads the TRUE latest event — never page one of a paginated
+read: it takes ``latest_seq`` from the record, fetches the page that must
+contain it, and verifies the event's seq AND run/tenant/device/session
+identity before trusting it.
+
+``_terminalize`` is THE one bounded entry point for every "make this run
+terminal" need — budget stop, fault epilogue, reconcile fallback. A CAS
+conflict is retried a bounded number of times after a re-read;
+``NOT_FOUND`` and an already-terminal run are a normal exit; UNAVAILABLE /
+INVARIANT / a time-up / exhausted retries are reported as the fixed
+``terminalization_fault`` — it never silently claims a run was sealed when it
+was not. ``_stand_down`` is bounded by the same principle: a hanging
+repository read can never keep the caller waiting.
 
 Outcome mapping (fixed, public, no agent prose):
 
@@ -84,6 +97,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -103,7 +117,7 @@ _LOGGER = logging.getLogger(__name__)
 #: content, so chunking is presentation only.
 _DELTA_CHUNK_CHARS = 24
 
-#: bounded CAS retries inside terminalization: conflict → re-read → retry.
+#: bounded attempts inside a terminalization pass / the answered finalize.
 _TERMINALIZE_ATTEMPTS = 3
 
 
@@ -129,9 +143,14 @@ class RunExecutionFault(RuntimeError):
         self.category = category
 
 
+class _TimeUp(Exception):
+    """Internal: the pass's single monotonic deadline is exhausted."""
+
+
 #: repository faults that mean "this run moved / ended elsewhere". The executor
-#: stands down instead of fighting them — but only after confirming the run is
-#: terminal (see ``_stand_down``). NOT_FOUND means the run record is gone.
+#: stands down instead of fighting them — but only after a BOUNDED read
+#: confirms the run is terminal (``_stand_down``). NOT_FOUND means the run
+#: record is gone.
 _STAND_DOWN_FAULTS = frozenset(
     {RunRepositoryFault.CAS_CONFLICT, RunRepositoryFault.NOT_FOUND}
 )
@@ -221,6 +240,20 @@ class RunExecutor:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
 
+    # -- bounded I/O primitives ----------------------------------------------------
+
+    async def _bounded(self, call: Callable[[], Any], deadline: float) -> Any:
+        """Run one repository call under the REMAINING time of the pass's
+        single deadline — never a fresh grace per call (attempts must not
+        stack). Raises ``_TimeUp`` when there is no time left."""
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _TimeUp
+        try:
+            return await asyncio.wait_for(call(), timeout=remaining)
+        except asyncio.TimeoutError:
+            raise _TimeUp from None
+
     # -- execution ----------------------------------------------------------------
 
     async def execute(self, record: Any) -> None:
@@ -277,45 +310,95 @@ class RunExecutor:
         state = RunState.ACCEPTED
         aborted = False
 
-        async def _read_durable() -> Any:
-            """One repository read under the TERMINALIZATION grace (not the run
-            budget): reconciliation and cleanup must stay possible after the
-            budget is gone."""
-            return await asyncio.wait_for(
-                self._repository.state(identity),
-                timeout=self._terminalization_grace_s,
-            )
-
-        async def _seal_failed(durable: Any, marker: str) -> None:
-            """One bounded FAILED commit from an explicitly re-read state."""
-            await asyncio.wait_for(
-                self._repository.commit_transition(
-                    identity,
-                    expected_state=durable,
-                    next_state=RunState.FAILED,
-                    data={"result": marker},
-                ),
-                timeout=self._terminalization_grace_s,
-            )
-
         async def _stop_for_budget() -> None:
-            """The budget is exhausted (or a write is unusable): abort the turn
-            and terminalize through the ONE bounded entry point."""
+            """The budget is exhausted: abort the turn and terminalize through
+            the ONE bounded entry point."""
             nonlocal aborted
             aborted = True
             await self._terminalize(identity, marker=RESULT_DEADLINE)
 
+        async def reconcile_unknown(
+            *,
+            target: RunState | None,
+            event_type: SSEEventType | None,
+            marker: str,
+        ) -> bool:
+            """A write whose result is UNKNOWN — an outer timeout OR the
+            repository's own UNAVAILABLE. Reconcile against the durable record;
+            never assume a rollback, never retry the original write.
+
+            Returns True only when a transition was ADOPTED (it durably landed)
+            and the turn may continue; every other resolution ends the step."""
+            nonlocal state, aborted
+            aborted = True  # whichever way this resolves, this step is over
+            pass_deadline = time.monotonic() + self._terminalization_grace_s
+            try:
+                if event_type is not None:
+                    page = await self._bounded(
+                        lambda: self._repository.snapshot(identity, 0, 0.0),
+                        pass_deadline,
+                    )
+                    if is_terminal_state(page.state):
+                        return False  # sealed elsewhere; nothing to add
+                    latest = await self._durable_latest_event(
+                        identity, page, pass_deadline
+                    )
+                    if (
+                        event_type is SSEEventType.ANSWER_COMPLETED
+                        and latest is not None
+                        and latest.event is event_type
+                    ):
+                        # the answer IS sealed: finish consistently, retrying —
+                        # never FAILED after a sealed answer
+                        await self._finalize_answered(identity, pass_deadline)
+                        return False
+                    await self._terminalize(identity, marker=marker)
+                    return False
+                # a state transition: adopt it if it durably landed
+                durable = await self._bounded(
+                    lambda: self._repository.state(identity), pass_deadline
+                )
+                if is_terminal_state(durable):
+                    return False  # the run ended elsewhere; nothing to add
+                if durable == target:
+                    # the write DID land: adopt it — no duplicate commit — and
+                    # let the turn continue to the next budget check
+                    state = target
+                    aborted = False
+                    return True
+                # the write did NOT land. Before sealing FAILED, check whether
+                # the ANSWER is already sealed: a persisted answer.completed
+                # must end COMPLETED/answered (retrying), never FAILED.
+                page = await self._bounded(
+                    lambda: self._repository.snapshot(identity, 0, 0.0),
+                    pass_deadline,
+                )
+                latest = await self._durable_latest_event(identity, page, pass_deadline)
+                if latest is not None and latest.event is SSEEventType.ANSWER_COMPLETED:
+                    await self._finalize_answered(identity, pass_deadline)
+                    return False
+                await self._terminalize(identity, marker=marker)
+                return False
+            except _TimeUp:
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return False
+            except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.NOT_FOUND:
+                    return False  # the record is gone: nothing to reconcile
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return False
+
         async def advance(target: RunState, data: dict[str, Any] | None) -> bool:
             """One CAS transition from the executor's current state.
 
-            A CAS loss stands down only when the durable run is confirmed
-            terminal; anything else (including a lost race against a LIVE run)
-            is an explicit fault. A timed-out write is RECONCILED, never
-            assumed rolled back and never blindly retried."""
+            A CAS loss stands down only when a BOUNDED read confirms the
+            durable run really is terminal; anything else (including a lost
+            race against a LIVE run) is an explicit fault. An unknown-result
+            write (outer timeout OR repository UNAVAILABLE) is RECONCILED."""
             nonlocal state, aborted
             if aborted:
                 return False
-            if _out_of_budget():
+            if (deadline - self._clock()).total_seconds() <= 0:
                 await _stop_for_budget()
                 return False
             try:
@@ -323,12 +406,18 @@ class RunExecutor:
                     self._repository.commit_transition(
                         identity, expected_state=state, next_state=target, data=data
                     ),
-                    timeout=max(_remaining_s(), 0.001),
+                    timeout=max((deadline - self._clock()).total_seconds(), 0.001),
                 )
             except asyncio.TimeoutError:
-                # UNKNOWN result: the write may have landed after we gave up
-                return await _reconcile_transition_timeout(target)
+                return await reconcile_unknown(
+                    target=target, event_type=None, marker=RESULT_DEADLINE
+                )
             except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.UNAVAILABLE:
+                    # a Redis/Lua write may STILL have landed: unknown result
+                    return await reconcile_unknown(
+                        target=target, event_type=None, marker=RESULT_NO_ANSWER
+                    )
                 if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
                     aborted = True
                     return False
@@ -336,39 +425,12 @@ class RunExecutor:
             state = target
             return True
 
-        async def _reconcile_transition_timeout(target: RunState) -> bool:
-            """A transition write timed out: read the durable state and decide.
-
-            Landed  → treat as landed (no duplicate commit, turn continues).
-            Not landed (still live, still pre-target) → seal FAILED/deadline.
-            Terminal (cancel won) → stand down."""
-            nonlocal state, aborted
-            aborted = True  # whichever way this resolves, the turn is over
-            try:
-                durable = await _read_durable()
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - cannot reconcile: report, stop
-                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
-                return False
-            if is_terminal_state(durable):
-                return False  # the run ended elsewhere; nothing to add
-            if durable is target or durable == target:
-                # the write DID land: adopt it and let the turn continue —
-                # the next budget check decides whether that is still viable
-                state = target
-                aborted = False
-                return True
-            # the write never landed and the budget is spent: seal the run
-            await self._terminalize(identity, marker=RESULT_DEADLINE)
-            return False
-
         async def append(event_type: SSEEventType, data: dict[str, Any]) -> bool:
             """State-preserving append under the same budget."""
             nonlocal aborted
             if aborted:
                 return False
-            if _out_of_budget():
+            if (deadline - self._clock()).total_seconds() <= 0:
                 await _stop_for_budget()
                 return False
             try:
@@ -376,70 +438,26 @@ class RunExecutor:
                     self._repository.append_event(
                         identity, event_type=event_type, data=data
                     ),
-                    timeout=max(_remaining_s(), 0.001),
+                    timeout=max((deadline - self._clock()).total_seconds(), 0.001),
                 )
             except asyncio.TimeoutError:
-                # UNKNOWN result: reconcile against the durable tail
-                await _reconcile_append_timeout(event_type)
+                await reconcile_unknown(
+                    target=None, event_type=event_type, marker=RESULT_DEADLINE
+                )
                 return False
             except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.UNAVAILABLE:
+                    await reconcile_unknown(
+                        target=None,
+                        event_type=event_type,
+                        marker=RESULT_NO_ANSWER,
+                    )
+                    return False
                 if exc.fault in _STAND_DOWN_FAULTS and await self._stand_down(identity):
                     aborted = True
                     return False
                 raise RunExecutionFault(FaultCategory.STORAGE_APPEND) from None
             return True
-
-        async def _reconcile_append_timeout(event_type: SSEEventType) -> None:
-            """An append timed out: read the durable tail and decide.
-
-            The sealed-answer case is the protocol-critical one: if
-            ``answer.completed`` durably landed, the run must complete
-            CONSISTENTLY as ``COMPLETED/answered`` — a sealed answer must never
-            be followed by a FAILED terminal. Anything else ends as the budget
-            dictates. No write is ever retried (a retry could duplicate a
-            persisted event)."""
-            nonlocal aborted
-            aborted = True  # whichever way this resolves, the turn is over
-            try:
-                page = await asyncio.wait_for(
-                    self._repository.snapshot(identity, 0, 0.0),
-                    timeout=self._terminalization_grace_s,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - cannot reconcile: report, stop
-                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
-                return
-            if is_terminal_state(page.state):
-                return  # sealed elsewhere; nothing to add
-            landed = any(e.event is event_type for e in page.events)
-            if event_type is SSEEventType.ANSWER_COMPLETED and landed:
-                # the answer IS sealed: finish consistently, never FAILED
-                try:
-                    durable = await _read_durable()
-                    if not is_terminal_state(durable):
-                        await asyncio.wait_for(
-                            self._repository.commit_transition(
-                                identity,
-                                expected_state=durable,
-                                next_state=RunState.COMPLETED,
-                                data={"result": RESULT_ANSWERED},
-                            ),
-                            timeout=self._terminalization_grace_s,
-                        )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # noqa: BLE001
-                    self._emit_fault(identity, FaultCategory.TERMINALIZATION)
-                return
-            # nothing protocol-critical landed: seal FAILED/deadline
-            await self._terminalize(identity, marker=RESULT_DEADLINE)
-
-        def _remaining_s() -> float:
-            return (deadline - self._clock()).total_seconds()
-
-        def _out_of_budget() -> bool:
-            return _remaining_s() <= 0
 
         async def on_stage(stage: str) -> None:
             """Map one Manager stage onto its run-state transition(s)."""
@@ -556,84 +574,171 @@ class RunExecutor:
         Every "make this run terminal" need goes through here: budget stop,
         fault epilogue, reconcile fallback. Guarantees:
 
-        * every repository call is bounded by the TERMINALIZATION grace — a
-          hanging read or write cannot keep this task alive;
+        * ONE monotonic deadline bounds the WHOLE pass — every read and write
+          inside uses only the time that is left, so attempts can never stack
+          into grace × attempts, and a hanging repository call cannot keep
+          this task alive;
         * a CAS conflict is retried a bounded number of times after a RE-READ
           (the run may have moved to terminal in between);
         * ``NOT_FOUND`` and an already-terminal run are a NORMAL exit — the
           run record is gone or sealed elsewhere, nothing to do;
-        * UNAVAILABLE / INVARIANT / a timed-out call / exhausted retries are
-          reported as the fixed ``terminalization_fault`` category — this
-          method NEVER silently claims a run was sealed when it was not.
+        * UNAVAILABLE / INVARIANT / a time-up / exhausted retries are reported
+          as the fixed ``terminalization_fault`` — this method NEVER silently
+          claims a run was sealed when it was not.
         """
+        deadline = time.monotonic() + self._terminalization_grace_s
         try:
-            durable = await self._read_durable_state(identity)
-        except _TerminalizeAbort:
-            return  # already reported by the helper
-        for _attempt in range(_TERMINALIZE_ATTEMPTS):
+            durable = await self._bounded(
+                lambda: self._repository.state(identity), deadline
+            )
+        except _TimeUp:
+            self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+            return
+        except RunRepositoryError as exc:
+            if exc.fault is RunRepositoryFault.NOT_FOUND:
+                return  # the record is gone: normal exit
+            self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+            return
+        for _ in range(_TERMINALIZE_ATTEMPTS):
             if is_terminal_state(durable):
                 return  # sealed elsewhere: normal exit
             try:
-                await self._commit_failed(identity, durable, marker)
+                await self._bounded(
+                    lambda d=durable: self._repository.commit_transition(
+                        identity,
+                        expected_state=d,
+                        next_state=RunState.FAILED,
+                        data={"result": marker},
+                    ),
+                    deadline,
+                )
                 return
-            except asyncio.CancelledError:
-                raise
-            except (asyncio.TimeoutError, RunRepositoryError) as exc:
-                if isinstance(exc, RunRepositoryError):
-                    if exc.fault is RunRepositoryFault.NOT_FOUND:
-                        return  # record gone: normal exit
-                    if exc.fault is not RunRepositoryFault.CAS_CONFLICT:
-                        # UNAVAILABLE / INVARIANT / ILLEGAL_TRANSITION: never
-                        # pretend the run was sealed
-                        self._emit_fault(identity, FaultCategory.TERMINALIZATION)
-                        return
-                # CAS conflict (or a timed-out commit — also an unknown result):
-                # bounded re-read and retry
+            except _TimeUp:
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return
+            except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.NOT_FOUND:
+                    return  # the record is gone: normal exit
+                if exc.fault is not RunRepositoryFault.CAS_CONFLICT:
+                    # UNAVAILABLE / INVARIANT / ILLEGAL_TRANSITION: never
+                    # pretend the run was sealed
+                    self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                    return
+                # CAS conflict: bounded re-read, then retry
                 try:
-                    durable = await self._read_durable_state(identity)
-                except _TerminalizeAbort:
+                    durable = await self._bounded(
+                        lambda: self._repository.state(identity), deadline
+                    )
+                except _TimeUp:
+                    self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                    return
+                except RunRepositoryError as exc2:
+                    if exc2.fault is RunRepositoryFault.NOT_FOUND:
+                        return
+                    self._emit_fault(identity, FaultCategory.TERMINALIZATION)
                     return
         # retries exhausted: the run may still be live — say so, loudly
         self._emit_fault(identity, FaultCategory.TERMINALIZATION)
 
-    async def _read_durable_state(self, identity: Any) -> RunState:
-        """One grace-bounded durable read; aborts via ``_TerminalizeAbort``."""
-        try:
-            return await asyncio.wait_for(
-                self._repository.state(identity),
-                timeout=self._terminalization_grace_s,
+    async def _durable_latest_event(
+        self, identity: Any, first_page: Any, deadline: float
+    ) -> Any | None:
+        """The TRUE latest event of the run — never page one of a paginated
+        read. Takes ``latest_seq`` from the record, fetches the page that must
+        contain it when page one stops short, and verifies the event's seq AND
+        run/tenant/device/session identity before trusting it."""
+        latest = first_page.latest_seq
+        if latest <= 0:
+            return None
+        events = first_page.events
+        if not events or events[-1].seq != latest:
+            tail = await self._bounded(
+                lambda: self._repository.snapshot(identity, latest - 1, 0.0),
+                deadline,
             )
-        except asyncio.CancelledError:
-            raise
-        except asyncio.TimeoutError:
-            self._emit_fault(identity, FaultCategory.TERMINALIZATION)
-            raise _TerminalizeAbort from None
-        except RunRepositoryError as exc:
-            if exc.fault is RunRepositoryFault.NOT_FOUND:
-                raise _TerminalizeAbort from None  # gone: normal exit
-            self._emit_fault(identity, FaultCategory.TERMINALIZATION)
-            raise _TerminalizeAbort from None
+            events = tail.events
+        for event in reversed(events):
+            if event.seq != latest:
+                continue
+            if (
+                event.run_id == identity.run_id
+                and event.tenant_id == identity.tenant_id
+                and event.device_id == identity.device_id
+                and event.session_id == identity.session_id
+            ):
+                return event
+            return None  # identity mismatch: trust nothing
+        return None
 
-    async def _commit_failed(self, identity: Any, durable: Any, marker: str) -> None:
-        """One grace-bounded FAILED commit."""
-        await asyncio.wait_for(
-            self._repository.commit_transition(
-                identity,
-                expected_state=durable,
-                next_state=RunState.FAILED,
-                data={"result": marker},
-            ),
-            timeout=self._terminalization_grace_s,
-        )
+    async def _finalize_answered(self, identity: Any, deadline: float) -> None:
+        """A sealed answer must end ``COMPLETED/answered`` — RETRYING.
+
+        One transient CAS conflict or UNAVAILABLE must never leave a sealed
+        answer FAILED: every attempt is preceded by a durable re-read, so a
+        commit that landed despite the error is ADOPTED and a run that ended
+        elsewhere (e.g. a cancel) is RESPECTED. Bounded attempts; exhaustion
+        is reported, never silently swallowed."""
+        for _ in range(_TERMINALIZE_ATTEMPTS):
+            try:
+                durable = await self._bounded(
+                    lambda: self._repository.state(identity), deadline
+                )
+            except _TimeUp:
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return
+            except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.NOT_FOUND:
+                    return
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return
+            if is_terminal_state(durable):
+                return  # ended elsewhere — respect that terminal
+            try:
+                await self._bounded(
+                    lambda d=durable: self._repository.commit_transition(
+                        identity,
+                        expected_state=d,
+                        next_state=RunState.COMPLETED,
+                        data={"result": RESULT_ANSWERED},
+                    ),
+                    deadline,
+                )
+                return
+            except _TimeUp:
+                # unknown whether the COMPLETED commit landed, and the pass is
+                # out of time: report — never claim success
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return
+            except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.NOT_FOUND:
+                    return
+                if exc.fault in (
+                    RunRepositoryFault.CAS_CONFLICT,
+                    RunRepositoryFault.UNAVAILABLE,
+                ):
+                    continue  # transient: re-read and retry
+                self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+                return
+        self._emit_fault(identity, FaultCategory.TERMINALIZATION)
 
     # -- fault machinery ------------------------------------------------------------
 
     async def _stand_down(self, identity: Any) -> bool:
-        """True when the durable run is confirmed TERMINAL (safe to abandon)."""
+        """True when it is SAFE to abandon the run.
+
+        Strictly bounded by ONE grace deadline: a hanging repository read can
+        never keep the caller waiting. ``NOT_FOUND`` ends the argument (the
+        record is gone — nothing to fight over); a CAS conflict is resolved
+        ONLY by this bounded read, never assumed."""
+        deadline = time.monotonic() + self._terminalization_grace_s
         try:
-            state = await self._repository.state(identity)
-        except RunRepositoryError:
-            return False  # cannot confirm: this is a fault, not a yield
+            state = await self._bounded(
+                lambda: self._repository.state(identity), deadline
+            )
+        except _TimeUp:
+            return False  # cannot confirm within the grace: a fault, not a yield
+        except RunRepositoryError as exc:
+            return exc.fault is RunRepositoryFault.NOT_FOUND
         return is_terminal_state(state)
 
     def _emit_fault(self, identity: Any, category: FaultCategory) -> None:
@@ -652,10 +757,6 @@ class RunExecutor:
         _LOGGER.warning(
             "run executor fault category=%s run_id=%s", category.value, run_id
         )
-
-
-class _TerminalizeAbort(Exception):
-    """Internal: ``_read_durable_state`` resolved the cleanup already."""
 
 
 def _refusal_outcome(safety: str) -> tuple[RunState, str]:
