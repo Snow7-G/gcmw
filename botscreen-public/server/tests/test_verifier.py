@@ -3,14 +3,24 @@
 Coverage:
 - FOUR-STATE outcome (PASS / REVISE / BLOCK / ESCALATE) returned to the Manager
   as Verdict(VerifierOutcome) — never a boolean;
+- ONE decision entry: ``decide`` refuses a FAILED/CANCELLED run with
+  ``not_completed`` however well cited the draft is, and the Manager slot is a
+  thin wrapper over it, so the two doors cannot diverge;
 - only PASS may deliver: BLOCK/ESCALATE/REVISE carry no answer and no evidence;
 - the candidate output is untrusted: duck objects, wrong container types, bad
   statuses, mutated/invalid Evidence and bad field types are refused (BLOCK)
   instead of being trusted, because model_copy does not re-validate;
 - citation consistency: unknown/out-of-range ids, missing citations, uncited
-  evidence and incomplete source_id/knowledge_version/content_hash all fail;
-- safety boundary: red flags escalate to a human, privacy leaks block, non-PASS
-  never returns candidate content;
+  evidence, a duplicated source_id and incomplete
+  source_id/knowledge_version/content_hash all fail;
+- EXTRACTIVE support gate: a correctly cited but unrelated or negation-inverted
+  answer is refused, a legitimate extractive answer passes, and a paraphrase is
+  refused by design (deterministic containment, not semantic entailment);
+- safety boundary: red flags escalate to a human from the answer OR the
+  evidence, privacy leaks block — including sensitive text parked in title,
+  source_uri, source_id or knowledge_version — and non-PASS never returns
+  candidate content;
+- fail-closed assembly: a verifier cannot exist without an APPROVED rule set;
 - pure and side-effect free: repeated decisions are identical, the input is not
   mutated, and a cancellation/exception from an injected scanner propagates;
 - no chain-of-thought: decisions carry fixed flags and a fixed marker only.
@@ -38,12 +48,27 @@ from app.agents.verifier import (
     REVISION_INSTRUCTIONS,
     SafetyEvidenceVerifier,
     VerifierDecision,
-    faq_fast_decision,
 )
 from app.contracts.agent import AgentContext, AgentStatus, Evidence, RiskLevel
 from app.contracts.common import Channel
 
 APPROVED_AT = datetime(2026, 1, 5, tzinfo=timezone.utc)
+
+
+def _rules(*patterns):
+    """An APPROVED rule set. Every verifier needs one — there is no empty
+    default any more, so "nothing configured" cannot mean "no red flag"."""
+    return RedFlagRules(
+        patterns=tuple(patterns) or ("自杀",),
+        approved_by="board",
+        approved_at=APPROVED_AT,
+    )
+
+
+def _verifier(contradiction_scan=None):
+    return SafetyEvidenceVerifier(
+        red_flag_rules=_rules("自杀"), contradiction_scan=contradiction_scan
+    )
 
 
 def _context(risk=RiskLevel.LOW, **overrides):
@@ -94,7 +119,7 @@ def _faq_answer(source_id="faq-fever", answer=None):
 
 class TestFourStateOutcome:
     def test_every_decision_carries_the_full_flag_set_and_a_fixed_marker(self):
-        verifier = SafetyEvidenceVerifier(red_flags=("自杀",))
+        verifier = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
         cases = [
             _faq_answer(),  # PASS
             _execution(answer="无来源答案", evidence=[]),
@@ -115,6 +140,8 @@ class TestFourStateOutcome:
                 "contradictions",
                 "red_flags",
                 "fast_path",
+                "evidence_supported",
+                "duplicate_source",
             ):
                 assert isinstance(getattr(decision, flag), bool)
             assert (
@@ -124,7 +151,7 @@ class TestFourStateOutcome:
 
     def test_only_pass_carries_no_marker(self):
         assert (
-            SafetyEvidenceVerifier()
+            SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
             .decide(_context(), _faq_answer())
             .revision_instructions
             == ""
@@ -133,54 +160,60 @@ class TestFourStateOutcome:
             _execution(answer="无引用。", evidence=[_evidence()]),
             _execution(answer="电话 13800138000", evidence=[_evidence()]),
         ):
-            decision = SafetyEvidenceVerifier().decide(_context(), case)
+            decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+                _context(), case
+            )
             assert decision.revision_instructions != ""
 
 
 class TestPassAndFastPath:
     def test_faq_fast_path_passes_with_citation(self):
-        decision = SafetyEvidenceVerifier().decide(_context(), _faq_answer())
+        decision = _verifier().decide(_context(), _faq_answer())
         assert decision.outcome is VerifierOutcome.PASS
         assert decision.fast_path is True
         assert decision.grounded and decision.citation_coverage
+        assert decision.evidence_supported is True
 
-    def test_fast_path_shortcut_helper(self):
-        decision = faq_fast_decision(_context(), _faq_answer())
-        assert decision is not None
-        assert decision.outcome is VerifierOutcome.PASS
+    def test_the_fast_path_flag_skips_no_check(self):
+        """The flag is an observation: a LOW-risk single-FAQ run is still
+        escalated when the ANSWER carries a red flag."""
+        execution = _execution(
+            answer="我想自杀，体温超过38.5建议门诊就诊（来源 faq-fever）。",
+            evidence=[_evidence()],
+        )
+        decision = _verifier().decide(_context(), execution)
+        assert decision.fast_path is True  # low risk + single FAQ evidence
+        assert decision.outcome is VerifierOutcome.ESCALATE
+        assert decision.revision_instructions == "red_flag_escalate"
 
     def test_full_path_passes_multisource_with_citations(self):
         execution = _execution(
             answer="建议就诊（来源 a、来源 b）。",
             evidence=[
-                _evidence("a", "内容甲"),
-                _evidence("b", "内容乙", source_type="document"),
+                _evidence("a", "建议就诊。"),
+                _evidence("b", "建议就诊，必要时转诊。", source_type="document"),
             ],
         )
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = _verifier().decide(_context(), execution)
         assert decision.outcome is VerifierOutcome.PASS
         assert decision.fast_path is False
+        assert decision.evidence_supported is True
 
     def test_faq_marker_style_citation_parsed(self):
-        execution = _execution(answer="建议就诊（资料[1]）。", evidence=[_evidence()])
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        execution = _execution(
+            answer="建议门诊就诊（资料[1]）。", evidence=[_evidence()]
+        )
+        decision = _verifier().decide(_context(), execution)
         assert decision.outcome is VerifierOutcome.PASS
 
     def test_high_risk_runs_full_path_not_fast(self):
-        decision = SafetyEvidenceVerifier().decide(
-            _context(risk=RiskLevel.HIGH), _faq_answer()
-        )
+        decision = _verifier().decide(_context(risk=RiskLevel.HIGH), _faq_answer())
         assert decision.fast_path is False
         assert decision.outcome is VerifierOutcome.PASS  # still passes with citations
 
     @mark.parametrize("risk", [RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL])
     def test_no_fast_path_above_low_risk(self, risk):
-        assert (
-            SafetyEvidenceVerifier()
-            .decide(_context(risk=risk), _faq_answer())
-            .fast_path
-            is False
-        )
+        assert _verifier().decide(_context(risk=risk), _faq_answer()).fast_path is False
 
 
 class TestCitationConsistency:
@@ -188,7 +221,7 @@ class TestCitationConsistency:
     provenance — none of them may PASS."""
 
     def test_missing_citation_fails_coverage(self):
-        decision = SafetyEvidenceVerifier().decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(), _faq_answer(answer="体温高建议就诊。")
         )
         assert decision.outcome is VerifierOutcome.REVISE
@@ -196,7 +229,7 @@ class TestCitationConsistency:
         assert decision.citation_coverage is False
 
     def test_unknown_citation_is_unsupported(self):
-        decision = SafetyEvidenceVerifier().decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(), _faq_answer(answer="建议就诊（来源 ghost）。")
         )
         assert decision.unsupported_claims is True
@@ -205,7 +238,9 @@ class TestCitationConsistency:
 
     def test_out_of_range_index_is_unknown(self):
         execution = _execution(answer="建议就诊（资料[9]）。", evidence=[_evidence()])
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "citation_unknown"
 
@@ -215,7 +250,9 @@ class TestCitationConsistency:
             answer="建议就诊（来源 a）。",
             evidence=[_evidence("a", "内容甲"), _evidence("b", "内容乙")],
         )
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "citation_mismatch"
 
@@ -224,7 +261,9 @@ class TestCitationConsistency:
         """An empty version/hash satisfies the contract but is not verifiable."""
         item = _evidence().model_copy(update={field: ""})
         execution = _execution(answer="建议就诊（来源 faq-fever）。", evidence=[item])
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "citation_incomplete"
 
@@ -232,7 +271,9 @@ class TestCitationConsistency:
         """An empty source_id is refused by strict re-validation, not "revised"."""
         item = _evidence().model_copy(update={"source_id": ""})
         execution = _execution(answer="建议就诊（来源 faq-fever）。", evidence=[item])
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.outcome is VerifierOutcome.BLOCK
         assert decision.revision_instructions == "invalid_execution"
 
@@ -241,7 +282,9 @@ class TestCitationConsistency:
             answer="发烧应服用阿司匹林。",
             evidence=[_evidence("doc-1", source_type="document")],
         )
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "citation_missing"
 
@@ -252,9 +295,9 @@ class TestCitationConsistency:
         execution = _execution(
             answer="内容矛盾（来源 a）。", evidence=[_evidence("a", "正文")]
         )
-        decision = SafetyEvidenceVerifier(contradiction_scan=scan).decide(
-            _context(), execution
-        )
+        decision = SafetyEvidenceVerifier(
+            red_flag_rules=_rules("自杀"), contradiction_scan=scan
+        ).decide(_context(), execution)
         assert decision.contradictions is True
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "contradiction"
@@ -270,7 +313,7 @@ class TestBlockAndEscalate:
         ],
     )
     def test_privacy_leak_blocks(self, payload):
-        decision = SafetyEvidenceVerifier().decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(), _faq_answer(answer=payload)
         )
         assert decision.privacy_ok is False
@@ -284,7 +327,7 @@ class TestBlockAndEscalate:
             answer=f"建议尽快处理（来源 {source_id}）。",
             evidence=[_evidence(source_id, "内容含 自杀 风险提示")],
         )
-        decision = SafetyEvidenceVerifier(red_flags=("自杀",)).decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(), execution
         )
         assert decision.red_flags is True
@@ -297,7 +340,7 @@ class TestBlockAndEscalate:
             answer="自杀 电话 13800138000（来源 faq-fever）",
             evidence=[_evidence()],
         )
-        decision = SafetyEvidenceVerifier(red_flags=("自杀",)).decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(), execution
         )
         assert decision.red_flags is True and decision.privacy_ok is False
@@ -311,7 +354,9 @@ class TestBlockAndEscalate:
         ],
     )
     def test_medical_scope_violation_escalates(self, text):
-        decision = SafetyEvidenceVerifier().decide(_context(), _faq_answer(answer=text))
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), _faq_answer(answer=text)
+        )
         assert decision.medical_scope_ok is False
         assert decision.outcome is VerifierOutcome.ESCALATE
         assert decision.revision_instructions == "medical_scope_out_of_ai_boundary"
@@ -321,7 +366,9 @@ class TestBlockAndEscalate:
             answer="建议就诊（来源 f1）。",
             evidence=[_evidence("f1", "开具处方需线下完成。")],
         )
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.medical_scope_ok is False
         assert decision.outcome is VerifierOutcome.ESCALATE
 
@@ -341,13 +388,15 @@ class TestUntrustedCandidateOutput:
             model_version = ""
             safety_status = "grounded"
 
-        decision = SafetyEvidenceVerifier().decide(_context(), _Duck())
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), _Duck()
+        )
         assert decision.outcome is VerifierOutcome.BLOCK
         assert decision.revision_instructions == "invalid_execution"
 
     @mark.parametrize("status", [AgentStatus.PENDING, AgentStatus.RUNNING, "completed"])
     def test_unreportable_or_non_enum_status_is_blocked(self, status):
-        decision = SafetyEvidenceVerifier().decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(),
             _execution(
                 answer="答案（来源 faq-fever）。", evidence=[_evidence()]
@@ -368,7 +417,9 @@ class TestUntrustedCandidateOutput:
             answer_candidate="答案（来源 faq-fever）。",
             evidence=[_evidence()],  # type: ignore[arg-type] - list, not tuple
         )
-        decision = SafetyEvidenceVerifier().decide(_context(), raw)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), raw
+        )
         assert decision.outcome is VerifierOutcome.BLOCK
 
     @mark.parametrize(
@@ -389,7 +440,9 @@ class TestUntrustedCandidateOutput:
             answer_candidate="答案（来源 faq-fever）。",
             evidence=(raw,),
         )
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), execution
+        )
         assert decision.outcome is VerifierOutcome.BLOCK
         assert decision.revision_instructions == "invalid_execution"
 
@@ -401,9 +454,9 @@ class TestUntrustedCandidateOutput:
             answer_candidate=answer,  # type: ignore[arg-type]
             evidence=(_evidence(),),
         )
-        assert SafetyEvidenceVerifier().decide(_context(), raw).outcome is (
-            VerifierOutcome.BLOCK
-        )
+        assert SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), raw
+        ).outcome is (VerifierOutcome.BLOCK)
 
     @mark.parametrize("tool_calls", [-1, True, 1.5, "2", None])
     def test_bad_tool_calls_are_blocked(self, tool_calls):
@@ -414,41 +467,48 @@ class TestUntrustedCandidateOutput:
             evidence=(_evidence(),),
             tool_calls=tool_calls,  # type: ignore[arg-type]
         )
-        assert SafetyEvidenceVerifier().decide(_context(), raw).outcome is (
-            VerifierOutcome.BLOCK
-        )
+        assert SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
+            _context(), raw
+        ).outcome is (VerifierOutcome.BLOCK)
 
     def test_the_snapshot_is_isolated_from_later_mutation(self):
-        """The verified snapshot is its own object: mutations cannot matter."""
+        """A mutation by the caller can neither rewrite a decision already made
+        nor be TRUSTED by a later one: the payload is re-validated from the
+        current state, and a mutation that breaks the contract is refused."""
         item = _evidence()
         execution = AgentExecution(
             agent_id="qa",
             status=AgentStatus.COMPLETED,
-            answer_candidate="答案（来源 faq-fever）。",
+            answer_candidate="体温超过38.5建议门诊就诊（来源 faq-fever）。",
             evidence=(item,),
         )
-        verifier = SafetyEvidenceVerifier()
+        verifier = _verifier()
         first = verifier.decide(_context(), execution)
         assert first.outcome is VerifierOutcome.PASS
-        item.content = "篡改后的内容"  # mutate after the decision
+        assert first.evidence_supported is True
+
+        item.source_id = ""  # a value the contract forbids (no re-validation)
         second = verifier.decide(_context(), execution)
-        assert second.outcome is first.outcome
-        assert second.citation_coverage is True
+        assert second.outcome is VerifierOutcome.BLOCK
+        assert second.revision_instructions == "invalid_execution"
+
+        # the earlier decision is its own object and stays exactly as issued
+        assert first.outcome is VerifierOutcome.PASS
+        assert first.citation_coverage is True
+        assert first.evidence_supported is True
 
 
 class TestEmptyAnswerGuard:
     def test_empty_completed_answer_never_passes(self):
         # e.g. the #53 no_evidence shape: COMPLETED with evidence but no answer
         execution = _execution(answer="", evidence=[_evidence()])
-        decision = SafetyEvidenceVerifier().decide(_context(), execution)
+        decision = _verifier().decide(_context(), execution)
         assert decision.grounded is True
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "empty_answer"
 
     def test_empty_answer_without_evidence_revises_ungrounded(self):
-        decision = SafetyEvidenceVerifier().decide(
-            _context(), _execution(answer="", evidence=[])
-        )
+        decision = _verifier().decide(_context(), _execution(answer="", evidence=[]))
         assert decision.outcome is VerifierOutcome.REVISE
         assert decision.revision_instructions == "ungrounded"
 
@@ -456,7 +516,7 @@ class TestEmptyAnswerGuard:
 class TestManagerSlot:
     @mark.asyncio
     async def test_the_slot_returns_a_four_state_verdict(self):
-        verifier = SafetyEvidenceVerifier()
+        verifier = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
         verdict = await verifier(_context(), _faq_answer())
         assert isinstance(verdict, ManagerVerdict)
         assert verdict.outcome is VerifierOutcome.PASS
@@ -469,7 +529,7 @@ class TestManagerSlot:
         blocked = await verifier(_context(), "not-an-execution")
         assert blocked.outcome is VerifierOutcome.BLOCK
 
-        escalating = SafetyEvidenceVerifier(red_flags=("自杀",))
+        escalating = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
         escalated = await escalating(
             _context(),
             _execution(
@@ -485,7 +545,9 @@ class TestManagerSlot:
         execution = _execution(
             answer="未完成内容", evidence=[_evidence()], status=status
         )
-        verdict = await SafetyEvidenceVerifier()(_context(), execution)
+        verdict = await SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))(
+            _context(), execution
+        )
         assert verdict.outcome is VerifierOutcome.BLOCK
         assert verdict.reason == "not_completed"
 
@@ -494,7 +556,9 @@ class TestManagerSlot:
         execution = _execution(
             answer="未完成内容", evidence=[_evidence()], status=AgentStatus.RUNNING
         )
-        verdict = await SafetyEvidenceVerifier()(_context(), execution)
+        verdict = await SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))(
+            _context(), execution
+        )
         assert verdict.outcome is VerifierOutcome.BLOCK
         assert verdict.reason == "invalid_execution"
 
@@ -518,7 +582,7 @@ class TestManagerSlot:
         manager = ManagerAgent(
             registry=registry,
             agent_runners={"qa": runner},
-            verifier=SafetyEvidenceVerifier(red_flags=("自杀",)),
+            verifier=SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")),
             red_flag_rules=RedFlagRules(
                 patterns=("自杀",), approved_by="board", approved_at=APPROVED_AT
             ),
@@ -542,7 +606,7 @@ class TestManagerSlot:
         manager2 = ManagerAgent(
             registry=registry,
             agent_runners={"qa": runner_unverified},
-            verifier=SafetyEvidenceVerifier(),
+            verifier=SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")),
             red_flag_rules=RedFlagRules(
                 patterns=("自杀",), approved_by="board", approved_at=APPROVED_AT
             ),
@@ -574,7 +638,7 @@ class TestManagerSlot:
         manager = ManagerAgent(
             registry=registry,
             agent_runners={"qa": runner},
-            verifier=SafetyEvidenceVerifier(red_flags=("自杀",)),
+            verifier=SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")),
             red_flag_rules=RedFlagRules(
                 patterns=("需要人工介入",), approved_by="b", approved_at=APPROVED_AT
             ),
@@ -593,7 +657,7 @@ class TestPurityAndNoChainOfThought:
     def test_decisions_are_deterministic_and_do_not_mutate_the_input(self):
         execution = _faq_answer()
         before = asdict(execution)
-        verifier = SafetyEvidenceVerifier()
+        verifier = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
         first = verifier.decide(_context(), execution)
         second = verifier.decide(_context(), execution)
         assert first == second
@@ -601,7 +665,7 @@ class TestPurityAndNoChainOfThought:
 
     def test_no_chain_of_thought_or_content_in_the_decision(self):
         secret = "患者自述：三天前发热，住址朝阳区某小区"
-        decision = SafetyEvidenceVerifier().decide(
+        decision = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀")).decide(
             _context(),
             _execution(
                 answer="体温超过38.5建议门诊就诊（来源 faq-fever）。",
@@ -615,7 +679,7 @@ class TestPurityAndNoChainOfThought:
     def test_a_non_pass_verdict_carries_no_candidate_content(self):
         secret = "患者自述：住址朝阳区"
         verdict = asyncio.run(
-            SafetyEvidenceVerifier()(
+            SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))(
                 _context(),
                 _execution(
                     answer="无引用的答案。",
@@ -636,7 +700,7 @@ class TestPurityAndNoChainOfThought:
             _execution(answer="", evidence=[]),
             "not-an-execution",
         ]
-        verifier = SafetyEvidenceVerifier(red_flags=("自杀",))
+        verifier = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
         for case in cases:
             decision = verifier.decide(_context(), case)
             assert decision.revision_instructions in REVISION_INSTRUCTIONS
@@ -648,7 +712,9 @@ class TestPurityAndNoChainOfThought:
         def scan(answer, evidence):
             raise asyncio.CancelledError
 
-        verifier = SafetyEvidenceVerifier(contradiction_scan=scan)
+        verifier = SafetyEvidenceVerifier(
+            red_flag_rules=_rules("自杀"), contradiction_scan=scan
+        )
         with pytest.raises(asyncio.CancelledError):
             await verifier(_context(), _faq_answer())
 
@@ -656,7 +722,7 @@ class TestPurityAndNoChainOfThought:
     async def test_cancellation_after_a_decision_changes_nothing(self):
         """The verifier keeps no state: a cancelled caller cannot leave a PASS
         behind, and a second call re-derives the same decision."""
-        verifier = SafetyEvidenceVerifier()
+        verifier = SafetyEvidenceVerifier(red_flag_rules=_rules("自杀"))
         execution = _faq_answer()
         task = asyncio.ensure_future(verifier(_context(), execution))
         task.cancel()
@@ -665,3 +731,331 @@ class TestPurityAndNoChainOfThought:
         assert task.cancelled()
         # nothing was recorded and the next call is independent
         assert (await verifier(_context(), execution)).outcome is VerifierOutcome.PASS
+
+
+class TestSingleDecisionEntry:
+    """Review scope: ``decide`` is the ONLY judgement entry. A run that did not
+    complete can never be judged PASS, whichever door is used."""
+
+    @mark.parametrize("status", [AgentStatus.FAILED, AgentStatus.CANCELLED])
+    def test_a_non_completed_run_never_passes_directly(self, status):
+        """A well-cited draft from a FAILED/CANCELLED run is not a result."""
+        execution = _execution(
+            answer="体温超过38.5建议门诊就诊（来源 faq-fever）。",
+            evidence=[_evidence()],
+            status=status,
+        )
+        decision = _verifier().decide(_context(), execution)
+        assert decision.outcome is VerifierOutcome.BLOCK
+        assert decision.revision_instructions == "not_completed"
+        assert decision.evidence_supported is False
+
+    @mark.parametrize("status", [AgentStatus.FAILED, AgentStatus.CANCELLED])
+    def test_both_doors_agree(self, status):
+        """The Manager slot adds no judgement: same input, same verdict."""
+        execution = _execution(
+            answer="体温超过38.5建议门诊就诊（来源 faq-fever）。",
+            evidence=[_evidence()],
+            status=status,
+        )
+        direct = _verifier().decide(_context(), execution)
+        verdict = asyncio.run(_verifier()(_context(), execution))
+        assert verdict.outcome is direct.outcome
+        assert verdict.reason == direct.revision_instructions
+
+    def test_a_completed_run_is_still_the_happy_path(self):
+        decision = _verifier().decide(_context(), _faq_answer())
+        assert decision.outcome is VerifierOutcome.PASS
+
+
+class TestExtractiveSupportGate:
+    """Review scope: correct citations are NOT the same as a supported answer.
+
+    The gate is deterministic and EXTRACTIVE — it never claims medical semantic
+    verification, and it refuses a correct-but-paraphrased answer on purpose."""
+
+    def test_a_legitimate_extractive_answer_passes(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="体温超过38.5建议门诊就诊（来源 faq-fever）。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+        assert decision.evidence_supported is True
+
+    def test_a_correctly_cited_but_unrelated_answer_revises(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="近视与遗传因素密切相关[1]。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+        assert decision.evidence_supported is False
+        assert decision.citation_coverage is True  # the citation was fine
+
+    def test_a_correctly_cited_but_negation_inverted_answer_revises(self):
+        """«不应使用激素类眼药水» can never support «应使用激素类眼药水»."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="应使用激素类眼药水[1]。",
+                evidence=[_evidence("eye-1", "不应使用激素类眼药水，需及时复诊。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+
+    def test_the_negated_claim_itself_is_supported(self):
+        """The same evidence DOES support the claim it actually makes."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="需及时复诊[1]。",
+                evidence=[_evidence("eye-1", "不应使用激素类眼药水，需及时复诊。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+
+    def test_a_negation_look_alike_is_not_an_inversion(self):
+        """«眼部不适» is not a negation of «需及时就诊» — no false escalation."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="需及时就诊[1]。",
+                evidence=[_evidence("eye-2", "眼部不适需及时就诊。")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.PASS
+
+    def test_an_uncited_second_claim_never_passes(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="体温超过38.5建议门诊就诊（来源 faq-fever）。按时复诊。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "citation_missing"
+
+    def test_a_paraphrase_is_refused_by_design(self):
+        """Honest scope: extractive containment, not entailment. A correct but
+        rewritten answer is refused rather than silently accepted."""
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="发烧应尽快看医生（来源 faq-fever）。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "evidence_unsupported"
+
+
+class TestFailClosedRedFlagRules:
+    """Review scope: no rule set means NO VERIFIER, not "no red flag found"."""
+
+    def test_a_verifier_cannot_be_built_without_rules(self):
+        with pytest.raises(TypeError):
+            SafetyEvidenceVerifier()  # type: ignore[call-arg]
+
+    def test_a_bare_pattern_tuple_is_not_accepted(self):
+        with pytest.raises(TypeError):
+            SafetyEvidenceVerifier(red_flag_rules=("自杀",))  # type: ignore[arg-type]
+
+    @mark.parametrize(
+        "kwargs",
+        [
+            {"patterns": (), "approved_by": "b"},  # nothing configured
+            {"patterns": (" 自杀 ",), "approved_by": "b"},  # dead pattern
+            {"patterns": ("自杀",), "approved_by": "  "},  # unapproved
+            {"patterns": ("自杀",), "approved_by": "b", "naive": True},  # naive ts
+        ],
+    )
+    def test_an_unusable_rule_set_fails_at_assembly(self, kwargs):
+        fields = {
+            "patterns": kwargs.get("patterns", ("自杀",)),
+            "approved_by": kwargs.get("approved_by", "b"),
+            "approved_at": (
+                # the naive timestamp IS the subject of this case: an approval
+                # that cannot be compared against an audit trail must be refused
+                datetime(2026, 1, 5)  # noqa: DTZ001
+                if kwargs.get("naive")
+                else APPROVED_AT
+            ),
+        }
+        with pytest.raises(ValueError):
+            RedFlagRules(**fields)
+
+    def test_a_red_flag_in_the_model_answer_escalates(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="我想自杀，体温超过38.5建议门诊就诊（来源 faq-fever）。",
+                evidence=[_evidence()],
+            ),
+        )
+        assert decision.red_flags is True
+        assert decision.outcome is VerifierOutcome.ESCALATE
+        assert decision.revision_instructions == "red_flag_escalate"
+
+    def test_a_red_flag_in_the_evidence_escalates(self):
+        decision = _verifier().decide(
+            _context(),
+            _execution(
+                answer="建议尽快处理（来源 f1）。",
+                evidence=[_evidence("f1", "内容含 自杀 风险提示")],
+            ),
+        )
+        assert decision.outcome is VerifierOutcome.ESCALATE
+        assert decision.revision_instructions == "red_flag_escalate"
+
+
+class TestDeliverySurfacePrivacy:
+    """Review scope: the scan surface IS the delivery surface. Any string field
+    that ships with the answer must satisfy the same privacy gate."""
+
+    SENSITIVE = "家长手机号13800138000"
+    ANSWER = "体温超过38.5建议门诊就诊（来源 faq-fever）。"
+
+    @mark.parametrize(
+        "field",
+        ["source_id", "title", "content", "source_uri", "knowledge_version"],
+    )
+    def test_sensitive_text_in_any_delivered_field_blocks(self, field):
+        item = _evidence(**{field: self.SENSITIVE})
+        decision = _verifier().decide(
+            _context(), _execution(answer=self.ANSWER, evidence=[item])
+        )
+        assert decision.privacy_ok is False
+        assert decision.outcome is VerifierOutcome.BLOCK
+        assert decision.revision_instructions == "privacy_leak"
+
+    def test_the_id_number_pattern_is_covered_too(self):
+        item = _evidence(source_uri="kbase://11010119900307777X")
+        decision = _verifier().decide(
+            _context(), _execution(answer=self.ANSWER, evidence=[item])
+        )
+        assert decision.outcome is VerifierOutcome.BLOCK
+
+    def test_a_blocked_decision_never_carries_the_sensitive_value(self):
+        item = _evidence(title=self.SENSITIVE)
+        decision = _verifier().decide(
+            _context(), _execution(answer=self.ANSWER, evidence=[item])
+        )
+        dumped = repr(decision) + decision.revision_instructions
+        assert self.SENSITIVE not in dumped
+
+
+class TestDuplicateSource:
+    """Review scope: the same source_id twice makes citation identity
+    ambiguous, so it must never be folded away by a set comparison."""
+
+    def test_two_versions_of_one_source_are_refused(self):
+        execution = _execution(
+            answer="建议就诊（来源 dup-1）。",
+            evidence=[
+                _evidence("dup-1", "建议就诊。", knowledge_version="dup-1-v1"),
+                _evidence(
+                    "dup-1",
+                    "建议就诊。",
+                    knowledge_version="dup-1-v2",
+                ),
+            ],
+        )
+        decision = _verifier().decide(_context(), execution)
+        assert decision.outcome is VerifierOutcome.REVISE
+        assert decision.revision_instructions == "duplicate_source"
+        assert decision.duplicate_source is True
+
+    def test_distinct_source_ids_are_fine(self):
+        execution = _execution(
+            answer="建议就诊（来源 a、来源 b）。",
+            evidence=[_evidence("a", "建议就诊。"), _evidence("b", "建议就诊。")],
+        )
+        assert _verifier().decide(_context(), execution).outcome is (
+            VerifierOutcome.PASS
+        )
+
+
+class TestManagerFourStates:
+    """The four states driven through the real Manager end to end."""
+
+    @staticmethod
+    def _manager(execution, verifier):
+        async def runner(_ctx):
+            return execution
+
+        registry = AgentRegistry()
+        registry.register(
+            AgentManifest(
+                agent_id="qa", version="1.0.0", supported_intents=["knowledge"]
+            )
+        )
+        return ManagerAgent(
+            registry=registry,
+            agent_runners={"qa": runner},
+            verifier=verifier,
+            red_flag_rules=_rules("自杀"),
+            risk_rules=RiskRules(
+                patterns=("剧烈",), approved_by="board", approved_at=APPROVED_AT
+            ),
+        )
+
+    @mark.asyncio
+    async def test_pass_delivers_a_verified_answer(self):
+        result = await self._manager(_faq_answer(), _verifier()).execute(
+            _context(), "发热怎么办"
+        )
+        assert result.status is AgentStatus.COMPLETED
+        assert result.safety_status == "verified"
+        assert result.answer_candidate
+        assert result.evidence[0].source_id == "faq-fever"
+
+    @mark.asyncio
+    async def test_revise_delivers_nothing(self):
+        execution = _execution(
+            answer="近视与遗传因素密切相关[1]。", evidence=[_evidence()]
+        )
+        result = await self._manager(execution, _verifier()).execute(
+            _context(), "发热怎么办"
+        )
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "revised"
+        assert result.answer_candidate == ""
+        assert result.evidence == []
+
+    @mark.asyncio
+    async def test_block_delivers_nothing(self):
+        execution = _execution(
+            answer="体温超过38.5建议门诊就诊（来源 faq-fever），电话 13800138000。",
+            evidence=[_evidence()],
+        )
+        result = await self._manager(execution, _verifier()).execute(
+            _context(), "发热怎么办"
+        )
+        assert result.status is AgentStatus.FAILED
+        assert result.safety_status == "blocked"
+        assert result.answer_candidate == ""
+        assert result.evidence == []
+        assert any(a["type"] == "verify.blocked" for a in result.actions)
+
+    @mark.asyncio
+    async def test_escalate_delivers_nothing_and_goes_to_a_human(self):
+        execution = _execution(
+            answer="建议尽快处理（来源 f1）。",
+            evidence=[_evidence("f1", "内容含 自杀 风险提示")],
+        )
+        result = await self._manager(execution, _verifier()).execute(
+            _context(), "发热怎么办"
+        )
+        assert result.status is AgentStatus.COMPLETED
+        assert result.safety_status == "escalated"
+        assert result.answer_candidate == ""
+        assert result.evidence == []
+        assert any(a["type"] == "verify.escalated" for a in result.actions)
