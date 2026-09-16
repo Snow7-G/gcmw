@@ -477,23 +477,23 @@ def verify_tool_quota_audit(audit: _AuditCapture, run_id: str) -> None:
 # -- 启动与编排 ------------------------------------------------------------------
 
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_DEMO_HOST = "127.0.0.1"
 
 
 def start_server(
-    host: str = "127.0.0.1", port: int = 0, cors_for_dev_frontends: bool = False
+    host: str = _DEMO_HOST, port: int = 0, cors_for_dev_frontends: bool = False
 ) -> SimpleNamespace:
     """进程内启动真实 uvicorn + demo 装配（合成知识、MockProvider、零出网）。
 
     ``port=0`` 自动选择端口（默认行为不变）；``cors_for_dev_frontends`` 只在
     本 demo app 上挂精确的开发前端 Origin 白名单（/qa 页面跨源演示用），
     绝不使用通配，也不影响 staging/production 的安全配置。
-    ``host`` 只接受 loopback：演示服务带固定低熵凭据，直接调用（绕过 CLI）
-    也必须在库层拒绝暴露到局域网。"""
-    if host not in _LOOPBACK_HOSTS:
+    ``host`` 只接受唯一地址 127.0.0.1：演示服务带固定低熵凭据，直接调用
+    （绕过 CLI）也必须在库层拒绝任何其他地址（含 localhost/::1/局域网）。"""
+    if host != _DEMO_HOST:
         raise ValueError(
-            f"demo server host must be loopback ({'/'.join(sorted(_LOOPBACK_HOSTS))}),"
-            f" got {host!r}: the fixed demo credential must never leave localhost"
+            f"demo server host must be exactly {_DEMO_HOST!r}, got {host!r}:"
+            " the fixed demo credential must never leave 127.0.0.1"
         )
     import uvicorn
 
@@ -581,9 +581,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
-        help="演示服务监听地址；仅允许 loopback（127.0.0.1/localhost），"
-        "防止固定演示凭据被暴露到局域网",
+        default=_DEMO_HOST,
+        help="演示服务监听地址；只允许唯一值 127.0.0.1"
+        "（固定演示凭据不得暴露到任何其他地址）",
     )
     parser.add_argument(
         "--port",
@@ -598,11 +598,11 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # 演示服务带固定低熵凭据：只允许绑定 loopback（库层 start_server 也会拒绝）
-    if args.host not in _LOOPBACK_HOSTS:
+    # 演示服务带固定低熵凭据：只允许绑定唯一地址（库层 start_server 也会拒绝）
+    if args.host != _DEMO_HOST:
         parser.error(
-            f"--host 仅允许 loopback（{'/'.join(sorted(_LOOPBACK_HOSTS))}），"
-            f"收到 {args.host!r}：演示凭据不得暴露到非本机回环地址"
+            f"--host 只允许 {_DEMO_HOST}，收到 {args.host!r}："
+            "演示凭据不得暴露到任何其他地址"
         )
 
     logging.getLogger("gcmw.audit").setLevel(logging.WARNING)

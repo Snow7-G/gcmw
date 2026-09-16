@@ -11,16 +11,18 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from demo_showcase import _LOOPBACK_HOSTS, start_server
+from demo_showcase import _DEMO_HOST, start_server
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "10.0.0.5", "example.com"])
-def test_start_server_rejects_non_loopback_hosts(host):
-    """直接调用（绕过 CLI）也必须在库层拒绝：固定演示凭据不得离开本机。"""
-    with pytest.raises(ValueError, match="loopback"):
+@pytest.mark.parametrize(
+    "host",
+    ["0.0.0.0", "192.168.1.10", "10.0.0.5", "example.com", "localhost", "::1"],
+)
+def test_start_server_rejects_any_host_but_127_0_0_1(host):
+    """直接调用（绕过 CLI）也必须在库层拒绝：唯一合法地址是 127.0.0.1。"""
+    with pytest.raises(ValueError, match="exactly '127.0.0.1'"):
         start_server(host=host)
 
 
-@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
-def test_loopback_hosts_are_the_only_allowed_set(host):
-    assert host in _LOOPBACK_HOSTS
+def test_allowed_host_set_is_exactly_127_0_0_1():
+    assert _DEMO_HOST == "127.0.0.1"

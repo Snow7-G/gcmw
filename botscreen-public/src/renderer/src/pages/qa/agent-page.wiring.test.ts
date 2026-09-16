@@ -60,6 +60,21 @@ const okJson = (obj: unknown): Response =>
   ({ ok: true, status: 200, json: async () => obj }) as unknown as Response
 const httpError = (status: number): Response =>
   ({ ok: false, status, json: async () => ({}) }) as unknown as Response
+/** 字节级 SSE 响应（answer 流测试用；帧可跨 chunk） */
+function sseBody(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    }
+  })
+}
+
+function okResponse(body: ReadableStream<Uint8Array>): Response {
+  return { ok: true, status: 200, body } as unknown as Response
+}
+
 const hang = (_url: string, signal: AbortSignal | undefined): Promise<never> =>
   new Promise((_resolve, reject) => {
     signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')))
@@ -151,7 +166,7 @@ describe('qa page agent wiring', () => {
     expect(text()).not.toContain('HTTP 500') // 不泄漏服务端细节
   })
 
-  it('unmount during hangs: session request aborted, no new requests, no reconnect', async () => {
+  it('unmount during hangs: session request aborted, no new requests', async () => {
     const signals: Record<string, AbortSignal | null | undefined> = {}
     stubFetch((url, signal) => {
       if (url.includes('/suggestions')) {
@@ -174,11 +189,37 @@ describe('qa page agent wiring', () => {
     expect(signals.session?.aborted).toBe(true) // Session 请求被 abort
     expect(signals.suggestions?.aborted).toBe(true)
     expect(agentSessionCount()).toBe(1) // 卸载后零新增 Agent 请求
-    // 卸载后旧语音 SSE 不复活（重连 timer 被清理）
-    const countBefore = FakeEventSource.instances.length
-    await new Promise((r) => setTimeout(r, 50))
-    expect(FakeEventSource.instances.length).toBe(countBefore)
-    expect(FakeEventSource.instances.every((s) => s.closed)).toBe(true)
+  })
+
+  it('cancels the armed legacy reconnect timer when unmounted within 3s', async () => {
+    vi.useFakeTimers()
+    try {
+      stubFetch((url, signal) => {
+        if (url.includes('/suggestions')) return hang(url, signal)
+        if (url.includes('/api/v1/sessions')) return hang(url, signal)
+        throw new Error('unexpected ' + url)
+      })
+      mountPage()
+      // 挂载即创建旧语音 EventSource（同步 FIRST）
+      expect(FakeEventSource.instances.length).toBe(1)
+      const legacy = FakeEventSource.instances[0]
+
+      // 主动触发服务端断开：进入重连等待期
+      legacy.onerror?.()
+      expect(legacy.closed).toBe(true)
+
+      // 3 秒到期前卸载
+      unmountPage()
+
+      // 推进虚拟时间跨过 3 秒重连窗口：绝不允许创建新 EventSource
+      vi.advanceTimersByTime(10_000)
+      await Promise.resolve()
+      expect(FakeEventSource.instances.length).toBe(1)
+      // 卸载后零新增 Agent 请求
+      expect(agentSessionCount()).toBe(1)
+    } finally {
+      vi.useRealTimers() // 恢复真实计时器，不污染其他测试
+    }
   })
 
   it('keeps the legacy voice SSE independent of a slow Agent backend', async () => {
@@ -192,6 +233,47 @@ describe('qa page agent wiring', () => {
     // 旧语音流必须已经启动——不等 suggestions/Agent Session
     expect(FakeEventSource.instances.length).toBe(1)
     expect(FakeEventSource.instances[0].url).toBe('http://127.0.0.1:8000/sse')
+  })
+
+  it('restores the default welcome text after returning from an answer', async () => {
+    stubFetch((url) => {
+      if (url.includes('/suggestions')) return okJson({ suggestions: ['发热怎么办'] })
+      if (url.includes('/api/v1/sessions')) return okJson({ session_id: 's-1' })
+      if (url.includes('/events')) {
+        const body = [
+          'id: 1\nevent: run.accepted\ndata: {"data":{}}\n\n',
+          'id: 2\nevent: process.status\ndata: {"data":{"stage":"retrieving"}}\n\n',
+          'id: 3\nevent: answer.delta\ndata: {"data":{"delta":"体温超过38.5建议门诊就诊（资料[1]）。"}}\n\n',
+          'id: 4\nevent: answer.completed\ndata: {"data":{"citations":[{"source_id":"faq-fever","knowledge_version":"1","content_hash":"' + 'a'.repeat(64) + '","title":"发热护理须知","source_uri":"kbase://faq-fever"}],"content_origin":"approved_faq"}}\n\n',
+          'id: 5\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
+        ]
+        return okResponse(sseBody([body.join('')]))
+      }
+      if (url.includes('/agent/runs')) {
+        // 注意：events 路由必须在前（/agent/runs/{id}/events 也含此前缀）
+        return okJson({ run_id: 'r-1', state: 'ACCEPTED' })
+      }
+      throw new Error('unexpected ' + url)
+    })
+    mountPage()
+    await flush()
+    clickSuggestion('发热怎么办')
+    await flush()
+    // 已进入答案态：答案 + 资料来源可见（此时欢迎语不渲染，返回后断言）
+
+    // 点击"返回"
+    const back = [...(root?.querySelectorAll('button') ?? [])].find((b) =>
+      b.textContent?.includes('返回')
+    )
+    expect(back).toBeDefined()
+    back!.click()
+    await flush()
+
+    // 欢迎语恢复；不残留"正在思考中..."；答案/引用已清空；问题卡片回来
+    expect(text()).toContain('眼睛健康小伙伴')
+    expect(text()).not.toContain('正在思考中...')
+    expect(text()).not.toContain('资料来源')
+    expect(text()).toContain('发热怎么办') // 建议问题重新可见
   })
 
   function agentSessionCount(): number {

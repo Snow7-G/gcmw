@@ -98,6 +98,8 @@ function goBack(): void {
   answerText.value = ''
   messages.value = []
   mascotState.value = 'idle'
+  // 恢复默认欢迎语：不能残留"正在思考中..."
+  welcomeText.value = defaultWelcome.value
 }
 
 /** 终态后把引用追加到现有答案文本（第一版不做引用卡片） */
