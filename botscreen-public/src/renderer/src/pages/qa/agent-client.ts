@@ -60,6 +60,19 @@ export function resolveAgentConfig(env: {
   if (!base || !credential || credential === 'YOUR_DEMO_CREDENTIAL_HERE') {
     return null
   }
+  // Demo boundary (development/test only): the fixed demo credential must
+  // never be sent anywhere but the loopback. Anything else — LAN IPs, hosts,
+  // https remotes, garbage — is rejected AT CONFIG TIME with zero fetches.
+  let parsed: URL
+  try {
+    parsed = new URL(base)
+  } catch {
+    return null
+  }
+  if (parsed.protocol !== 'http:') return null
+  if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
+    return null
+  }
   return { baseUrl: base.replace(/\/+$/, ''), credential }
 }
 
@@ -357,27 +370,37 @@ export async function streamRun(
     if (!res.body) throw new AgentStreamError('unavailable')
 
     const parser = new SseFrameParser()
+    // ONE decoder per response, reused across chunks with streaming mode:
+    // a fresh decoder per chunk would drop the incomplete trailing UTF-8
+    // sequence and turn a Chinese character split across TCP chunks into U+FFFD
+    const decoder = new TextDecoder()
     const reader = res.body.getReader()
+
+    const dispatch = (frame: SseFrame): void => {
+      if (typeof frame.id === 'number') cursor = frame.id
+      onEvent({ id: frame.id, event: frame.event, data: parseData(frame.data) })
+      if (frame.event === 'run.completed' || frame.event === 'stream.error') {
+        done = true
+      }
+    }
+
     try {
       for (;;) {
         const { done: eof, value } = await reader.read()
-        if (eof) break
-        for (const frame of parser.push(new TextDecoder().decode(value, { stream: true }))) {
-          if (typeof frame.id === 'number') cursor = frame.id
-          onEvent({ id: frame.id, event: frame.event, data: parseData(frame.data) })
-          if (frame.event === 'run.completed') done = true
-          if (frame.event === 'stream.error') done = true
+        if (eof) {
+          // flush any final incomplete multi-byte sequence, then any trailing
+          // frame residue left in the parser buffer
+          const tail = decoder.decode()
+          if (tail.length > 0) {
+            for (const frame of parser.push(tail)) dispatch(frame)
+          }
+          for (const frame of parser.flush()) dispatch(frame)
+          break
+        }
+        for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
+          dispatch(frame)
         }
         if (done) break
-      }
-      if (!done) {
-        for (const frame of parser.flush()) {
-          if (typeof frame.id === 'number') cursor = frame.id
-          onEvent({ id: frame.id, event: frame.event, data: parseData(frame.data) })
-          if (frame.event === 'run.completed' || frame.event === 'stream.error') {
-            done = true
-          }
-        }
       }
     } catch {
       if (signal?.aborted) throw new AgentStreamError('aborted')
@@ -452,6 +475,18 @@ export class AgentRunView {
   answer = ''
   citations: Citation[] = []
   terminalResult: string | null = null
+  /**
+   * True only when `answer.completed` arrived AND its citations validated
+   * (at least one valid triple). A medical answer is deliverable ONLY with
+   * non-empty accumulated deltas + this flag — `run.completed/answered`
+   * alone can never keep unverified text on the page.
+   */
+  answerVerified = false
+
+  /** Delivery gate for the `answered` terminal result. */
+  canDeliverAnswer(): boolean {
+    return this.answer.length > 0 && this.answerVerified
+  }
 
   apply(event: AgentSseEvent): RunViewAction | null {
     if (typeof event.id === 'number') {
@@ -483,6 +518,10 @@ export class AgentRunView {
         const citations = validateCitations(inner)
         if (citations) {
           this.citations = citations
+          // only a completed event WITH at least one valid triple verifies
+          // the answer; an invalid/missing triple leaves answerVerified=false
+          // so a later run.completed/answered cannot deliver unverified text
+          this.answerVerified = true
           return { citations }
         }
         return null

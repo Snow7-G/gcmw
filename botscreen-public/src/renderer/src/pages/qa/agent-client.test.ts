@@ -168,6 +168,31 @@ describe('streamRun reconnect', () => {
   })
 })
 
+it('keeps multi-byte characters intact when bytes split across chunks', async () => {
+  // 回归：中文 UTF-8 字节被 TCP 任意拆分（这里每 7 字节一切，必然切开
+  // '体温' 等多字节字符）时，decoder 必须跨 chunk 复用，否则出现 U+FFFD
+  const frame =
+    'id: 1\nevent: answer.delta\ndata: {"data":{"delta":"体温超过38.5建议门诊就诊"}}\n\n' +
+    'id: 2\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
+  const bytes = new TextEncoder().encode(frame)
+  const chunks: Uint8Array[] = []
+  for (let i = 0; i < bytes.length; i += 7) chunks.push(bytes.subarray(i, i + 7))
+  const stream = new ReadableStream<Uint8Array>({
+    start(c) {
+      for (const ch of chunks) c.enqueue(ch)
+      c.close()
+    }
+  })
+  stubFetch([okResponse(stream)])
+
+  const events: AgentSseEvent[] = []
+  await streamRun(OPTS, 'r-1', { onEvent: (e) => events.push(e) })
+  expect(events.map((e) => e.event)).toEqual(['answer.delta', 'run.completed'])
+  const delta = (events[0].data as { data: { delta: string } }).data.delta
+  expect(delta).toBe('体温超过38.5建议门诊就诊')
+  expect(delta).not.toContain('\uFFFD')
+})
+
 // -- 8/9/10/11: 终态唯一、迟到事件、stream.error、abort -----------------------
 
 describe('streamRun terminal & failure handling', () => {
@@ -287,6 +312,32 @@ describe('resolveAgentConfig fails closed', () => {
       })
     ).toEqual({ baseUrl: BASE, credential: 'real-looking-demo-token' })
   })
+
+  it('rejects non-loopback demo addresses at config time (zero fetch)', () => {
+    for (const bad of [
+      'http://192.168.1.10:8001/api/v1',
+      'http://0.0.0.0:8001',
+      'https://demo.example.com/api/v1',
+      'ws://127.0.0.1:8001',
+      'not a url'
+    ]) {
+      expect(
+        resolveAgentConfig({
+          VITE_GCMW_AGENT_API_BASE: bad,
+          VITE_GCMW_DEMO_CREDENTIAL: 'real-looking-demo-token'
+        })
+      ).toBeNull()
+    }
+    // loopback HTTP hosts stay allowed
+    for (const good of ['http://localhost:8001/api/v1', 'http://127.0.0.1:8001/api/v1']) {
+      expect(
+        resolveAgentConfig({
+          VITE_GCMW_AGENT_API_BASE: good,
+          VITE_GCMW_DEMO_CREDENTIAL: 'real-looking-demo-token'
+        })
+      ).not.toBeNull()
+    }
+  })
 })
 
 // -- 6/8/11: AgentRunView 顺序拼接 / 重放去重 / 终态后忽略 --------------------
@@ -359,6 +410,37 @@ describe('AgentRunView reducer', () => {
       view.apply({ id: 4, event: 'answer.completed', data: envelope({ citations: [bad] }) })
     ).toBeNull()
     expect(view.citations).toHaveLength(1)
+  })
+
+  it('gates the answered terminal behind verified completion', () => {
+    const view = new AgentRunView()
+    // delta 已累积但还没有合法 answer.completed：answered 不得交付
+    view.apply({ id: 1, event: 'answer.delta', data: envelope({ delta: '部分答案' }) })
+    expect(
+      view.apply({ id: 2, event: 'run.completed', data: envelope({ result: 'answered' }) })
+        ?.terminalResult
+    ).toBe('answered')
+    expect(view.canDeliverAnswer()).toBe(false) // 缺 answer.completed
+
+    // answer.completed 缺引用/引用非法：同样不交付
+    const view2 = new AgentRunView()
+    view2.apply({ id: 1, event: 'answer.delta', data: envelope({ delta: '答案' }) })
+    view2.apply({ id: 2, event: 'answer.completed', data: envelope({ citations: [] }) })
+    view2.apply({ id: 3, event: 'run.completed', data: envelope({ result: 'answered' }) })
+    expect(view2.canDeliverAnswer()).toBe(false)
+
+    // 非空答案 + 合法 completed + 有效引用 → 交付
+    const view3 = new AgentRunView()
+    view3.apply({ id: 1, event: 'answer.delta', data: envelope({ delta: '体温超过38.5' }) })
+    view3.apply({
+      id: 2,
+      event: 'answer.completed',
+      data: envelope({
+        citations: [{ source_id: 's', knowledge_version: 'v', content_hash: 'a'.repeat(64) }]
+      })
+    })
+    view3.apply({ id: 3, event: 'run.completed', data: envelope({ result: 'answered' }) })
+    expect(view3.canDeliverAnswer()).toBe(true)
   })
 
   it('rejects non-string deltas', () => {

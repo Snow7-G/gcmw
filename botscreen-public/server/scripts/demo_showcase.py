@@ -572,7 +572,8 @@ def main() -> int:
     parser.add_argument(
         "--host",
         default="127.0.0.1",
-        help="演示服务监听地址（默认 127.0.0.1）",
+        help="演示服务监听地址；仅允许 loopback（127.0.0.1/localhost），"
+        "防止固定演示凭据被暴露到局域网",
     )
     parser.add_argument(
         "--port",
@@ -586,6 +587,14 @@ def main() -> int:
         help="为本机开发前端（localhost:5173）加精确 CORS 白名单",
     )
     args = parser.parse_args()
+
+    # 演示服务带固定低熵凭据：只允许绑定 loopback，拒绝 0.0.0.0/局域网地址
+    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    if args.host not in _LOOPBACK_HOSTS:
+        parser.error(
+            f"--host 仅允许 loopback（{'/'.join(sorted(_LOOPBACK_HOSTS))}），"
+            f"收到 {args.host!r}：演示凭据不得暴露到非本机回环地址"
+        )
 
     logging.getLogger("gcmw.audit").setLevel(logging.WARNING)
     audit = _AuditCapture()

@@ -57,8 +57,14 @@ describe('renderer CSP contract', () => {
     expect(directive('base-uri')).toEqual(["'none'"])
   })
 
-  it('pins connect-src to the local QA backend instead of all localhost ports', () => {
-    expect(directive('connect-src')).toEqual(["'self'", 'http://127.0.0.1:8000'])
+  it('pins connect-src to the two local QA backends instead of all localhost ports', () => {
+    // legacy voice service (8000) + Agent demo service (8001), exact hosts,
+    // no wildcards and no other localhost ports
+    expect(directive('connect-src')).toEqual([
+      "'self'",
+      'http://127.0.0.1:8000',
+      'http://127.0.0.1:8001'
+    ])
   })
 
   it('keeps inline styles for MathJax/UI but grants no worker or font sources', () => {
