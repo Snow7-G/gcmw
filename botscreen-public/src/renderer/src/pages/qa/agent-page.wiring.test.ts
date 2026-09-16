@@ -259,7 +259,12 @@ describe('qa page agent wiring', () => {
     await flush()
     clickSuggestion('发热怎么办')
     await flush()
-    // 已进入答案态：答案 + 资料来源可见（此时欢迎语不渲染，返回后断言）
+    // 已进入答案态：回答与引用必须真实展示过，防止请求意外走进固定失败
+    // 页面时测试假绿（失败页同样有"返回"按钮）
+    expect(text()).toContain('体温超过38.5建议门诊就诊')
+    expect(text()).toContain('资料来源')
+    expect(text()).toContain('发热护理须知')
+    expect(text()).not.toContain('暂时连不上问答服务')
 
     // 点击"返回"
     const back = [...(root?.querySelectorAll('button') ?? [])].find((b) =>

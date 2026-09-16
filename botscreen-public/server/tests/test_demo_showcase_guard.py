@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from demo_showcase import _DEMO_HOST, start_server
+from demo_showcase import start_server
 
 
 @pytest.mark.parametrize(
@@ -22,7 +22,3 @@ def test_start_server_rejects_any_host_but_127_0_0_1(host):
     """直接调用（绕过 CLI）也必须在库层拒绝：唯一合法地址是 127.0.0.1。"""
     with pytest.raises(ValueError, match="exactly '127.0.0.1'"):
         start_server(host=host)
-
-
-def test_allowed_host_set_is_exactly_127_0_0_1():
-    assert _DEMO_HOST == "127.0.0.1"
