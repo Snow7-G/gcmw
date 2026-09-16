@@ -43,6 +43,7 @@ from app.api.v1.rate_limit import RateLimiter, rules_from_settings
 from app.api.v1.stream_leases import DEFAULT_RECONNECT_GRACE_S, RunLeaseRegistry
 from app.config import Settings
 from app.contracts.errors import ErrorCode
+from app.orchestration.assembly import build_agent_executor
 from app.providers.model_gateway import ModelGatewayError
 from app.runtime import build_run_repository, readiness_report
 from app.tools.builtins import build_gateway
@@ -131,12 +132,19 @@ def create_app(
     settings: Settings | None = None,
     repository_factory: Callable[[Settings], object] | None = None,
     reconnect_grace_s: float = DEFAULT_RECONNECT_GRACE_S,
+    agent_executor: bool = False,
 ) -> FastAPI:
     """Compose the application.
 
     ``settings`` defaults to the environment (``GCMW_ENV`` …); the repository
     factory is the single composition seam (tests inject a repository, the
     runtime picks the backend for the environment).
+
+    ``agent_executor`` opts the app into the #55A vertical slice: admitted runs
+    are then driven to a terminal state by the demo agent stack (synthetic
+    knowledge + MockProvider + Manager/RAG/Verifier). It is OFF by default so
+    admission-only tests keep their contract, and the assembly itself refuses
+    to build anything outside development / test.
     """
     settings = settings or Settings.from_env()
     factory = repository_factory or build_run_repository
@@ -146,7 +154,13 @@ def create_app(
         # the service is built ONCE per application run: a single event loop
         # owns its asyncio locks, and no module-level singleton can be shared
         # between loops (or between workers) by accident
-        service = RunAdmissionService(repository=factory(settings))
+        repository = factory(settings)
+        executor = (
+            build_agent_executor(repository=repository, settings=settings)
+            if agent_executor
+            else None
+        )
+        service = RunAdmissionService(repository=repository, executor=executor)
         credentials = CredentialStore.from_env(settings.auth_credentials_env)
         rate_limiter = RateLimiter(
             rules_from_settings(settings), audit=_log_audit_record
@@ -174,9 +188,15 @@ def create_app(
         app.state.rate_limiter = rate_limiter
         app.state.readiness = report
         app.state.stream_leases = leases
+        app.state.run_executor = executor
         try:
             yield
         finally:
+            if executor is not None:
+                await executor.shutdown()  # stop in-flight run tasks first
+                if executor.tool_gateway is not None:
+                    # the demo assembly's OWN gateway: release its worker pool
+                    executor.tool_gateway.shutdown()
             await leases.shutdown()
             tool_gateway.shutdown()  # release the bounded tool worker pool
             app.state.agent_service = None
@@ -185,6 +205,7 @@ def create_app(
             app.state.rate_limiter = None
             app.state.readiness = None
             app.state.stream_leases = None
+            app.state.run_executor = None
 
     app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
     app.state.settings = settings
@@ -274,4 +295,4 @@ def create_app(
     return app
 
 
-app = create_app()
+app = create_app(agent_executor=True)

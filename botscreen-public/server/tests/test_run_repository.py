@@ -1909,3 +1909,110 @@ class TestRealRedis:
         layers = {e.layer.value for e in first.events}
         assert layers == {"process", "answer"}
         assert first.events[-1].timestamp == second.events[-1].timestamp
+
+
+# -- sealed-answer atomic invariant: enforced INSIDE the commit boundary ------
+
+_SEAL_PAYLOAD = {
+    "citations": [],
+    "actions": [],
+    "content_origin": "approved_faq",
+}
+
+
+async def _seal_answer(repo, identity=T1) -> None:
+    """Advance a fresh run to STREAMING and append the answer.completed seal."""
+    await _to_streaming(repo, identity)
+    await repo.append_event(
+        identity, event_type=SSEEventType.ANSWER_COMPLETED, data=dict(_SEAL_PAYLOAD)
+    )
+
+
+class TestSealedAnswerAtomicInvariant:
+    """A FAILED over a persisted answer.completed is refused ZERO-WRITE inside
+    the commit boundary, with a DISTINGUISHABLE fault — not generic INVARIANT.
+    An executor-side check-then-act has a TOCTOU window this closes."""
+
+    @mark.asyncio
+    async def test_failed_over_a_sealed_answer_is_refused_zero_write(self):
+        repo = MemoryRunRepository()
+        await _seal_answer(repo)
+        before = await repo.snapshot(T1, 0, 0.01)
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.commit_transition(
+                T1, expected_state=RunState.STREAMING, next_state=RunState.FAILED
+            )
+        assert exc.value.fault is RunRepositoryFault.ANSWER_SEALED
+        after = await repo.snapshot(T1, 0, 0.01)
+        assert after.state is RunState.STREAMING  # zero-write: nothing moved
+        assert after.latest_seq == before.latest_seq
+        assert after.terminal_seq is None
+
+    @mark.asyncio
+    async def test_failed_wins_then_the_seal_is_refused(self):
+        """The mirror direction: once FAILED is the terminal, a late seal must
+        not sneak in either — the run can never become answer.completed+FAILED."""
+        repo = MemoryRunRepository()
+        await _to_streaming(repo)
+        await repo.commit_transition(
+            T1, expected_state=RunState.STREAMING, next_state=RunState.FAILED
+        )
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.append_event(
+                T1, event_type=SSEEventType.ANSWER_COMPLETED, data=dict(_SEAL_PAYLOAD)
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT  # terminal run
+
+
+@pytest.mark.skipif(
+    not os.getenv("GCMW_REDIS_TEST_URL"),
+    reason="GCMW_REDIS_TEST_URL not set (CI redis service)",
+)
+class TestRealRedisSealedAnswerInvariant:
+    """Same invariant, exercised against the REAL Redis Lua commit boundary
+    (the -11 control code inside _LUA_COMMIT). Skipped without a Redis URL."""
+
+    @pytest_asyncio.fixture()
+    async def repo(self):
+        import redis.asyncio as aioredis
+
+        client = aioredis.from_url(os.environ["GCMW_REDIS_TEST_URL"])
+        repo = RedisRunRepository(client, prefix="gcmw:test:rr-seal")
+        for identity in (T1, R2):
+            try:
+                await repo.delete(identity)
+            except RunRepositoryError:
+                pass
+        yield repo
+        for identity in (T1, R2):
+            try:
+                await repo.delete(identity)
+            except RunRepositoryError:
+                pass
+        await client.aclose()
+
+    @mark.asyncio
+    async def test_failed_over_a_sealed_answer_is_refused_zero_write(self, repo):
+        await _seal_answer(repo)
+        before = await repo.snapshot(T1, 0, 0.01)
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.commit_transition(
+                T1, expected_state=RunState.STREAMING, next_state=RunState.FAILED
+            )
+        assert exc.value.fault is RunRepositoryFault.ANSWER_SEALED
+        after = await repo.snapshot(T1, 0, 0.01)
+        assert after.state is RunState.STREAMING  # the Lua refusal wrote nothing
+        assert after.latest_seq == before.latest_seq
+        assert after.terminal_seq is None
+
+    @mark.asyncio
+    async def test_failed_wins_then_the_seal_is_refused(self, repo):
+        await _to_streaming(repo)
+        await repo.commit_transition(
+            T1, expected_state=RunState.STREAMING, next_state=RunState.FAILED
+        )
+        with pytest.raises(RunRepositoryError) as exc:
+            await repo.append_event(
+                T1, event_type=SSEEventType.ANSWER_COMPLETED, data=dict(_SEAL_PAYLOAD)
+            )
+        assert exc.value.fault is RunRepositoryFault.INVARIANT  # terminal run

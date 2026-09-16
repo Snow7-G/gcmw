@@ -192,9 +192,15 @@ class RunAdmissionService:
         self,
         repository: Any | None = None,
         clock: Any | None = None,
+        executor: Any | None = None,
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.repository = repository or MemoryRunRepository()
+        # the #55A run executor, when the environment assembles one: it is the
+        # only thing that moves a run past ACCEPTED. ``None`` (staging /
+        # production, or a test that only exercises admission) keeps the old
+        # behaviour — runs are admitted and simply never progress.
+        self.executor = executor
         # ONE reference-counted guard per session. Idempotency keys and the
         # single-active-run rule are both session-scoped, so per-session locking
         # is sufficient for correctness while keeping unrelated sessions
@@ -242,7 +248,9 @@ class RunAdmissionService:
         for run_id in [
             r for r in list(self.runs) if self.runs[r].session_id == session_id
         ]:
-            del self.runs[run_id]
+            # via the choke point: the run's executor task is interrupted too,
+            # so an expired session cannot leave a slow task running
+            self._forget_run(run_id)
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
         # NOTE: the session guard is deliberately NOT touched here. Purging
@@ -340,10 +348,16 @@ class RunAdmissionService:
         )
 
     def _forget_run(self, run_id: str) -> None:
-        """Drop a run this process can no longer reach durably."""
+        """Drop a run this process can no longer reach durably.
+
+        The executor task is interrupted HERE, at the single choke point every
+        "this run is unreachable" path goes through — a deleted session must not
+        leave a background task answering a question nobody can read."""
         self.runs.pop(run_id, None)
         for key in [k for k, v in list(self.idempotency.items()) if v[0] == run_id]:
             del self.idempotency[key]
+        if self.executor is not None:
+            self.executor.cancel(run_id)
 
     # -- durable state reads -----------------------------------------------------
 
@@ -499,6 +513,11 @@ class RunAdmissionService:
             )
             self.runs[run_id] = record
             self.idempotency[key] = (run_id, payload_hash)
+            if self.executor is not None:
+                # #55A: hand the admitted run to the executor. The admission
+                # lock protects bookkeeping only — the executor drives the run
+                # in its own task, so this call never awaits a model.
+                self.executor.schedule(record)
             return self._snapshot(record, RunState.ACCEPTED)
 
     async def get_run(
@@ -539,7 +558,13 @@ class RunAdmissionService:
     ) -> RunStatusSnapshot:
         async with self._session_guard(self._session_of(run_id)):
             record = self._owned_run(principal, run_id)
-            return self._snapshot(record, await self._cancel_record(record))
+            state = await self._cancel_record(record)
+            if self.executor is not None:
+                # #55A: the terminal state is committed by the CAS above; this
+                # only interrupts the SLOW WORK behind it (a model call), so no
+                # late answer can ever be produced after the cancel
+                self.executor.cancel(run_id)
+            return self._snapshot(record, state)
 
     async def cancel_for_disconnect(self, run_id: str) -> None:
         """Cancel a run whose LAST subscriber left (lease grace expired).
@@ -563,6 +588,8 @@ class RunAdmissionService:
                 await self._cancel_record(record)
             except AppError:
                 return
+            if self.executor is not None:
+                self.executor.cancel(run_id)
 
     # -- streaming ---------------------------------------------------------------
 

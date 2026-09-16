@@ -401,6 +401,33 @@ class VerifierRunner(Protocol):
     ) -> Awaitable[Verdict]: ...
 
 
+#: The FIXED stage vocabulary ``ManagerAgent.execute`` may report through its
+#: optional progress hook. Nothing else is ever emitted, so a run executor can
+#: map a stage name onto a run state without parsing free text.
+MANAGER_STAGES: tuple[str, ...] = (
+    "guarding",
+    "routing",
+    "retrieving",
+    "verifying",
+)
+
+
+async def _emit_stage(
+    on_stage: Callable[[str], Awaitable[None]] | None, stage: str
+) -> None:
+    """Fire the optional progress hook once, with a fixed stage name.
+
+    A hook fault is deliberately contained HERE: the executor's hook swallows
+    its own storage failures, and any other exception would break the guarded
+    turn, so this wrapper re-raises nothing new — it simply lets a hook error
+    propagate as the hook's own (the Manager never inspects it)."""
+    if on_stage is None:
+        return
+    if stage not in MANAGER_STAGES:  # pragma: no cover - internal call sites
+        raise ValueError(f"unknown manager stage {stage!r}")
+    await on_stage(stage)
+
+
 class ManagerAgent:
     """Deterministic run controller (one run = one call to ``execute``)."""
 
@@ -675,10 +702,25 @@ class ManagerAgent:
             and verdict.outcome is VerifierOutcome.PASS
         )
 
-    async def execute(self, ctx: AgentContext, text: str) -> AgentResult:
+    async def execute(
+        self,
+        ctx: AgentContext,
+        text: str,
+        on_stage: Callable[[str], Awaitable[None]] | None = None,
+    ) -> AgentResult:
         """Run one guarded, routed, verified turn. Returns the Manager's final
-        AgentResult (safe markers only — no chain-of-thought)."""
+        AgentResult (safe markers only — no chain-of-thought).
+
+        ``on_stage`` is an OPTIONAL, read-only progress hook for the run
+        executor (#55A): it is awaited with a fixed stage name at the moment a
+        phase BEGINS — ``"guarding"``, ``"routing"``, ``"retrieving"`` and
+        ``"verifying"`` — and nothing else. It can never change a decision: the
+        callback receives no result data, and a raising hook is the caller's
+        problem (the executor swallows storage faults and lets the run finish).
+        The default ``None`` keeps this call exactly as it was, so no existing
+        behaviour or test changes."""
         actions: list[dict[str, Any]] = []
+        await _emit_stage(on_stage, "guarding")
         self._mark(actions, "manager.guard")
         cleaned = self._guard(ctx, text)
 
@@ -693,6 +735,7 @@ class ManagerAgent:
         # only ever means "these rules did not raise it" — it must not downgrade
         # a context that already arrives as MEDIUM/CRITICAL, so the effective
         # level is the HIGHER of the declared and the decided level.
+        await _emit_stage(on_stage, "routing")
         declared = RiskLevel(ctx.risk_level)
         decision = self._risk_rules.classify(cleaned)
         risk = highest_risk(declared, decision)
@@ -723,6 +766,7 @@ class ManagerAgent:
         )
         runner = self._runners[agent_id]
         run_tool_calls = 0  # whole-run total: first execution + every revision
+        await _emit_stage(on_stage, "retrieving")
         raw = await self._run_with_deadline(
             lambda: runner(sub_ctx), self._remaining_ms(ctx)
         )
@@ -758,6 +802,7 @@ class ManagerAgent:
             verifier = self._verifier
             # the verifier only ever sees its OWN deep copy: whatever it does to
             # that object cannot change what this module validated
+            await _emit_stage(on_stage, "verifying")
             verifier_view = self._trusted_snapshot(execution, agent_id=agent_id)
             verdict = await self._run_with_deadline(
                 lambda view=verifier_view: verifier(sub_ctx, view),
