@@ -1,13 +1,85 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref } from 'vue'
 import LiquidBar from '@renderer/components/LiquidBar.vue'
+import {
+  AgentRunView,
+  AgentStreamError,
+  cancelRun,
+  createRun,
+  createSession,
+  resolveAgentConfig,
+  streamRun,
+  type AgentClientOptions,
+  type Citation
+} from './agent-client'
 
+// 旧服务：仅语音/硬件链路继续使用（本切片不迁移语音）
 const API_BASE = 'http://127.0.0.1:8000'
-const sessionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+
+// ===== 新 Agent 演示链路（development/test 合成数据演示） =====
+// 配置来自 .env.local（占位符见 .env.example），缺配置时文字问答失败关闭并
+// 显示固定提示；绝不回显、不提交凭据值。
+const agentOptions = resolveAgentConfig(
+  import.meta.env as unknown as Record<string, string | undefined>
+)
+const agentReady = agentOptions !== null
+
+const agentSessionId = ref('')
+const activeRunId = ref('')
+let agentAbortController: AbortController | null = null
+let agentRunView: AgentRunView | null = null
+// 旧语音 SSE（legacyVoiceSse）与新 Agent SSE 各用各的变量，互不关闭
+let legacyVoiceSse: EventSource | null = null
+let legacySseReconnectTimer: ReturnType<typeof setTimeout> | null = null
+let pageAlive = true
+let agentSessionAbort: AbortController | null = null
+let suggestionsAbort: AbortController | null = null
+
+/** 演示确定性：前三个问题固定对应三条后端路径（有引用 / 无证据 / 红旗） */
+const DEMO_QUESTIONS = ['发热怎么办', '空调病怎么预防', '我最近有自杀的念头']
+
+const AGENT_COPY = {
+  configMissing: '演示服务还没配置好，请先在 .env.local 里填写演示配置～',
+  sessionFailed: '暂时连不上问答服务，请稍后再试～',
+  refused: '目前没有足够可靠的资料回答这个问题，建议咨询专业人员。',
+  escalated: '这个问题需要人工或专业人员进一步协助。',
+  cancelled: '本次问答已取消',
+  timeout: '本次处理超时，请稍后重试。',
+  genericError: '哎呀，服务暂时不可用，请稍后再试～',
+  sourcePrefix: '\n\n资料来源：\n'
+} as const
+
+/** 统一失败出口：清空部分答案、把固定安全文案放到可见的答案面板 */
+function showAgentFailure(copy: string): void {
+  answerText.value = copy
+  showAnswer.value = true
+  mascotState.value = 'idle'
+}
+
+function agentFailCopy(err: unknown): string {
+  if (err instanceof AgentStreamError) {
+    switch (err.kind) {
+      case 'unauthorized':
+      case 'forbidden':
+        return AGENT_COPY.sessionFailed
+      case 'rate_limited':
+        return '问得有点太快啦，休息一下再试试～'
+      case 'aborted':
+        return AGENT_COPY.cancelled
+      default:
+        return AGENT_COPY.genericError
+    }
+  }
+  return AGENT_COPY.genericError
+}
 
 type MascotState = 'idle' | 'listening' | 'processing' | 'answering' | 'encourage' | 'rest'
 
-interface ChatMessage { role: 'user' | 'robot'; text: string; source?: 'kb' | 'deepseek' | 'error' }
+interface ChatMessage {
+  role: 'user' | 'robot'
+  text: string
+  source?: 'kb' | 'deepseek' | 'error' | 'agent'
+}
 
 const mascotState = ref<MascotState>('idle')
 const messages = ref<ChatMessage[]>([])
@@ -17,42 +89,181 @@ const isSending = ref(false)
 const answerText = ref('')
 const showAnswer = ref(false)
 
-let sseSource: EventSource | null = null
 let lastManualQuestion = ''
 
 function goBack(): void {
+  // 主动取消：中止 Agent SSE 流并对未终态的 Run best-effort 取消
+  cancelActiveRun()
   showAnswer.value = false
   answerText.value = ''
   messages.value = []
   mascotState.value = 'idle'
+  // 恢复默认欢迎语：不能残留"正在思考中..."
+  welcomeText.value = defaultWelcome.value
+}
+
+/** 终态后把引用追加到现有答案文本（第一版不做引用卡片） */
+function appendCitations(citations: Citation[]): void {
+  const lines = citations.map(
+    (c, i) => `${i + 1}. ${c.title ?? c.source_id} · ${c.knowledge_version}`
+  )
+  if (lines.length > 0) {
+    answerText.value += `${AGENT_COPY.sourcePrefix}${lines.join('\n')}`
+  }
+}
+
+/** run.completed 的 result → 页面固定文案（终态只能进来一次） */
+function applyTerminalResult(result: string, view: AgentRunView | null): void {
+  switch (result) {
+    case 'answered':
+      // 交付门槛：非空答案 + 合法 answer.completed + ≥1 条有效引用三元组，
+      // 否则未核验的医疗回答一律清掉并显示固定文案
+      if (!view || !view.canDeliverAnswer()) {
+        answerText.value = AGENT_COPY.genericError
+        showAnswer.value = true
+        mascotState.value = 'idle'
+        return
+      }
+      // 保留已累积答案；吉祥物走鼓励再回 idle
+      mascotState.value = 'encourage'
+      setTimeout(() => {
+        if (mascotState.value === 'encourage') mascotState.value = 'idle'
+      }, 2500)
+      break
+    case 'refused_no_answer':
+      answerText.value = AGENT_COPY.refused
+      showAnswer.value = true
+      mascotState.value = 'idle'
+      break
+    case 'escalated_to_human':
+      answerText.value = AGENT_COPY.escalated
+      showAnswer.value = true
+      mascotState.value = 'idle'
+      break
+    case 'cancelled':
+      answerText.value = AGENT_COPY.cancelled
+      showAnswer.value = true
+      mascotState.value = 'idle'
+      break
+    case 'deadline_exceeded':
+      answerText.value = AGENT_COPY.timeout
+      showAnswer.value = true
+      mascotState.value = 'idle'
+      break
+    default:
+      answerText.value = AGENT_COPY.genericError
+      showAnswer.value = true
+      mascotState.value = 'idle'
+      break
+  }
 }
 
 async function sendQuestion(question: string): Promise<void> {
   if (!question.trim() || isSending.value) return
-  lastManualQuestion = question
-  messages.value.push({ role: 'user', text: question })
+  if (!agentReady || !agentSessionId.value) {
+    messages.value.push({ role: 'user', text: question })
+    showAgentFailure(agentReady ? AGENT_COPY.sessionFailed : AGENT_COPY.configMissing)
+    return
+  }
+
   isSending.value = true
   mascotState.value = 'processing'
+  welcomeText.value = '正在思考中...'
+  answerText.value = ''
+  showAnswer.value = false
+  messages.value.push({ role: 'user', text: question })
+
+  // 新问题生成新 key；同一次创建的重试必须复用同一个 key
+  const idempotencyKey = `qa-${Date.now()}-${crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)}`
+  agentRunView = new AgentRunView()
+  agentAbortController = new AbortController()
 
   try {
-    const res = await fetch(`${API_BASE}/chat`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ question, session_id: sessionId })
+    let runId = ''
+    try {
+      const run = await createRun(
+        agentOptions as AgentClientOptions,
+        agentSessionId.value,
+        question,
+        idempotencyKey,
+        agentAbortController.signal
+      )
+      runId = run.run_id
+    } catch (err) {
+      // 网络故障：同 key 重试一次（服务端幂等去重）
+      if (err instanceof AgentStreamError && err.kind === 'network') {
+        const run = await createRun(
+          agentOptions as AgentClientOptions,
+          agentSessionId.value,
+          question,
+          idempotencyKey,
+          agentAbortController.signal
+        )
+        runId = run.run_id
+      } else {
+        throw err
+      }
+    }
+
+    activeRunId.value = runId
+    await streamRun(agentOptions as AgentClientOptions, runId, {
+      lastEventId: 0,
+      signal: agentAbortController.signal,
+      onEvent: handleAgentEvent
     })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    const data = await res.json()
-    mascotState.value = 'answering'
-    answerText.value = data.robot_answer
-    showAnswer.value = true
-    messages.value.push({ role: 'robot', text: data.robot_answer, source: data.source || 'local' })
-    setTimeout(() => {
-      mascotState.value = 'encourage'
-      setTimeout(() => { if (mascotState.value === 'encourage') mascotState.value = 'idle' }, 2500)
-    }, 2000)
   } catch (err) {
-    messages.value.push({ role: 'robot', text: `哎呀，服务暂时不可用 😿\n${String(err)}`, source: 'error' })
+    if (!(err instanceof AgentStreamError && err.kind === 'aborted')) {
+      // 统一失败出口：清空部分答案/引用，固定安全文案可见，绝不显示
+      // 服务端异常原文
+      showAgentFailure(agentFailCopy(err))
+      messages.value.push({ role: 'robot', text: answerText.value, source: 'agent' })
+    }
+  } finally {
+    isSending.value = false
+    activeRunId.value = ''
+    agentRunView = null
+    agentAbortController = null
+  }
+}
+
+/** Agent SSE 事件 → 现有 UI 状态（业务逻辑在 AgentRunView，页面只做映射） */
+function handleAgentEvent(event: { id?: number; event: string; data: unknown }): void {
+  const view = agentRunView
+  if (!view) return
+  const action = view.apply(event)
+  if (!action) return
+
+  if (action.stage) {
+    mascotState.value = action.stage
+  }
+  if (action.appendDelta) {
+    answerText.value = view.answer
+    showAnswer.value = true
+  }
+  if (action.citations) {
+    appendCitations(action.citations)
+  }
+  if (action.terminalResult !== undefined) {
+    applyTerminalResult(action.terminalResult, view)
+  }
+  if (action.streamError) {
+    answerText.value = AGENT_COPY.genericError
+    showAnswer.value = true
     mascotState.value = 'idle'
-  } finally { isSending.value = false }
+  }
+}
+
+/** best-effort 取消当前 Run（页面离开 / 返回按钮）；不阻塞、不泄漏错误 */
+function cancelActiveRun(): void {
+  agentAbortController?.abort()
+  agentAbortController = null
+  if (activeRunId.value && agentOptions) {
+    const runId = activeRunId.value
+    cancelRun(agentOptions, runId).catch(() => {
+      /* best-effort: the server also reaps unfinished runs */
+    })
+    activeRunId.value = ''
+  }
 }
 
 // ========== 硬件麦克风控制（测试模式）==========
@@ -78,12 +289,18 @@ async function startMic(): Promise<void> {
     startMicPolling()
   } catch {
     welcomeText.value = '无法连接后端，请检查服务～'
-    setTimeout(() => { welcomeText.value = defaultWelcome.value }, 3000)
+    setTimeout(() => {
+      welcomeText.value = defaultWelcome.value
+    }, 3000)
   }
 }
 
 async function stopMic(): Promise<void> {
-  try { await fetch(API_BASE + '/mic/stop', { method: 'POST' }) } catch { /* ignore */ }
+  try {
+    await fetch(API_BASE + '/mic/stop', { method: 'POST' })
+  } catch {
+    /* ignore */
+  }
   micActive.value = false
   mascotState.value = 'idle'
   welcomeText.value = defaultWelcome.value
@@ -107,7 +324,9 @@ function startMicPolling(): void {
       if (data.elapsed_seconds > 15 && micActive.value) {
         stopMic()
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }, 500)
 }
 
@@ -118,52 +337,126 @@ function stopMicPolling(): void {
   }
 }
 
-onMounted(async () => {
-  welcomeText.value = '你好呀～我是小视，你的眼睛健康小伙伴！\n有什么想知道的，点点按钮或者按一下麦克风跟我说吧～'
+/** 演示固定问题放最前，其余旧问题去重后继续保留 */
+function withDemoQuestionsFirst(questions: string[]): string[] {
+  return [...DEMO_QUESTIONS, ...questions.filter((q) => !DEMO_QUESTIONS.includes(q))]
+}
+
+onMounted(() => {
+  welcomeText.value =
+    '你好呀～我是小视，你的眼睛健康小伙伴！\n有什么想知道的，点点按钮或者按一下麦克风跟我说吧～'
   defaultWelcome.value = welcomeText.value
-  try {
-    const res = await fetch(`${API_BASE}/suggestions`)
-    if (res.ok) { const data = await res.json(); suggestions.value = data.suggestions || [] }
-    else throw new Error('fallback')
-  } catch {
-    suggestions.value = ['眼轴正常长度','近视小科普','近视分级标准','用眼休息时长','正确读写姿势','每日户外时长','用眼光线环境','护眼饮食推荐','定期检查眼睛']
-  }
+  // 旧语音链路 FIRST：同步启动，不依赖任何 await，8001 卡住绝不阻塞 8000
   connectSSE()
+  // 两个相互独立的异步任务，各自带组件级 AbortController，卸载统一中止
+  void loadSuggestions()
+  void initAgentSession()
 })
 
+/** 任务一：建议问题（独立 abort；每次状态写入前检查 pageAlive） */
+async function loadSuggestions(): Promise<void> {
+  suggestionsAbort = new AbortController()
+  try {
+    const res = await fetch(`${API_BASE}/suggestions`, {
+      signal: suggestionsAbort.signal
+    })
+    if (!pageAlive) return // 卸载后丢弃结果，不写状态
+    if (res.ok) {
+      const data = await res.json()
+      if (pageAlive) suggestions.value = withDemoQuestionsFirst(data.suggestions || [])
+    } else throw new Error('fallback')
+  } catch {
+    if (pageAlive) {
+      suggestions.value = withDemoQuestionsFirst([
+        '眼轴正常长度',
+        '近视小科普',
+        '近视分级标准',
+        '用眼休息时长',
+        '正确读写姿势',
+        '每日户外时长',
+        '用眼光线环境',
+        '护眼饮食推荐',
+        '定期检查眼睛'
+      ])
+    }
+  }
+}
+
+/** 任务二：Agent Session（组件级 abort + 5s 超时；失败则文字问答失败关闭） */
+async function initAgentSession(): Promise<void> {
+  if (!agentReady || !pageAlive) return
+  agentSessionAbort = new AbortController()
+  const sessionTimeout = setTimeout(() => agentSessionAbort?.abort(), 5000)
+  try {
+    const id = await createSession(agentOptions as AgentClientOptions, agentSessionAbort.signal)
+    if (!pageAlive) return // 卸载后丢弃结果，不再写状态
+    agentSessionId.value = id
+  } catch {
+    // 失败关闭：session 拿不到时 sendQuestion 会给出固定提示，语音链路不受影响
+  } finally {
+    clearTimeout(sessionTimeout)
+    agentSessionAbort = null
+  }
+}
+
 onBeforeUnmount(() => {
+  pageAlive = false
   stopMicPolling()
   if (hwTimeoutTimer) clearTimeout(hwTimeoutTimer)
-  if (sseSource) { sseSource.close(); sseSource = null }
+  cancelActiveRun()
+  suggestionsAbort?.abort()
+  suggestionsAbort = null
+  agentSessionAbort?.abort()
+  agentSessionAbort = null
+  if (legacySseReconnectTimer) {
+    clearTimeout(legacySseReconnectTimer)
+    legacySseReconnectTimer = null
+  }
+  if (legacyVoiceSse) {
+    legacyVoiceSse.close()
+    legacyVoiceSse = null
+  }
 })
 
 // ========== 硬件语音唤醒超时定时器 ==========
 let hwTimeoutTimer: ReturnType<typeof setTimeout> | null = null
 
 function connectSSE(): void {
-  sseSource = new EventSource(`${API_BASE}/sse`)
+  if (!pageAlive) return // 卸载后禁止任何续连
+  legacyVoiceSse = new EventSource(`${API_BASE}/sse`)
 
   // ── 问答答案事件 ──
-  sseSource.onmessage = (event: MessageEvent) => {
+  legacyVoiceSse.onmessage = (event: MessageEvent) => {
     try {
       const data = JSON.parse(event.data)
-      if (data.user_question === lastManualQuestion) { lastManualQuestion = ''; return }
+      if (data.user_question === lastManualQuestion) {
+        lastManualQuestion = ''
+        return
+      }
       messages.value.push({ role: 'user', text: data.user_question })
       mascotState.value = 'answering'
       answerText.value = data.robot_answer
       showAnswer.value = true
-      messages.value.push({ role: 'robot', text: data.robot_answer, source: data.source || 'deepseek' })
+      messages.value.push({
+        role: 'robot',
+        text: data.robot_answer,
+        source: data.source || 'deepseek'
+      })
       // 硬件唤醒模式：收到答案后自动结束麦克风状态
       stopMicHw()
       setTimeout(() => {
         mascotState.value = 'encourage'
-        setTimeout(() => { if (mascotState.value === 'encourage') mascotState.value = 'idle' }, 2500)
+        setTimeout(() => {
+          if (mascotState.value === 'encourage') mascotState.value = 'idle'
+        }, 2500)
       }, 2000)
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   }
 
   // ── 麦克风状态事件（硬件唤醒 / ASR 收到等）──
-  sseSource.addEventListener('mic_status', (event: MessageEvent) => {
+  legacyVoiceSse.addEventListener('mic_status', (event: MessageEvent) => {
     try {
       const evt = JSON.parse(event.data)
       switch (evt.event) {
@@ -194,12 +487,20 @@ function connectSSE(): void {
           // 手动点击触发，不需要额外处理（前端已通过 startMic 设置状态）
           break
       }
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
   })
 
-  sseSource.onerror = () => {
-    if (sseSource) { sseSource.close(); sseSource = null }
-    setTimeout(connectSSE, 3000)
+  legacyVoiceSse.onerror = () => {
+    if (legacyVoiceSse) {
+      legacyVoiceSse.close()
+      legacyVoiceSse = null
+    }
+    if (pageAlive) {
+      // timer 必须可清理：卸载时 clear，绝不复活旧语音流
+      legacySseReconnectTimer = setTimeout(connectSSE, 3000)
+    }
   }
 }
 
@@ -220,87 +521,193 @@ function stopMicHw(): void {
 function speakText(text: string): void {
   window.speechSynthesis.cancel()
   const u = new SpeechSynthesisUtterance(text)
-  u.lang = 'zh-CN'; u.rate = 0.9; u.pitch = 1.1
+  u.lang = 'zh-CN'
+  u.rate = 0.9
+  u.pitch = 1.1
   window.speechSynthesis.speak(u)
 }
 
 // ========== LED 点阵表情：坐标点数据 ==========
-interface LedDot { x: number; y: number; color?: string }
+interface LedDot {
+  x: number
+  y: number
+  color?: string
+}
 
 const HAPPY_COLOR = '#36c7b7'
 // 280×200 卡片，像素块排布
 const HAPPY_DOTS: LedDot[] = [
   // 左眼 — 弯弯月牙（上弯弧）
-  {x:58,y:78},{x:65,y:72},{x:72,y:68},{x:79,y:72},{x:86,y:78},
+  { x: 58, y: 78 },
+  { x: 65, y: 72 },
+  { x: 72, y: 68 },
+  { x: 79, y: 72 },
+  { x: 86, y: 78 },
   // 右眼 — 弯弯月牙
-  {x:194,y:78},{x:201,y:72},{x:208,y:68},{x:215,y:72},{x:222,y:78},
+  { x: 194, y: 78 },
+  { x: 201, y: 72 },
+  { x: 208, y: 68 },
+  { x: 215, y: 72 },
+  { x: 222, y: 78 },
   // 嘴 — 5点横排
-  {x:110,y:140},{x:126,y:144},{x:140,y:145},{x:154,y:144},{x:170,y:140},
+  { x: 110, y: 140 },
+  { x: 126, y: 144 },
+  { x: 140, y: 145 },
+  { x: 154, y: 144 },
+  { x: 170, y: 140 },
   // 腮红（极淡）
-  {x:44,y:100,color:'#f1aaaa'},{x:236,y:100,color:'#f1aaaa'},
+  { x: 44, y: 100, color: '#f1aaaa' },
+  { x: 236, y: 100, color: '#f1aaaa' }
 ]
 
 const THINKING_COLOR = '#36c7b7'
 const THINKING_DOTS: LedDot[] = [
   // 左眼 — 缩小
-  {x:62,y:62},{x:76,y:62},{x:62,y:76},{x:76,y:76},
+  { x: 62, y: 62 },
+  { x: 76, y: 62 },
+  { x: 62, y: 76 },
+  { x: 76, y: 76 },
   // 右眼 — 正常
-  {x:194,y:58},{x:208,y:58},{x:222,y:58},
-  {x:194,y:72},{x:208,y:72},{x:222,y:72},
-  {x:194,y:86},{x:208,y:86},{x:222,y:86},
+  { x: 194, y: 58 },
+  { x: 208, y: 58 },
+  { x: 222, y: 58 },
+  { x: 194, y: 72 },
+  { x: 208, y: 72 },
+  { x: 222, y: 72 },
+  { x: 194, y: 86 },
+  { x: 208, y: 86 },
+  { x: 222, y: 86 },
   // 小椭圆嘴
-  {x:124,y:142},{x:140,y:144},{x:156,y:142},
+  { x: 124, y: 142 },
+  { x: 140, y: 144 },
+  { x: 156, y: 142 }
 ]
 
 const LISTEN_COLOR = '#36c7b7'
 const LISTEN_DOTS: LedDot[] = [
   // 左眼 — 两条横线
-  {x:44,y:66},{x:60,y:66},{x:76,y:66},{x:92,y:66},
-  {x:44,y:78},{x:60,y:78},{x:76,y:78},{x:92,y:78},
+  { x: 44, y: 66 },
+  { x: 60, y: 66 },
+  { x: 76, y: 66 },
+  { x: 92, y: 66 },
+  { x: 44, y: 78 },
+  { x: 60, y: 78 },
+  { x: 76, y: 78 },
+  { x: 92, y: 78 },
   // 右眼 — 两条横线
-  {x:188,y:66},{x:204,y:66},{x:220,y:66},{x:236,y:66},
-  {x:188,y:78},{x:204,y:78},{x:220,y:78},{x:236,y:78},
+  { x: 188, y: 66 },
+  { x: 204, y: 66 },
+  { x: 220, y: 66 },
+  { x: 236, y: 66 },
+  { x: 188, y: 78 },
+  { x: 204, y: 78 },
+  { x: 220, y: 78 },
+  { x: 236, y: 78 },
   // 小横线嘴
-  {x:120,y:140},{x:140,y:140},{x:160,y:140},
+  { x: 120, y: 140 },
+  { x: 140, y: 140 },
+  { x: 160, y: 140 },
   // 轻侧边点
-  {x:24,y:70},{x:28,y:80},{x:28,y:60},{x:256,y:70},{x:252,y:80},{x:252,y:60},
+  { x: 24, y: 70 },
+  { x: 28, y: 80 },
+  { x: 28, y: 60 },
+  { x: 256, y: 70 },
+  { x: 252, y: 80 },
+  { x: 252, y: 60 }
 ]
 
 const SPEAK_COLOR = '#36c7b7'
 const SPEAK_DOTS: LedDot[] = [
   // 眼
-  {x:58,y:58},{x:72,y:58},{x:86,y:58},{x:58,y:72},{x:72,y:72},{x:86,y:72},{x:58,y:86},{x:72,y:86},{x:86,y:86},
-  {x:194,y:58},{x:208,y:58},{x:222,y:58},{x:194,y:72},{x:208,y:72},{x:222,y:72},{x:194,y:86},{x:208,y:86},{x:222,y:86},
+  { x: 58, y: 58 },
+  { x: 72, y: 58 },
+  { x: 86, y: 58 },
+  { x: 58, y: 72 },
+  { x: 72, y: 72 },
+  { x: 86, y: 72 },
+  { x: 58, y: 86 },
+  { x: 72, y: 86 },
+  { x: 86, y: 86 },
+  { x: 194, y: 58 },
+  { x: 208, y: 58 },
+  { x: 222, y: 58 },
+  { x: 194, y: 72 },
+  { x: 208, y: 72 },
+  { x: 222, y: 72 },
+  { x: 194, y: 86 },
+  { x: 208, y: 86 },
+  { x: 222, y: 86 },
   // 三段嘴
-  {x:110,y:136},{x:126,y:138},{x:140,y:140},{x:154,y:138},{x:170,y:136},
-  {x:120,y:148},{x:140,y:150},{x:160,y:148},
+  { x: 110, y: 136 },
+  { x: 126, y: 138 },
+  { x: 140, y: 140 },
+  { x: 154, y: 138 },
+  { x: 170, y: 136 },
+  { x: 120, y: 148 },
+  { x: 140, y: 150 },
+  { x: 160, y: 148 }
 ]
 
 const ENCOURAGE_COLOR = '#36c7b7'
 const ENCOURAGE_DOTS: LedDot[] = [
-  {x:58,y:58},{x:72,y:58},{x:86,y:58},{x:58,y:72},{x:72,y:72},{x:86,y:72},{x:58,y:86},{x:72,y:86},{x:86,y:86},
-  {x:194,y:58},{x:208,y:58},{x:222,y:58},{x:194,y:72},{x:208,y:72},{x:222,y:72},{x:194,y:86},{x:208,y:86},{x:222,y:86},
-  {x:104,y:136},{x:118,y:144},{x:132,y:148},{x:148,y:148},{x:162,y:144},{x:176,y:136},
-  {x:44,y:100,color:'#f1aaaa'},{x:236,y:100,color:'#f1aaaa'},
+  { x: 58, y: 58 },
+  { x: 72, y: 58 },
+  { x: 86, y: 58 },
+  { x: 58, y: 72 },
+  { x: 72, y: 72 },
+  { x: 86, y: 72 },
+  { x: 58, y: 86 },
+  { x: 72, y: 86 },
+  { x: 86, y: 86 },
+  { x: 194, y: 58 },
+  { x: 208, y: 58 },
+  { x: 222, y: 58 },
+  { x: 194, y: 72 },
+  { x: 208, y: 72 },
+  { x: 222, y: 72 },
+  { x: 194, y: 86 },
+  { x: 208, y: 86 },
+  { x: 222, y: 86 },
+  { x: 104, y: 136 },
+  { x: 118, y: 144 },
+  { x: 132, y: 148 },
+  { x: 148, y: 148 },
+  { x: 162, y: 144 },
+  { x: 176, y: 136 },
+  { x: 44, y: 100, color: '#f1aaaa' },
+  { x: 236, y: 100, color: '#f1aaaa' }
 ]
 
 const REST_COLOR = '#36c7b7'
 const REST_DOTS: LedDot[] = [
   // 半闭眼 — 横条
-  {x:58,y:70},{x:72,y:70},{x:86,y:70},
-  {x:194,y:70},{x:208,y:70},{x:222,y:70},
+  { x: 58, y: 70 },
+  { x: 72, y: 70 },
+  { x: 86, y: 70 },
+  { x: 194, y: 70 },
+  { x: 208, y: 70 },
+  { x: 222, y: 70 },
   // 小弧嘴
-  {x:118,y:136},{x:132,y:142},{x:148,y:142},{x:162,y:136},
+  { x: 118, y: 136 },
+  { x: 132, y: 142 },
+  { x: 148, y: 142 },
+  { x: 162, y: 136 }
 ]
 
 function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
   switch (state) {
-    case 'listening': return { dots: LISTEN_DOTS, color: LISTEN_COLOR }
-    case 'processing': return { dots: THINKING_DOTS, color: THINKING_COLOR }
-    case 'answering': return { dots: SPEAK_DOTS, color: SPEAK_COLOR }
-    case 'encourage': return { dots: ENCOURAGE_DOTS, color: ENCOURAGE_COLOR }
-    case 'rest': return { dots: REST_DOTS, color: REST_COLOR }
-    default: return { dots: HAPPY_DOTS, color: HAPPY_COLOR }
+    case 'listening':
+      return { dots: LISTEN_DOTS, color: LISTEN_COLOR }
+    case 'processing':
+      return { dots: THINKING_DOTS, color: THINKING_COLOR }
+    case 'answering':
+      return { dots: SPEAK_DOTS, color: SPEAK_COLOR }
+    case 'encourage':
+      return { dots: ENCOURAGE_DOTS, color: ENCOURAGE_COLOR }
+    case 'rest':
+      return { dots: REST_DOTS, color: REST_COLOR }
+    default:
+      return { dots: HAPPY_DOTS, color: HAPPY_COLOR }
   }
 }
 </script>
