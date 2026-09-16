@@ -125,6 +125,10 @@ class MedicalQAAgent:
     async def _search(
         self, ctx: AgentContext, budget: dict[str, int]
     ) -> list[RetrievalHit]:
+        # #55A-B CALL-TIME quota: checked BEFORE the gateway call, so a zero or
+        # exhausted grant makes the call impossible — never a post-hoc count
+        if budget["calls"] >= budget["ceiling"]:
+            return []
         result = await self._tools.ainvoke(
             ctx,  # trusted identity: the gateway derives tenant/session/run here
             ToolRequest(
@@ -262,7 +266,15 @@ class MedicalQAAgent:
         All mutable run state (tool budget) lives in a per-run dict so
         concurrent runs on one shared agent instance can never interleave
         counters (the budget is a security control, not shared state)."""
-        budget = {"calls": 0}
+        # #55A-B: the ceiling is the MIN of the agent's own limit and the
+        # run-cumulative leftover the Manager granted for THIS engagement —
+        # a revision can never start a fresh quota
+        granted = (
+            context.tool_budget_granted
+            if context.tool_budget_granted is not None
+            else self._max_tool_calls
+        )
+        budget = {"calls": 0, "ceiling": min(self._max_tool_calls, granted)}
         if not (context.normalized_input or "").strip():
             return self._execution(
                 status=AgentStatus.FAILED, safety="invalid_input", tool_calls=0
@@ -273,8 +285,8 @@ class MedicalQAAgent:
         evidence: list[Evidence] = []
         grounded: list[str] = []
         for hit in hits[: self._max_fragments]:
-            if budget["calls"] >= self._max_tool_calls:
-                break
+            if budget["calls"] >= budget["ceiling"]:
+                break  # call-time quota: the read never even starts
             verified = await self._read_fragment(context, hit, budget)
             if verified is None:
                 continue  # unusable/unverifiable read: this candidate is dropped

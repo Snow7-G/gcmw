@@ -550,6 +550,12 @@ class RunExecutor:
             "actions": list(result.actions),
             "content_origin": ContentOrigin.APPROVED_FAQ.value,
         }
+        # #55A-B: the ONLY model provenance on the wire is the trusted
+        # server-side configuration the Manager verified (AgentResult.model) —
+        # never anything a model output claimed. A Manager that did not attach
+        # it simply publishes no provenance at all.
+        if result.model:
+            completed["model"] = result.model
         if not await append(SSEEventType.ANSWER_COMPLETED, completed):
             return
 

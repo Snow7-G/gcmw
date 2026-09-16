@@ -303,6 +303,22 @@ def build_event(
             f"data keys {sorted(unknown)} not allowed for {event_type.value}",
         )
     if event_type is SSEEventType.ANSWER_COMPLETED:
+        # #55A-B: when a model provenance block is present it must be the
+        # COMPLETE trusted triple with non-empty values — partial or forged
+        # provenance is refused before any write
+        model = payload.get("model")
+        if model is not None:
+            required = {"provider_id", "model_id", "model_version"}
+            if (
+                not isinstance(model, dict)
+                or set(model) != required
+                or not all(isinstance(v, str) and v.strip() for v in model.values())
+            ):
+                raise RunRepositoryError(
+                    RunRepositoryFault.INVARIANT,
+                    "answer.completed model provenance must be the complete "
+                    "trusted triple",
+                )
         origin = payload.get("content_origin")
         valid_origins = {member.value for member in ContentOrigin}
         if origin not in valid_origins:

@@ -443,6 +443,7 @@ class ManagerAgent:
         risk_rules: RiskRules | None = None,
         clock: Callable[[], datetime] | None = None,
         limits: ManagerLimits | None = None,
+        trusted_model_provenance: Mapping[str, tuple[str, str, str]] | None = None,
     ) -> None:
         self._registry = registry
         self._runners: dict[str, AgentRunner] = dict(agent_runners or {})
@@ -467,6 +468,15 @@ class ManagerAgent:
         self._risk_rules = risk_rules
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._limits = limits or ManagerLimits()
+        # #55A-B trusted model provenance: agent_id -> (provider_id, model_id,
+        # model_version), read from the server-side ModelGateway/Provider
+        # configuration by the assembly. Anything the sub-agent (or the model
+        # output) claims about its own identity is DISCARDED and overwritten
+        # with these values in ``_trusted_snapshot`` — a forged provenance can
+        # never reach the verdict, the markers or the delivered result.
+        self._trusted_provenance: dict[str, tuple[str, str, str]] = dict(
+            trusted_model_provenance or {}
+        )
 
     # -- guard ----------------------------------------------------------------
 
@@ -671,6 +681,24 @@ class ManagerAgent:
             raise ManagerAgentError(
                 ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
             )
+        # #55A-B: provenance is SERVER-SIDE ONLY. Whatever the sub-agent (or
+        # the model output) claimed is discarded and replaced with the trusted
+        # ModelGateway/Provider configuration for this agent — a forged
+        # provider/model identity can never reach the verdict or the SSE layer.
+        trusted = self._trusted_provenance.get(agent_id)
+        provenance = (
+            {
+                "provider_id": trusted[0],
+                "model_id": trusted[1],
+                "model_version": trusted[2],
+            }
+            if trusted is not None
+            else {
+                "provider_id": raw.provider_id,
+                "model_id": raw.model_id,
+                "model_version": raw.model_version,
+            }
+        )
         return AgentExecution(
             agent_id=agent_id,
             status=raw.status,
@@ -679,10 +707,8 @@ class ManagerAgent:
                 self._validated_evidence_copy(item) for item in raw.evidence
             ),
             tool_calls=tool_calls,
-            provider_id=raw.provider_id,
-            model_id=raw.model_id,
-            model_version=raw.model_version,
             safety_status=raw.safety_status,
+            **provenance,
         )
 
     # -- execute ----------------------------------------------------------------
@@ -760,9 +786,17 @@ class ManagerAgent:
         # verifier both read it from ``AgentContext.risk_level`` (the same
         # contract enum), so a high-risk decision cannot be downgraded silently
         # by a downstream fast path that only inspects the context.
+        # #55A-B CALL-TIME tool quota: the sub-agent is granted the LEFTOVER of
+        # the run-cumulative budget for THIS engagement (revisions re-granted
+        # below see less), and must check it BEFORE each gateway call — never a
+        # post-hoc accounting alone. Zero left = zero calls possible.
         sub_ctx = ctx.model_copy(
             deep=True,
-            update={"normalized_input": cleaned, "risk_level": risk},
+            update={
+                "normalized_input": cleaned,
+                "risk_level": risk,
+                "tool_budget_granted": self._limits.max_tool_calls,
+            },
         )
         runner = self._runners[agent_id]
         run_tool_calls = 0  # whole-run total: first execution + every revision
@@ -818,8 +852,18 @@ class ManagerAgent:
             ):
                 revisions += 1
                 self._mark(actions, "verify.revise", revision=revisions)
+                # #55A-B: the revision is granted ONLY the leftover of the
+                # run-cumulative tool budget — counts accumulate across
+                # revisions, so a revision can never start a fresh quota
+                sub_ctx = sub_ctx.model_copy(
+                    update={
+                        "tool_budget_granted": max(
+                            0, self._limits.max_tool_calls - run_tool_calls
+                        )
+                    }
+                )
                 raw = await self._run_with_deadline(
-                    lambda: runner(sub_ctx), self._remaining_ms(ctx)
+                    lambda sc=sub_ctx: runner(sc), self._remaining_ms(ctx)
                 )
                 execution = self._trusted_snapshot(raw, agent_id=agent_id)
                 run_tool_calls += execution.tool_calls
@@ -830,7 +874,7 @@ class ManagerAgent:
                     break
                 verifier_view = self._trusted_snapshot(execution, agent_id=agent_id)
                 verdict = await self._run_with_deadline(
-                    lambda view=verifier_view: verifier(sub_ctx, view),
+                    lambda sc=sub_ctx, view=verifier_view: verifier(sc, view),
                     self._remaining_ms(ctx),
                 )
                 self._mark(actions, "verify.verdict", outcome=verdict.outcome.value)
@@ -895,6 +939,11 @@ class ManagerAgent:
             answer=delivered.answer_candidate,
             safety="verified",
             confidence="high",
+            model_provenance={
+                "provider_id": delivered.provider_id,
+                "model_id": delivered.model_id,
+                "model_version": delivered.model_version,
+            },
         )
 
     # -- helpers ---------------------------------------------------------------
@@ -986,6 +1035,7 @@ class ManagerAgent:
         answer: str,
         safety: str,
         confidence: str | None = None,
+        model_provenance: dict[str, str] | None = None,
     ) -> AgentResult:
         return AgentResult(
             agent_id="manager",
@@ -995,4 +1045,7 @@ class ManagerAgent:
             actions=actions,
             confidence_band=confidence,
             safety_status=safety,
+            # #55A-B: ONLY the trusted server-side provenance reaches the
+            # public result (and from there the SSE layer); refusals carry none
+            model=model_provenance,
         )

@@ -91,7 +91,7 @@ EVENT_DATA_ALLOWED_KEYS: dict[SSEEventType, frozenset[str]] = {
     SSEEventType.HEARTBEAT: frozenset(),
     SSEEventType.ANSWER_DELTA: frozenset({"delta"}),
     SSEEventType.ANSWER_COMPLETED: frozenset(
-        {"citations", "actions", "content_origin"}
+        {"citations", "actions", "content_origin", "model"}
     ),
     SSEEventType.RUN_COMPLETED: frozenset({"status", "result"}),
     SSEEventType.MIC_STATUS: frozenset({"state", "status", "message"}),
