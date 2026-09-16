@@ -1,4 +1,5 @@
-"""#40 后端演示收口：一条命令的后端演示 + 五个合成场景验收。
+"""后端 MVP 一键五场景验收（路线图"演示收口"）：一条命令的后端演示 +
+五个合成场景验收。
 
 用法::
 
@@ -285,13 +286,24 @@ def scenario_1_cited_answer(client: DemoClient, session_id: str) -> str:
     payload = completed["data"]["data"]
     citations = payload["citations"]
     _check(len(citations) >= 1, "answer.completed 缺引用")
-    _check(
-        all(
-            c.get("content_hash") and c.get("source_id") and c.get("title")
-            for c in citations
-        ),
-        f"引用三元组字段不全: {citations}",
-    )
+    # 可核验引用三元组：source_id + knowledge_version + content_hash 三者
+    # 非空缺一不可（content_hash 必须是 64 位十六进制 SHA-256）；PR 描述
+    # 声称的 title/source_uri 也分别断言存在，防止描述与脚本漂移假绿
+    for c in citations:
+        _check(
+            c.get("source_id") and c.get("knowledge_version") and c.get("content_hash"),
+            f"引用三元组缺字段（source_id/knowledge_version/content_hash）: {c}",
+        )
+        _check(
+            isinstance(c.get("content_hash"), str)
+            and len(c["content_hash"]) == 64
+            and all(ch in "0123456789abcdef" for ch in c["content_hash"]),
+            f"content_hash 应为 64 位十六进制: {c.get('content_hash')!r}",
+        )
+        _check(
+            c.get("title") and c.get("source_uri"),
+            f"引用展示字段缺失（title/source_uri）: {c}",
+        )
     _check(
         payload["content_origin"] == "approved_faq",
         f"content_origin 应为 approved_faq: {payload['content_origin']}",
@@ -393,6 +405,15 @@ def scenario_4_cancel_and_resume(client: DemoClient, session_id: str) -> None:
     _check("answer.completed" not in names, "已取消运行不得有答案帧")
 
 
+def _assert_acl_denied(client: DemoClient, target_run_id: str, who: str) -> None:
+    """凭据对目标运行的 GET 与 events GET 都必须 403，且响应零流字节。"""
+    res = client._client.get(f"{client.base}/api/v1/agent/runs/{target_run_id}")
+    _check(res.status_code == 403, f"{who}读运行应 403: {res.status_code}")
+    res = client._client.get(f"{client.base}/api/v1/agent/runs/{target_run_id}/events")
+    _check(res.status_code == 403, f"{who}读事件流应 403: {res.status_code}")
+    _check("data:" not in res.text, f"{who}的 403 响应不得携带任何流字节")
+
+
 def scenario_5_isolation(client: DemoClient, session_id: str) -> None:
     """场景 5：租户/设备隔离 — 知识按租户发布、运行按设备属主。"""
     # 自建一个 t1/d1 的目标运行（隔离探测的对象）
@@ -400,7 +421,8 @@ def scenario_5_isolation(client: DemoClient, session_id: str) -> None:
     client.wait_terminal(target["run_id"])
     target_run_id = target["run_id"]
 
-    # 5a. 异租户：知识未对 t2 发布 → 无证据拒答
+    # 5a. 异租户：知识未对 t2 发布 → 无证据拒答（锁定具体拒绝标记，部署
+    # 故障之类的普通 FAILED 不能冒充隔离成功）
     other = DemoClient(client.base, TOKEN_OTHER_TENANT)
     try:
         session_t2 = other.create_session()
@@ -409,26 +431,25 @@ def scenario_5_isolation(client: DemoClient, session_id: str) -> None:
             other.wait_terminal(run["run_id"]) == "FAILED",
             "异租户有知识问题应 FAILED（隔离）",
         )
-        names = [f["event"] for f in _frames(other.events(run["run_id"]))]
+        frames = _frames(other.events(run["run_id"]))
+        names = [f["event"] for f in frames]
         _check("answer.completed" not in names, "异租户不得拿到 t1 的知识答案")
+        result = next(f for f in frames if f["event"] == "run.completed")["data"][
+            "data"
+        ].get("result")
+        _check(
+            result == "refused_no_answer",
+            f"异租户拒绝标记应为 refused_no_answer: {result}",
+        )
+        # 5b. 异租户凭据直接读 t1/d1 的运行与事件流：必须 403 且零流字节
+        _assert_acl_denied(other, target_run_id, "异租户")
     finally:
         other.close()
 
-    # 5b. 同租户异设备：访问 d1 的运行必须 403
+    # 5c. 同租户异设备：访问 d1 的运行必须 403 且零流字节
     same_tenant = DemoClient(client.base, TOKEN_SAME_TENANT)
     try:
-        res = same_tenant._client.get(
-            f"{client.base}/api/v1/agent/runs/{target_run_id}"
-        )
-        _check(res.status_code == 403, f"异设备读运行应 403: {res.status_code}")
-        res = same_tenant._client.get(
-            f"{client.base}/api/v1/agent/runs/{target_run_id}/events"
-        )
-        _check(res.status_code == 403, f"异设备读事件流应 403: {res.status_code}")
-        _check(
-            "data:" not in res.text,
-            "403 响应不得携带任何流字节",
-        )
+        _assert_acl_denied(same_tenant, target_run_id, "异设备")
     finally:
         same_tenant.close()
 
@@ -573,7 +594,7 @@ def main() -> int:
         if not args.serve:
             stop_server(server)
 
-    print("\n===== #40 后端演示收口 =====")
+    print("\n===== 后端 MVP 五场景验收 =====")
     failed = [r for r in results if r[1] != "PASS"]
     for name, status in results:
         print(f"  {status:<6} {name}")
