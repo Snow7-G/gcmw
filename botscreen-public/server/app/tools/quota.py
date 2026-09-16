@@ -9,19 +9,34 @@ the gateway's own submission boundary, so the quota lives there:
   execution and every revision share the SAME state (counts accumulate across
   revisions, never reset);
 * the quota object travels in a :class:`~contextvars.ContextVar`, so it needs
-  no global run-id registry and is released when the Manager's task context
-  ends;
-* ``ToolGateway._prepare`` calls :meth:`RunToolQuota.try_acquire` as its LAST
-  gate — atomically, BEFORE ``_submit`` — so an exhausted quota means zero
+  no global run-id registry;
+* ``ToolGateway._prepare`` calls :meth:`RunToolQuota.acquire` as its LAST gate
+  — atomically, BEFORE ``_submit()`` — so an exhausted quota means zero
   executions, and the refusal is audited like any other gate denial;
 * a unit is consumed when the attempt STARTS: a timeout, a tool fault or a
   cancellation afterwards never refunds it.
+
+LIFETIME — explicit close, not context teardown: ``ContextVar.reset()`` only
+unbinds the CURRENT task. ``asyncio.create_task()`` copies the context, so a
+background task spawned by a runner would keep holding a live quota object and
+could make LATE tool calls after the Manager returned, timed out or was
+cancelled. The Manager therefore calls :meth:`RunToolQuota.close` FIRST in its
+``finally``: close is atomic under the same lock as acquire, so every context
+holding the object — current or copied — sees the quota as closed and every
+late acquire is refused (audited as ``rejected:tool_quota_closed``). Calls
+that acquired BEFORE the close are allowed to finish; nothing is refunded and
+the quota never reopens.
 """
 
 from __future__ import annotations
 
 import threading
 from contextvars import ContextVar
+
+#: outcomes of :meth:`RunToolQuota.acquire`
+GRANTED = "granted"
+EXHAUSTED = "exhausted"
+CLOSED = "closed"
 
 
 class RunToolQuota:
@@ -34,22 +49,46 @@ class RunToolQuota:
         self._lock = threading.Lock()
         self._remaining = limit
         self._consumed = 0
-        self._refused = 0
+        self._refused_exhausted = 0
+        self._refused_closed = 0
+        self._closed = False
 
-    def try_acquire(self) -> bool:
-        """Atomically reserve ONE tool call.
+    def acquire(self) -> str:
+        """Atomically reserve ONE tool call; returns ``GRANTED``,
+        ``EXHAUSTED`` or ``CLOSED``.
 
         Synchronous on purpose: check-and-decrement happen without an await,
-        and the lock also covers pool-thread callers. ``False`` means the
-        budget is exhausted — the gateway must refuse BEFORE submission, with
-        zero side effects."""
+        and the lock also covers pool-thread callers. Any non-granted outcome
+        means the gateway must refuse BEFORE submission, with zero side
+        effects. A close always wins over a later acquire — the two are
+        serialized by the same lock, so after :meth:`close` returns, no
+        context holding this object can ever acquire again."""
         with self._lock:
+            if self._closed:
+                self._refused_closed += 1
+                return CLOSED
             if self._remaining <= 0:
-                self._refused += 1
-                return False
+                self._refused_exhausted += 1
+                return EXHAUSTED
             self._remaining -= 1
             self._consumed += 1
-            return True
+            return GRANTED
+
+    def try_acquire(self) -> bool:
+        """Convenience wrapper: ``True`` iff :meth:`acquire` granted."""
+        return self.acquire() == GRANTED
+
+    def close(self) -> None:
+        """Atomically close the quota: every later acquire — in ANY context
+        that copied this object — is refused as ``CLOSED``. Irreversible: no
+        refund, no reopen. Calls that already acquired may finish."""
+        with self._lock:
+            self._closed = True
+
+    @property
+    def closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     @property
     def consumed(self) -> int:
@@ -58,10 +97,16 @@ class RunToolQuota:
             return self._consumed
 
     @property
-    def refused(self) -> int:
-        """How many calls the boundary refused (audit/ops probe)."""
+    def refused_exhausted(self) -> int:
+        """Calls refused because the budget ran out."""
         with self._lock:
-            return self._refused
+            return self._refused_exhausted
+
+    @property
+    def refused_closed(self) -> int:
+        """LATE calls refused because the run had already ended."""
+        with self._lock:
+            return self._refused_closed
 
 
 _quota_var: ContextVar[RunToolQuota | None] = ContextVar(
@@ -75,7 +120,8 @@ def set_run_quota(quota: RunToolQuota) -> object:
 
 
 def reset_run_quota(token: object) -> None:
-    """Release the binding (the Manager's ``finally``)."""
+    """Unbind the CURRENT task only — NOT enough to stop copied contexts.
+    Always pair with :meth:`RunToolQuota.close` (called first)."""
     _quota_var.reset(token)  # type: ignore[arg-type]
 
 

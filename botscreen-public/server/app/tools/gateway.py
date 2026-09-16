@@ -59,7 +59,7 @@ from app.contracts.agent import ToolRequest, ToolResult
 from app.contracts.audit import AuditRecord
 from app.contracts.common import TenantContext
 from app.contracts.errors import ErrorCode, lookup
-from app.tools.quota import current_run_quota
+from app.tools.quota import EXHAUSTED, GRANTED, current_run_quota
 from app.tools.specs import READONLY_TOOL_NAMES, ToolSpec
 from app.tools.validation import validate
 
@@ -474,14 +474,24 @@ class ToolGateway:
         # like every other gate denial. A started attempt (timeout / tool fault
         # / cancellation) is never refunded.
         quota = current_run_quota()
-        if quota is not None and not quota.try_acquire():
-            audit(
-                result="rejected:tool_quota_exhausted",
-                code=ErrorCode.TOOL_OVER_LIMIT,
-            )
-            raise ToolGatewayError(
-                ErrorCode.TOOL_OVER_LIMIT, "run tool quota is exhausted"
-            )
+        if quota is not None:
+            outcome = quota.acquire()
+            if outcome != GRANTED:
+                # DISTINGUISHABLE refusals: the budget ran out vs the run has
+                # already ended (a LATE call from a context that copied the
+                # quota). Same public error code, different audit markers.
+                result = (
+                    "rejected:tool_quota_exhausted"
+                    if outcome == EXHAUSTED
+                    else "rejected:tool_quota_closed"
+                )
+                message = (
+                    "run tool quota is exhausted"
+                    if outcome == EXHAUSTED
+                    else "run has ended: the tool quota is closed"
+                )
+                audit(result=result, code=ErrorCode.TOOL_OVER_LIMIT)
+                raise ToolGatewayError(ErrorCode.TOOL_OVER_LIMIT, message)
 
         return _Prepared(
             spec=spec,

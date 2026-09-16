@@ -767,13 +767,18 @@ class ManagerAgent:
         # #55A-B: ONE Manager-owned, run-wide tool quota binds to THIS task's
         # context — the ToolGateway acquires from it atomically before every
         # submission, so the enforcement is INSIDE the gateway, not an integer
-        # the sub-agent may ignore. The ContextVar needs no global registry and
-        # is released when this task context ends.
+        # the sub-agent may ignore.
+        # LIFETIME: the ContextVar reset only unbinds THIS task — a background
+        # task spawned by a runner holds a COPY of the context and would keep
+        # the quota alive. The quota is therefore CLOSED first (atomic, same
+        # lock as acquire): every context holding the object, current or
+        # copied, refuses all late calls once the Manager has ended.
         quota = RunToolQuota(self._limits.max_tool_calls)
         quota_token = set_run_quota(quota)
         try:
             return await self._execute_turn(ctx, text, on_stage, quota)
         finally:
+            quota.close()  # BEFORE the reset: kills every copied context too
             reset_run_quota(quota_token)
 
     async def _execute_turn(
