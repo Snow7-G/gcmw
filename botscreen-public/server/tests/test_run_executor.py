@@ -1327,3 +1327,64 @@ class TestNoNestedFreshGrace:
         # the fault is reported — total ≈ 0.2, NOT 0.1 + a fresh 0.2 (= 0.3)
         assert elapsed < 0.25
         assert FaultCategory.TERMINALIZATION in [c for c, _ in faults]
+
+
+# -- sixth-review counterexample: the sealed-answer invariant lives INSIDE the
+#    repository's atomic commit boundary (the executor check-then-act had a
+#    TOCTOU window a concurrent seal could slip through)
+
+
+class _ConcurrentSealWinsRepository(_StallAppendRepository):
+    """The executor's tail check passes; a concurrent writer commits
+    answer.completed INSIDE the check→commit window; the repository's atomic
+    boundary then refuses the FAILED with the distinguishable ANSWER_SEALED."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__(delay_s)
+        self.raced = False
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if next_state is RunState.FAILED and not self.raced:
+            self.raced = True
+            # the concurrent writer wins the race right here — a legal seal,
+            # because the run is STREAMING and not yet sealed
+            await super().append_event(
+                identity,
+                event_type=SSEEventType.ANSWER_COMPLETED,
+                data={
+                    "citations": [],
+                    "actions": [],
+                    "content_origin": "approved_faq",
+                },
+            )
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class TestConcurrentSealRace:
+    @mark.asyncio
+    async def test_a_concurrent_seal_wins_over_the_budget_failed(self):
+        """The reviewer's deterministic probe: tail check (no seal) →
+        concurrent answer.completed → FAILED commit. With the invariant in the
+        commit boundary the FAILED is refused zero-write and the executor
+        finalizes COMPLETED/answered within the same grace."""
+        faults: list = []
+        repository = _ConcurrentSealWinsRepository(delay_s=0.3)
+        stack = _stack(
+            run_timeout_ms=100,
+            repository=repository,
+            fault_sink=lambda c, r: faults.append((c, r)),
+        )
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-race")
+        state = await _drain(stack, identity, timeout_s=5)
+        assert state is RunState.COMPLETED  # NEVER FAILED over a sealed answer
+        events = await stack.events(identity)
+        assert len(_by_type(events, SSEEventType.ANSWER_COMPLETED)) == 1
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_ANSWERED
+        seqs = sorted(e.seq for e in events)
+        assert seqs == list(range(1, len(seqs) + 1))  # no holes, no duplicates

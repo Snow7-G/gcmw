@@ -407,6 +407,14 @@ class RunExecutor:
                     target=target, event_type=None, marker=RESULT_DEADLINE
                 )
             except RunRepositoryError as exc:
+                if exc.fault is RunRepositoryFault.ANSWER_SEALED:
+                    # the atomic boundary proved a seal landed concurrently:
+                    # the answer is out, so this run may only end COMPLETED
+                    aborted = True
+                    await self._finalize_answered(
+                        identity, time.monotonic() + self._terminalization_grace_s
+                    )
+                    return False
                 if exc.fault is RunRepositoryFault.UNAVAILABLE:
                     # a Redis/Lua write may STILL have landed: unknown result
                     return await reconcile_unknown(
@@ -643,6 +651,12 @@ class RunExecutor:
             except RunRepositoryError as exc:
                 if exc.fault is RunRepositoryFault.NOT_FOUND:
                     return  # the record is gone: normal exit
+                if exc.fault is RunRepositoryFault.ANSWER_SEALED:
+                    # the repository's ATOMIC boundary just proved a concurrent
+                    # seal landed after our tail check: finish COMPLETED within
+                    # the SAME remaining grace — never FAILED
+                    await self._finalize_answered(identity, deadline)
+                    return
                 if exc.fault is not RunRepositoryFault.CAS_CONFLICT:
                     # UNAVAILABLE / INVARIANT / ILLEGAL_TRANSITION: never
                     # pretend the run was sealed

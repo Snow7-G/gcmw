@@ -88,6 +88,7 @@ _CODE_STATE_MISMATCH = -7  # CAS conflict
 _CODE_STATE_NOT_ALLOWED = -8  # event/state whitelist or answer already sealed
 _CODE_ANSWER_REQUIRED = -9  # STREAMING -> COMPLETED without answer.completed
 _CODE_CORRUPT_TAIL = -10  # newest stream entry is malformed / misidentified
+_CODE_ANSWER_SEALED = -11  # FAILED refused: the newest event is answer.completed
 
 #: state-preserving events and the states they may be written in.
 #: ``heartbeat`` is intentionally absent: B-1 defines it as a comment frame
@@ -110,6 +111,7 @@ SEALING_EVENT_TYPES = frozenset({SSEEventType.ANSWER_COMPLETED})
 
 class RunRepositoryFault(str, Enum):
     CAS_CONFLICT = "cas_conflict"
+    ANSWER_SEALED = "answer_sealed"
     CONCURRENT_MODIFICATION = "concurrent_modification"
     NOT_FOUND = "not_found"
     UNAVAILABLE = "unavailable"
@@ -127,6 +129,9 @@ class RunRepositoryError(RuntimeError):
         RunRepositoryFault.UNAVAILABLE: ErrorCode.UNAVAILABLE_OVERLOADED,
         RunRepositoryFault.INVARIANT: ErrorCode.INTERNAL_UNKNOWN,
         RunRepositoryFault.ILLEGAL_TRANSITION: ErrorCode.CONFLICT_ACTIVE_RUN,
+        # never surfaced to a client as an error: the executor catches it and
+        # finalizes COMPLETED/answered (a sealed answer must not end FAILED)
+        RunRepositoryFault.ANSWER_SEALED: ErrorCode.INTERNAL_UNKNOWN,
     }
 
     def __init__(self, fault: RunRepositoryFault, message: str = "") -> None:
@@ -461,6 +466,19 @@ class MemoryRunRepository:
                     RunRepositoryFault.INVARIANT,
                     "STREAMING -> COMPLETED requires a prior answer.completed",
                 )
+            if next_state is RunState.FAILED and self._answer_sealed(record):
+                # ATOMIC sealed-answer invariant (zero-write refusal): the
+                # newest event IS answer.completed, so a FAILED terminal would
+                # contradict an answer the client already received. This is
+                # enforced HERE — inside the commit boundary — because an
+                # executor-side check-then-act leaves a TOCTOU window in which
+                # a concurrent seal lands between the check and the FAILED.
+                # Distinguishable on purpose: the caller finalizes COMPLETED.
+                raise RunRepositoryError(
+                    RunRepositoryFault.ANSWER_SEALED,
+                    f"run {identity.run_id!r}: newest event is answer.completed "
+                    "— FAILED would contradict a delivered answer",
+                )
             event_type = SSEEventType(transition_event_type(next_state))
             seq = record.latest_seq + 1
             # authoritative stage/status come from the target state
@@ -636,6 +654,27 @@ if redis.call('HGET', KEYS[1], 'session_id') ~= ARGV[3] then return -4 end
 if redis.call('EXISTS', KEYS[2]) == 0 then return -5 end
 if redis.call('HGET', KEYS[1], 'terminal_seq') then return -3 end
 if redis.call('HGET', KEYS[1], 'state') ~= ARGV[4] then return -7 end
+if ARGV[6] == 'FAILED' then
+  -- ATOMIC sealed-answer invariant, zero-write refusal: if the REAL newest
+  -- event is answer.completed, a FAILED terminal would contradict an answer
+  -- the client already received. Enforced inside this atomic window because
+  -- an executor-side check-then-act leaves a TOCTOU gap. Distinguishable
+  -- on purpose (-11): the caller finalizes COMPLETED instead.
+  local lastf = redis.call('XREVRANGE', KEYS[2], '+', '-', 'COUNT', 1)
+  if lastf[1] then
+    local fieldsf = lastf[1][2]
+    local payloadf = nil
+    for i = 1, #fieldsf - 1, 2 do
+      if fieldsf[i] == 'event' then payloadf = fieldsf[i + 1] end
+    end
+    if payloadf ~= nil then
+      local okf, decodedf = pcall(cjson.decode, payloadf)
+      if okf and type(decodedf) == 'table' and decodedf['event'] == 'answer.completed' then
+        return -11
+      end
+    end
+  end
+end
 if ARGV[11] == '1' then
   -- the seal must be proven by the REAL newest event, not a cached bit, and
   -- only inside this atomic window (no TOCTOU gap)
@@ -1177,6 +1216,12 @@ class RedisRunRepository:
             return RunRepositoryError(
                 RunRepositoryFault.INVARIANT,
                 "stream tail is corrupt or misidentified",
+            )
+        if code == _CODE_ANSWER_SEALED:
+            return RunRepositoryError(
+                RunRepositoryFault.ANSWER_SEALED,
+                "newest event is answer.completed — FAILED is refused; "
+                "finalize COMPLETED instead",
             )
         if code == _CODE_ANSWER_REQUIRED:
             return RunRepositoryError(
