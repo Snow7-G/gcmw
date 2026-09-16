@@ -477,8 +477,14 @@ def verify_tool_quota_audit(audit: _AuditCapture, run_id: str) -> None:
 # -- 启动与编排 ------------------------------------------------------------------
 
 
-def start_server() -> SimpleNamespace:
-    """进程内启动真实 uvicorn + demo 装配（合成知识、MockProvider、零出网）。"""
+def start_server(
+    host: str = "127.0.0.1", port: int = 0, cors_for_dev_frontends: bool = False
+) -> SimpleNamespace:
+    """进程内启动真实 uvicorn + demo 装配（合成知识、MockProvider、零出网）。
+
+    ``port=0`` 自动选择端口（默认行为不变）；``cors_for_dev_frontends`` 只在
+    本 demo app 上挂精确的开发前端 Origin 白名单（/qa 页面跨源演示用），
+    绝不使用通配，也不影响 staging/production 的安全配置。"""
     import uvicorn
 
     settings = Settings(
@@ -506,8 +512,26 @@ def start_server() -> SimpleNamespace:
         agent_executor=True,  # demo 栈：合成已审核知识 + MockProvider
     )
 
+    if cors_for_dev_frontends:
+        # 精确白名单（禁止 "*"）：只放行本机开发前端。OPTIONS 预检由
+        # CORSMiddleware 在认证层之前应答；Authorization / Content-Type /
+        # Last-Event-ID 三个头被显式允许。未知 Origin 收不到任何 CORS 允许头。
+        from fastapi.middleware.cors import CORSMiddleware
+
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[
+                "http://localhost:5173",
+                "http://127.0.0.1:5173",
+            ],
+            allow_credentials=False,
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+            max_age=600,
+        )
+
     # 认证走真实 Bearer 头（entry guard 先于路由生效），不再覆盖依赖
-    config = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error")
+    config = uvicorn.Config(app, host=host, port=port, log_level="error")
     instance = uvicorn.Server(config)
     thread = threading.Thread(target=instance.run, daemon=True)
     thread.start()
@@ -516,12 +540,12 @@ def start_server() -> SimpleNamespace:
         time.sleep(0.05)
     if not instance.started:
         raise RuntimeError("uvicorn 未能在 30s 内启动")
-    port = instance.servers[0].sockets[0].getsockname()[1]
+    bound_port = instance.servers[0].sockets[0].getsockname()[1]
     return SimpleNamespace(
         app=app,
         instance=instance,
         thread=thread,
-        base=f"http://127.0.0.1:{port}",
+        base=f"http://{host}:{bound_port}",
         _env_name=env_name,
         _env_previous=previous,
     )
@@ -545,6 +569,22 @@ def main() -> int:
         action="store_true",
         help="场景全过后保持服务运行（Ctrl+C 结束），供人工演示",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="演示服务监听地址（默认 127.0.0.1）",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="演示服务监听端口；0=自动选择（默认），如 --port 8001",
+    )
+    parser.add_argument(
+        "--cors-for-dev-frontends",
+        action="store_true",
+        help="为本机开发前端（localhost:5173）加精确 CORS 白名单",
+    )
     args = parser.parse_args()
 
     logging.getLogger("gcmw.audit").setLevel(logging.WARNING)
@@ -555,7 +595,11 @@ def main() -> int:
     # 属预期行为 — 演示输出里静默它
     logging.getLogger("app.orchestration.executor").setLevel(logging.ERROR)
 
-    server = start_server()
+    server = start_server(
+        host=args.host,
+        port=args.port,
+        cors_for_dev_frontends=args.cors_for_dev_frontends,
+    )
     print(f"[demo] 服务已启动: {server.base}  (MockProvider · 合成数据 · 零出网)")
 
     results: list[tuple[str, str]] = []
