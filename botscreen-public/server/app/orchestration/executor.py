@@ -340,19 +340,20 @@ class RunExecutor:
                     )
                     if is_terminal_state(page.state):
                         return False  # sealed elsewhere; nothing to add
-                    latest = await self._durable_latest_event(
-                        identity, page, pass_deadline
+                    if event_type is SSEEventType.ANSWER_COMPLETED:
+                        # an unknown-result seal: check the TRUE tail — landed
+                        # → consistent COMPLETED; not landed → budget seal
+                        latest = await self._durable_latest_event(
+                            identity, page, pass_deadline
+                        )
+                        if latest is not None and latest.event is event_type:
+                            await self._finalize_answered(identity, pass_deadline)
+                            return False
+                    # everything else (and an unlanded seal) ends via the ONE
+                    # terminalization entry — SAME deadline, no fresh grace
+                    await self._terminalize(
+                        identity, marker=marker, deadline=pass_deadline
                     )
-                    if (
-                        event_type is SSEEventType.ANSWER_COMPLETED
-                        and latest is not None
-                        and latest.event is event_type
-                    ):
-                        # the answer IS sealed: finish consistently, retrying —
-                        # never FAILED after a sealed answer
-                        await self._finalize_answered(identity, pass_deadline)
-                        return False
-                    await self._terminalize(identity, marker=marker)
                     return False
                 # a state transition: adopt it if it durably landed
                 durable = await self._bounded(
@@ -366,18 +367,11 @@ class RunExecutor:
                     state = target
                     aborted = False
                     return True
-                # the write did NOT land. Before sealing FAILED, check whether
-                # the ANSWER is already sealed: a persisted answer.completed
-                # must end COMPLETED/answered (retrying), never FAILED.
-                page = await self._bounded(
-                    lambda: self._repository.snapshot(identity, 0, 0.0),
-                    pass_deadline,
-                )
-                latest = await self._durable_latest_event(identity, page, pass_deadline)
-                if latest is not None and latest.event is SSEEventType.ANSWER_COMPLETED:
-                    await self._finalize_answered(identity, pass_deadline)
-                    return False
-                await self._terminalize(identity, marker=marker)
+                # the write did NOT land: the ONE terminalization entry decides
+                # — including the sealed-answer invariant (a persisted
+                # answer.completed ends COMPLETED/answered, never FAILED) —
+                # under the SAME pass deadline
+                await self._terminalize(identity, marker=marker, deadline=pass_deadline)
                 return False
             except _TimeUp:
                 self._emit_fault(identity, FaultCategory.TERMINALIZATION)
@@ -568,7 +562,9 @@ class RunExecutor:
 
     # -- terminalization ------------------------------------------------------------
 
-    async def _terminalize(self, identity: Any, *, marker: str) -> None:
+    async def _terminalize(
+        self, identity: Any, *, marker: str, deadline: float | None = None
+    ) -> None:
         """THE one bounded terminalization entry point.
 
         Every "make this run terminal" need goes through here: budget stop,
@@ -577,7 +573,14 @@ class RunExecutor:
         * ONE monotonic deadline bounds the WHOLE pass — every read and write
           inside uses only the time that is left, so attempts can never stack
           into grace × attempts, and a hanging repository call cannot keep
-          this task alive;
+          this task alive. A caller that already holds a pass deadline (e.g.
+          :meth:`_run_turn`'s reconcile) MUST pass it in — a nested
+          terminalization never opens a fresh grace;
+        * **a SEALED ANSWER is invariant here**: before any ``FAILED`` is
+          written, the true durable event tail is checked, and a persisted
+          ``answer.completed`` routes the pass to the RETRYING
+          ``COMPLETED/answered`` finalize instead — a sealed answer can never
+          be followed by a FAILED terminal, whatever fault triggered this pass;
         * a CAS conflict is retried a bounded number of times after a RE-READ
           (the run may have moved to terminal in between);
         * ``NOT_FOUND`` and an already-terminal run are a NORMAL exit — the
@@ -586,7 +589,8 @@ class RunExecutor:
           as the fixed ``terminalization_fault`` — this method NEVER silently
           claims a run was sealed when it was not.
         """
-        deadline = time.monotonic() + self._terminalization_grace_s
+        if deadline is None:
+            deadline = time.monotonic() + self._terminalization_grace_s
         try:
             durable = await self._bounded(
                 lambda: self._repository.state(identity), deadline
@@ -599,9 +603,29 @@ class RunExecutor:
                 return  # the record is gone: normal exit
             self._emit_fault(identity, FaultCategory.TERMINALIZATION)
             return
+        if is_terminal_state(durable):
+            return  # sealed elsewhere: normal exit
+        # THE sealed-answer invariant: check the TRUE durable tail before any
+        # FAILED. If the answer is out, this run may only end COMPLETED.
+        try:
+            page = await self._bounded(
+                lambda: self._repository.snapshot(identity, 0, 0.0), deadline
+            )
+            latest = await self._durable_latest_event(identity, page, deadline)
+        except _TimeUp:
+            self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+            return
+        except RunRepositoryError as exc:
+            if exc.fault is RunRepositoryFault.NOT_FOUND:
+                return
+            self._emit_fault(identity, FaultCategory.TERMINALIZATION)
+            return
+        if latest is not None and latest.event is SSEEventType.ANSWER_COMPLETED:
+            await self._finalize_answered(identity, deadline)
+            return
         for _ in range(_TERMINALIZE_ATTEMPTS):
             if is_terminal_state(durable):
-                return  # sealed elsewhere: normal exit
+                return  # sealed elsewhere (e.g. a cancel won): normal exit
             try:
                 await self._bounded(
                     lambda d=durable: self._repository.commit_transition(
@@ -674,10 +698,13 @@ class RunExecutor:
         """A sealed answer must end ``COMPLETED/answered`` — RETRYING.
 
         One transient CAS conflict or UNAVAILABLE must never leave a sealed
-        answer FAILED: every attempt is preceded by a durable re-read, so a
-        commit that landed despite the error is ADOPTED and a run that ended
-        elsewhere (e.g. a cancel) is RESPECTED. Bounded attempts; exhaustion
-        is reported, never silently swallowed."""
+        answer FAILED — and the retry covers READS as well as writes: a first
+        ``state()`` that reports UNAVAILABLE (the store recovers a moment
+        later) is retried, because giving up here would leave a sealed answer
+        with NO terminal at all. Every attempt is preceded by a durable
+        re-read, so a commit that landed despite the error is ADOPTED and a
+        run that ended elsewhere (e.g. a cancel) is RESPECTED. Bounded
+        attempts; exhaustion is reported, never silently swallowed."""
         for _ in range(_TERMINALIZE_ATTEMPTS):
             try:
                 durable = await self._bounded(
@@ -689,6 +716,11 @@ class RunExecutor:
             except RunRepositoryError as exc:
                 if exc.fault is RunRepositoryFault.NOT_FOUND:
                     return
+                if exc.fault in (
+                    RunRepositoryFault.CAS_CONFLICT,
+                    RunRepositoryFault.UNAVAILABLE,
+                ):
+                    continue  # transient READ fault: retry the read
                 self._emit_fault(identity, FaultCategory.TERMINALIZATION)
                 return
             if is_terminal_state(durable):

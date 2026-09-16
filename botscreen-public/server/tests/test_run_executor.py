@@ -1147,3 +1147,183 @@ class TestSinglePassGrace:
         elapsed = time.monotonic() - started
         assert FaultCategory.TERMINALIZATION in [c for c, _ in faults]  # reported
         assert 0.04 <= elapsed < 0.15  # one grace, NOT attempts × grace
+
+
+# -- fifth-review counterexamples: the sealed-answer invariant inside the ONE
+#    terminalization entry, transient read retries, and no nested fresh grace
+
+
+class _StallAfterSealRepository(MemoryRunRepository):
+    """The answer.completed append COMMITS normally, then stalls before
+    returning — the run budget expires during the stall, so the COMPLETED
+    transition is only attempted once the budget is already gone."""
+
+    def __init__(self, delay_s: float) -> None:
+        super().__init__()
+        self.delay_s = delay_s
+        self.stalled = False
+
+    async def append_event(self, identity, *, event_type, data=None):
+        seq = await super().append_event(identity, event_type=event_type, data=data)
+        if event_type is SSEEventType.ANSWER_COMPLETED and not self.stalled:
+            self.stalled = True
+            await asyncio.sleep(self.delay_s)
+        return seq
+
+
+class _InvariantOnCompletedRepository(MemoryRunRepository):
+    """The FIRST commit TO COMPLETED raises INVARIANT — a definite refusal,
+    which sends the executor into its fault epilogue."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.spent = False
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if next_state is RunState.COMPLETED and not self.spent:
+            self.spent = True
+            raise RunRepositoryError(RunRepositoryFault.INVARIANT)
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class _FlakyFirstReadRepository(_CommitThenUnavailableRepository):
+    """The answer.completed append landed but reported UNAVAILABLE; the NEXT
+    ``state()`` read after that seal — exactly the finalize's first read —
+    reports UNAVAILABLE once, then the store recovers."""
+
+    def __init__(self) -> None:
+        super().__init__(append_type=SSEEventType.ANSWER_COMPLETED)
+        self.seal_fired = False
+        self.read_faulted = False
+
+    async def append_event(self, identity, *, event_type, data=None):
+        if event_type is SSEEventType.ANSWER_COMPLETED and not self.spent:
+            self.spent = True
+            self.seal_fired = True  # arm the ONE flaky read from here on
+            await super().append_event(identity, event_type=event_type, data=data)
+            raise RunRepositoryError(RunRepositoryFault.UNAVAILABLE)
+        return await super().append_event(identity, event_type=event_type, data=data)
+
+    async def state(self, identity):
+        if self.seal_fired and not self.read_faulted:
+            self.read_faulted = True
+            raise RunRepositoryError(RunRepositoryFault.UNAVAILABLE)
+        return await super().state(identity)
+
+
+class _SlowReadHangingFailedCommitRepository(MemoryRunRepository):
+    """``state()`` takes a while; every FAILED-seal commit hangs forever."""
+
+    async def state(self, identity):
+        await asyncio.sleep(0.15)
+        return await super().state(identity)
+
+    async def commit_transition(
+        self, identity, *, expected_state, next_state, data=None
+    ):
+        if next_state is RunState.FAILED:
+            await asyncio.sleep(30)
+        return await super().commit_transition(
+            identity, expected_state=expected_state, next_state=next_state, data=data
+        )
+
+
+class TestSealedAnswerInvariant:
+    """A persisted answer.completed must NEVER be followed by FAILED —
+    whatever fault, budget or write refusal triggers the terminalization."""
+
+    @mark.asyncio
+    async def test_budget_exhausted_after_the_seal_completes_answered(self):
+        """P1: answer.completed landed, the budget died before the COMPLETED
+        commit — the old code sealed FAILED/deadline_exceeded over a delivered
+        answer. The terminalization entry now sees the seal and completes."""
+        repository = _StallAfterSealRepository(delay_s=0.3)
+        stack = _stack(repository=repository, run_timeout_ms=100)
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-seal-budget")
+        state = await _drain(stack, identity)
+        assert state is RunState.COMPLETED
+        events = await stack.events(identity)
+        assert len(_by_type(events, SSEEventType.ANSWER_COMPLETED)) == 1
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_ANSWERED  # NEVER deadline
+
+    @mark.asyncio
+    async def test_an_invariant_on_the_completed_commit_still_completes(self):
+        """P1: the COMPLETED write refused with INVARIANT → the fault epilogue
+        must NOT seal FAILED over the persisted answer."""
+        faults: list = []
+        repository = _InvariantOnCompletedRepository()
+        stack = _stack(
+            repository=repository, fault_sink=lambda c, r: faults.append((c, r))
+        )
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-seal-inv")
+        state = await _drain(stack, identity)
+        assert state is RunState.COMPLETED
+        events = await stack.events(identity)
+        terminal = _by_type(events, SSEEventType.RUN_COMPLETED)
+        assert len(terminal) == 1
+        assert terminal[0].data["result"] == RESULT_ANSWERED
+        assert FaultCategory.STORAGE_TRANSITION in [c for c, _ in faults]
+
+
+class TestFinalizeRetriesReads:
+    @mark.asyncio
+    async def test_a_transient_read_fault_cannot_leave_a_sealed_answer_unterminal(self):
+        """P1: the finalize used to retry only the WRITE. A first ``state()``
+        UNAVAILABLE (store recovers right after) gave up and left the run in
+        STREAMING with a sealed answer and no terminal. Reads retry too."""
+        repository = _FlakyFirstReadRepository()
+        stack = _stack(repository=repository)
+        identity = await stack.admit_and_drive("发热怎么办", run_id="r-flaky-read")
+
+        # poll via SNAPSHOT, not state(): the flaky read belongs to the
+        # executor's finalize, and a state()-based poll would consume it
+        async def _wait():
+            while True:
+                page = await stack.repository.snapshot(identity, 0, 0.0)
+                if is_terminal_state(page.state):
+                    return page.state
+                await asyncio.sleep(0.01)
+
+        state = await asyncio.wait_for(_wait(), timeout=5)
+        assert state is RunState.COMPLETED  # the retry landed the terminal
+        events = await stack.events(identity)
+        assert len(_by_type(events, SSEEventType.ANSWER_COMPLETED)) == 1
+        assert len(_by_type(events, SSEEventType.RUN_COMPLETED)) == 1
+
+
+class TestNoNestedFreshGrace:
+    @mark.asyncio
+    async def test_a_nested_terminalization_never_opens_a_fresh_grace(self):
+        """P2: reconcile → terminalize used to re-arm a FULL grace, stacking
+        pass on pass. The same monotonic deadline must flow through."""
+        faults: list = []
+        repository = _SlowReadHangingFailedCommitRepository()
+        stack = _stack(
+            terminalization_grace_s=0.2,
+            repository=repository,
+            fault_sink=lambda c, r: faults.append((c, r)),
+        )
+        identity = RunIdentity(
+            run_id="r-nested", tenant_id=TENANT, device_id=DEVICE, session_id=SESSION
+        )
+        await stack.repository.create(identity)
+        deadline = time.monotonic() + 0.2  # ONE pass deadline
+        await asyncio.sleep(0.1)  # the pass has already spent half its grace
+        started = time.monotonic()
+        await asyncio.wait_for(
+            stack.executor._terminalize(
+                identity, marker=RESULT_DEADLINE, deadline=deadline
+            ),
+            timeout=5,
+        )
+        elapsed = time.monotonic() - started
+        # remaining grace was 0.1: the slow read is cut by THE deadline, then
+        # the fault is reported — total ≈ 0.2, NOT 0.1 + a fresh 0.2 (= 0.3)
+        assert elapsed < 0.25
+        assert FaultCategory.TERMINALIZATION in [c for c, _ in faults]
