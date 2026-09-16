@@ -52,6 +52,11 @@ class AgentContext(BaseModel):
     permitted_long_memory: bool = False
     risk_level: RiskLevel = RiskLevel.LOW
     deadline: AwareDatetime | None = None
+    # call-time tool quota (#55A-B): the MAX tool calls the sub-agent may make
+    # in THIS engagement, granted by the Manager from the run-cumulative
+    # budget (revisions see what is left). ``None`` = unrestricted (legacy
+    # callers); the Manager always grants an explicit number.
+    tool_budget_granted: int | None = Field(default=None, ge=0)
 
 
 class ToolRequest(BaseModel):
@@ -96,3 +101,8 @@ class AgentResult(BaseModel):
     safety_status: str = "unknown"
     memory_candidates: list[dict[str, Any]] = Field(default_factory=list)
     public_trace: list[dict[str, Any]] = Field(default_factory=list)
+    # trusted model provenance (#55A-B): ONLY the server-side
+    # ModelGateway/Provider configuration, never model-reported values. The
+    # Manager overwrites whatever the sub-agent claimed before this result is
+    # built, so a forged provider/model identity can never reach the SSE layer.
+    model: dict[str, str] | None = None

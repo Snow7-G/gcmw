@@ -59,6 +59,7 @@ from app.contracts.agent import ToolRequest, ToolResult
 from app.contracts.audit import AuditRecord
 from app.contracts.common import TenantContext
 from app.contracts.errors import ErrorCode, lookup
+from app.tools.quota import current_run_quota
 from app.tools.specs import READONLY_TOOL_NAMES, ToolSpec
 from app.tools.validation import validate
 
@@ -465,6 +466,22 @@ class ToolGateway:
         if timeout_ms <= 0:
             audit(result="rejected:deadline_expired", code=ErrorCode.TOOL_TIMEOUT)
             raise ToolGatewayError(ErrorCode.TOOL_TIMEOUT, "deadline already expired")
+
+        # 5. #55A-B RUN QUOTA — the HARD, call-time enforcement point. The quota
+        # object is Manager-owned and travels in a ContextVar; the unit is taken
+        # atomically BEFORE _submit, so an exhausted budget makes the execution
+        # impossible (zero side effects), and the refusal is audited exactly
+        # like every other gate denial. A started attempt (timeout / tool fault
+        # / cancellation) is never refunded.
+        quota = current_run_quota()
+        if quota is not None and not quota.try_acquire():
+            audit(
+                result="rejected:tool_quota_exhausted",
+                code=ErrorCode.TOOL_OVER_LIMIT,
+            )
+            raise ToolGatewayError(
+                ErrorCode.TOOL_OVER_LIMIT, "run tool quota is exhausted"
+            )
 
         return _Prepared(
             spec=spec,
