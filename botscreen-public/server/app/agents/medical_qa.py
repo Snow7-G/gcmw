@@ -125,20 +125,31 @@ class MedicalQAAgent:
     async def _search(
         self, ctx: AgentContext, budget: dict[str, int]
     ) -> list[RetrievalHit]:
-        result = await self._tools.ainvoke(
-            ctx,  # trusted identity: the gateway derives tenant/session/run here
-            ToolRequest(
-                tool_name="knowledge.search",
-                # NO identity arguments: tenant/session come from the context the
-                # gateway injects, and the schema forbids extra properties
-                arguments={
-                    "query": ctx.normalized_input,
-                    "top_k": self._max_fragments + 2,
-                },
-            ),
-            allowed_tools=self._allowed_tools,
-            agent_id=self._agent_id,
-        )
+        # #55A-B CALL-TIME quota: checked BEFORE the gateway call, so a zero or
+        # exhausted grant makes the call impossible — never a post-hoc count
+        if budget["calls"] >= budget["ceiling"]:
+            return []
+        try:
+            result = await self._tools.ainvoke(
+                ctx,  # trusted identity: the gateway derives tenant/session/run here
+                ToolRequest(
+                    tool_name="knowledge.search",
+                    # NO identity arguments: tenant/session come from the context
+                    # the gateway injects, and the schema forbids extra properties
+                    arguments={
+                        "query": ctx.normalized_input,
+                        "top_k": self._max_fragments + 2,
+                    },
+                ),
+                allowed_tools=self._allowed_tools,
+                agent_id=self._agent_id,
+            )
+        except ToolGatewayError as exc:
+            if exc.code is ErrorCode.TOOL_OVER_LIMIT:
+                # the run quota is exhausted AT THE GATEWAY BOUNDARY: the call
+                # never started, so stop calling gracefully (no_evidence below)
+                return []
+            raise
         budget["calls"] += 1
         if not result.ok:
             return []
@@ -195,6 +206,10 @@ class MedicalQAAgent:
                 agent_id=self._agent_id,
             )
         except ToolGatewayError as exc:
+            if exc.code is ErrorCode.TOOL_OVER_LIMIT:
+                # a quota refusal at the boundary is NOT a started attempt: the
+                # call never executed, so it is neither counted nor retried
+                return None
             # the round-trip still happened and was audited, so it counts
             budget["calls"] += 1
             if exc.code is ErrorCode.NOT_FOUND_KNOWLEDGE:
@@ -262,7 +277,15 @@ class MedicalQAAgent:
         All mutable run state (tool budget) lives in a per-run dict so
         concurrent runs on one shared agent instance can never interleave
         counters (the budget is a security control, not shared state)."""
-        budget = {"calls": 0}
+        # #55A-B: the ceiling is the MIN of the agent's own limit and the
+        # run-cumulative leftover the Manager granted for THIS engagement —
+        # a revision can never start a fresh quota
+        granted = (
+            context.tool_budget_granted
+            if context.tool_budget_granted is not None
+            else self._max_tool_calls
+        )
+        budget = {"calls": 0, "ceiling": min(self._max_tool_calls, granted)}
         if not (context.normalized_input or "").strip():
             return self._execution(
                 status=AgentStatus.FAILED, safety="invalid_input", tool_calls=0
@@ -273,8 +296,8 @@ class MedicalQAAgent:
         evidence: list[Evidence] = []
         grounded: list[str] = []
         for hit in hits[: self._max_fragments]:
-            if budget["calls"] >= self._max_tool_calls:
-                break
+            if budget["calls"] >= budget["ceiling"]:
+                break  # call-time quota: the read never even starts
             verified = await self._read_fragment(context, hit, budget)
             if verified is None:
                 continue  # unusable/unverifiable read: this candidate is dropped

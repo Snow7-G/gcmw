@@ -178,6 +178,9 @@ def build_agent_executor(
         verifier=SafetyEvidenceVerifier(red_flag_rules=red_flags),
         red_flag_rules=red_flags,
         risk_rules=risk_rules,
+        # #55A-B: provenance comes from the SERVER-SIDE ModelGateway/Provider
+        # configuration only — model-reported identities are discarded
+        trusted_model_provenance={"qa": models.provenance()},
     )
     executor = RunExecutor(
         repository=repository,

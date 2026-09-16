@@ -59,6 +59,7 @@ from app.contracts.agent import ToolRequest, ToolResult
 from app.contracts.audit import AuditRecord
 from app.contracts.common import TenantContext
 from app.contracts.errors import ErrorCode, lookup
+from app.tools.quota import EXHAUSTED, GRANTED, current_run_quota
 from app.tools.specs import READONLY_TOOL_NAMES, ToolSpec
 from app.tools.validation import validate
 
@@ -465,6 +466,52 @@ class ToolGateway:
         if timeout_ms <= 0:
             audit(result="rejected:deadline_expired", code=ErrorCode.TOOL_TIMEOUT)
             raise ToolGatewayError(ErrorCode.TOOL_TIMEOUT, "deadline already expired")
+
+        # 5. #55A-B RUN QUOTA — the HARD, call-time enforcement point. The quota
+        # object is Manager-owned and travels in a ContextVar; the unit is taken
+        # atomically BEFORE _submit, so an exhausted budget makes the execution
+        # impossible (zero side effects), and the refusal is audited exactly
+        # like every other gate denial. A started attempt (timeout / tool fault
+        # / cancellation) is never refunded.
+        #
+        # FAIL CLOSED on a missing quota: a Manager-managed context is
+        # recognizable by its EXPLICIT grant (``tool_budget_granted is not
+        # None``) and MUST find its quota here. ``threading.Thread`` and some
+        # ``run_in_executor`` uses do NOT copy ContextVars — if the gate simply
+        # read ``None`` as "legacy/unrestricted", any such thread would bypass
+        # the budget entirely. So a grant without a quota is refused BEFORE
+        # submission (``rejected:tool_quota_missing``, zero execution); the
+        # ``None = unrestricted`` reading is reserved for callers WITHOUT an
+        # explicit grant (legacy/direct gateway users, bare TenantContext).
+        quota = current_run_quota()
+        if quota is None:
+            if getattr(context, "tool_budget_granted", None) is not None:
+                audit(
+                    result="rejected:tool_quota_missing",
+                    code=ErrorCode.TOOL_OVER_LIMIT,
+                )
+                raise ToolGatewayError(
+                    ErrorCode.TOOL_OVER_LIMIT,
+                    "run tool quota context is missing",
+                )
+        else:
+            outcome = quota.acquire()
+            if outcome != GRANTED:
+                # DISTINGUISHABLE refusals: the budget ran out vs the run has
+                # already ended (a LATE call from a context that copied the
+                # quota). Same public error code, different audit markers.
+                result = (
+                    "rejected:tool_quota_exhausted"
+                    if outcome == EXHAUSTED
+                    else "rejected:tool_quota_closed"
+                )
+                message = (
+                    "run tool quota is exhausted"
+                    if outcome == EXHAUSTED
+                    else "run has ended: the tool quota is closed"
+                )
+                audit(result=result, code=ErrorCode.TOOL_OVER_LIMIT)
+                raise ToolGatewayError(ErrorCode.TOOL_OVER_LIMIT, message)
 
         return _Prepared(
             spec=spec,

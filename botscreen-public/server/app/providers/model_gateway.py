@@ -137,6 +137,15 @@ class ModelGateway:
 
     # -- availability / info -------------------------------------------------
 
+    def provenance(self, provider_id: str | None = None) -> tuple[str, str, str]:
+        """The SERVER-SIDE identity of a configured provider: (provider_id,
+        model_id, model_version) straight from the registered adapter's
+        configuration — the only provenance source the Manager trusts. Values
+        claimed by model OUTPUT are never consulted (#55A-B)."""
+        adapter = self._resolve(provider_id)
+        info = adapter.model_info()
+        return (adapter.provider_id, info.model_id, info.model_version)
+
     def is_available(self, provider_id: str | None = None) -> bool:
         adapter = self._adapters.get(provider_id or self._active_provider_id)
         return adapter is not None and adapter.is_available()

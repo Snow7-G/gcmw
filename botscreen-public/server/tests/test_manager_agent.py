@@ -52,9 +52,18 @@ from app.agents.manager import (
     is_safe_marker_value,
 )
 from app.agents.registry import AgentManifest, AgentRegistry
-from app.contracts.agent import AgentContext, AgentStatus, Evidence, RiskLevel
+from app.contracts.agent import (
+    AgentContext,
+    AgentStatus,
+    Evidence,
+    RiskLevel,
+    ToolRequest,
+)
 from app.contracts.common import Channel
 from app.contracts.errors import ErrorCode
+from app.knowledge.store import KnowledgeStore
+from app.tools.builtins import build_gateway
+from app.tools.gateway import ToolGatewayError
 
 
 def _agent_execution(
@@ -278,16 +287,54 @@ class TestRoutingAndBudgets:
         assert booker_runner.calls == ["帮我预约明天"]
 
     @mark.asyncio
-    async def test_tool_budget_violation_raises_tool_over_limit(self):
+    async def test_a_rogue_runner_cannot_exceed_the_gateway_quota(self):
+        """#55A-B: a runner that ignores its grant, calls the REAL gateway six
+        times and self-reports tool_calls=0 cannot exceed the budget — the
+        gateway refuses everything past the limit BEFORE submission, and the
+        audit trail reflects the authoritative count (4 ok, 2 refused)."""
+        records: list = []
+        gateway = build_gateway(
+            knowledge_store=KnowledgeStore(), audit_sink=records.append
+        )
+
+        class _RogueRunner:
+            def __init__(self):
+                self.calls = []
+
+            async def __call__(self, ctx):
+                self.calls.append(ctx.normalized_input)
+                for _ in range(6):  # ignore the grant; swallow the refusals
+                    try:
+                        await gateway.ainvoke(
+                            ctx,
+                            ToolRequest(
+                                tool_name="knowledge.search",
+                                arguments={"query": "发热", "top_k": 1},
+                            ),
+                            allowed_tools={
+                                "knowledge.search",
+                                "knowledge.get_fragment",
+                            },
+                            agent_id="qa",
+                        )
+                    except ToolGatewayError:
+                        pass
+                return _agent_execution(tool_calls=0)  # LIE about the usage
+
         reg = AgentRegistry()
         reg.register(_qa_manifest())
         m = build_manager(
             registry=reg,
-            agent_runners={"qa": _Runner(result=_agent_execution(tool_calls=5))},
+            agent_runners={"qa": _RogueRunner()},
+            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
         )
-        with pytest.raises(ManagerAgentError) as exc:
-            await m.execute(_context(), "发烧怎么办")
-        assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
+        result = await m.execute(_context(), "发烧怎么办")
+        assert result.safety_status == "verified"  # the run itself is honest
+        executed = [r for r in records if r.result.startswith("ok:")]
+        refused = [r for r in records if r.result == "rejected:tool_quota_exhausted"]
+        assert len(executed) == 4  # the limit, never more
+        assert len(refused) == 2  # the boundary refused the rest, audited
+        assert all(r.error_code is ErrorCode.TOOL_OVER_LIMIT for r in refused)
 
     @mark.asyncio
     async def test_handoff_budget_violation_raises_budget_exceeded(self):
@@ -667,38 +714,77 @@ class TestRiskGrading:
         assert risk_marker["level"] == "low"
 
 
-class TestBudgetScopeIsHonest:
-    """The tool budget is a POST-HOC check today (documented, not enforced)."""
+class TestQuotaIsGatewayEnforced:
+    """#55A-B: the authoritative count is the gateway's quota state, not the
+    sub-agent's self-report — over- AND under-reporting are both irrelevant to
+    enforcement, because the boundary refuses calls before they execute."""
 
-    @mark.asyncio
-    async def test_over_reported_tool_calls_fail_the_run(self, registry):
-        runner = _Runner(result=_agent_execution(tool_calls=99))
-        m = build_manager(
+    @staticmethod
+    def _rogue_manager(registry, gateway, calls, report):
+        class _Rogue:
+            def __init__(self):
+                self.calls = []
+
+            async def __call__(self, ctx):
+                self.calls.append(ctx.normalized_input)
+                for _ in range(calls):
+                    try:
+                        await gateway.ainvoke(
+                            ctx,
+                            ToolRequest(
+                                tool_name="knowledge.search",
+                                arguments={"query": "发热", "top_k": 1},
+                            ),
+                            allowed_tools={
+                                "knowledge.search",
+                                "knowledge.get_fragment",
+                            },
+                            agent_id="qa",
+                        )
+                    except ToolGatewayError:
+                        pass
+                return _agent_execution(tool_calls=report)
+
+        return build_manager(
             registry=registry,
-            agent_runners={"qa": runner},
+            agent_runners={"qa": _Rogue()},
             verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
         )
-        with pytest.raises(ManagerAgentError) as exc:
-            await m.execute(_context(), "发烧怎么办")
-        assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
 
     @mark.asyncio
-    async def test_under_reported_tool_calls_are_not_detected(self, registry):
-        """CHARACTERISATION of the documented limitation: a run that really
-        exceeded the tool budget but under-reports is NOT stopped here. The
-        call-time hard cap arrives with #55A (ToolGateway quota), so this PR
-        must not claim the tool budget is preemptively enforced."""
-        runner = _Runner(result=_agent_execution(tool_calls=1))  # claims 1, did N
-        m = build_manager(
-            registry=registry,
-            agent_runners={"qa": runner},
-            verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
+    async def test_over_reporting_cannot_smuggle_extra_calls(self, registry):
+        """A runner that calls the gateway 9 times but reports 99 still gets
+        only 4 executions — and the report itself is ignored, not punished."""
+        records: list = []
+        gateway = build_gateway(
+            knowledge_store=KnowledgeStore(), audit_sink=records.append
         )
+        m = self._rogue_manager(registry, gateway, calls=9, report=99)
         result = await m.execute(_context(), "发烧怎么办")
-        assert result.status is AgentStatus.COMPLETED  # no call-time counter here
+        executed = [r for r in records if r.result.startswith("ok:")]
+        refused = [r for r in records if r.result == "rejected:tool_quota_exhausted"]
+        assert len(executed) == 4
+        assert len(refused) == 5
+        assert result.safety_status == "verified"
+
+    @mark.asyncio
+    async def test_under_reporting_cannot_hide_the_usage_either(self, registry):
+        """The mirror of the old TOCTOU: report 0 after 9 calls — the audit
+        trail and the authoritative count still say 4 executed, 5 refused."""
+        records: list = []
+        gateway = build_gateway(
+            knowledge_store=KnowledgeStore(), audit_sink=records.append
+        )
+        m = self._rogue_manager(registry, gateway, calls=9, report=0)
+        result = await m.execute(_context(), "发烧怎么办")
+        executed = [r for r in records if r.result.startswith("ok:")]
+        refused = [r for r in records if r.result == "rejected:tool_quota_exhausted"]
+        assert len(executed) == 4
+        assert len(refused) == 5
+        assert result.safety_status == "verified"
 
     def test_limits_docstring_states_the_scope(self):
-        assert "POST-HOC" in (ManagerLimits.__doc__ or "")
+        assert "AT CALL TIME" in (ManagerLimits.__doc__ or "")
 
 
 class TestRiskIsNeverDowngraded:
@@ -1600,26 +1686,51 @@ class TestEvidenceIsRevalidatedNotJustCopied:
 
 
 class TestToolBudgetIsRunCumulative:
-    """Review P1: the ≤4 tool cap is summed over the whole run."""
+    """#55A-B: the ≤4 tool cap is ONE shared quota state over the whole run —
+    first execution plus every revision — enforced by the gateway itself. A
+    rogue runner that swallows the refusals still cannot get a fifth execution,
+    and the audit trail carries the authoritative split (ok vs refused)."""
 
     @staticmethod
     def _revision_manager(registry, first_calls, revision_calls, verifier=None):
-        drafts = [
-            _agent_execution(tool_calls=first_calls),
-            _agent_execution(tool_calls=revision_calls),
-        ]
+        records: list = []
+        gateway = build_gateway(
+            knowledge_store=KnowledgeStore(), audit_sink=records.append
+        )
 
-        class _TwoStep:
+        class _TwoStepRogue:
+            """Each engagement really calls the gateway; refusals swallowed."""
+
             def __init__(self):
                 self.calls = []
                 self.risks = []
+                self.plan = [first_calls, revision_calls]
+                self.engagements = 0
 
             async def __call__(self, ctx):
                 self.calls.append(ctx.normalized_input)
                 self.risks.append(ctx.risk_level)
-                return drafts[len(self.calls) - 1]
+                n = self.plan[min(self.engagements, len(self.plan) - 1)]
+                self.engagements += 1
+                for _ in range(n):
+                    try:
+                        await gateway.ainvoke(
+                            ctx,
+                            ToolRequest(
+                                tool_name="knowledge.search",
+                                arguments={"query": "发热", "top_k": 1},
+                            ),
+                            allowed_tools={
+                                "knowledge.search",
+                                "knowledge.get_fragment",
+                            },
+                            agent_id="qa",
+                        )
+                    except ToolGatewayError:
+                        pass  # the rogue runner swallows quota refusals
+                return _agent_execution(tool_calls=0)  # LIE about the usage
 
-        runner = _TwoStep()
+        runner = _TwoStepRogue()
         m = build_manager(
             registry=registry,
             agent_runners={"qa": runner},
@@ -1628,47 +1739,95 @@ class TestToolBudgetIsRunCumulative:
                 [Verdict(VerifierOutcome.REVISE), Verdict(VerifierOutcome.PASS)]
             ),
         )
-        return m, runner
+        return m, runner, records
+
+    def _split(self, records):
+        executed = [r for r in records if r.result.startswith("ok:")]
+        refused = [r for r in records if r.result == "rejected:tool_quota_exhausted"]
+        return executed, refused
 
     @mark.asyncio
     async def test_two_plus_two_is_within_the_budget(self, registry):
-        m, runner = self._revision_manager(registry, 2, 2)
+        m, runner, records = self._revision_manager(registry, 2, 2)
         result = await m.execute(_context(), "发烧怎么办")
         assert result.status is AgentStatus.COMPLETED
         assert result.safety_status == "verified"
         assert len(runner.calls) == 2
+        executed, refused = self._split(records)
+        assert len(executed) == 4
+        assert len(refused) == 0
 
-    @mark.parametrize(("first", "revision"), [(3, 2), (3, 3), (4, 1), (0, 5), (5, 0)])
+    @mark.parametrize(
+        ("first", "revision", "refused"),
+        [(3, 2, 1), (3, 3, 2), (4, 1, 1), (0, 5, 1), (5, 0, 1)],
+    )
     @mark.asyncio
-    async def test_over_budget_totals_are_refused(self, registry, first, revision):
-        """3 + 2 = 5 > 4: comparing per engagement would have allowed this."""
-        m, runner = self._revision_manager(registry, first, revision)
-        with pytest.raises(ManagerAgentError) as exc:
-            await m.execute(_context(), "发烧怎么办")
-        assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
-        # an over-budget FIRST execution is refused before any revision
-        assert len(runner.calls) == (1 if first > 4 else 2)
+    async def test_over_budget_totals_are_hard_refused_at_the_boundary(
+        self, registry, first, revision, refused
+    ):
+        """3 + 2 = 5 > 4: the FIFTH call is refused by the gateway itself —
+        not by a post-hoc complaint — and the refusal is audited."""
+        m, _runner, records = self._revision_manager(registry, first, revision)
+        result = await m.execute(_context(), "发烧怎么办")
+        executed, refused_records = self._split(records)
+        assert len(executed) == 4  # the hard cap, shared across revisions
+        assert len(refused_records) == refused
+        assert result.safety_status == "verified"
 
     @mark.asyncio
-    async def test_a_single_over_budget_execution_is_still_refused(self, registry):
+    async def test_a_single_over_budget_execution_is_hard_capped(self, registry):
+        records: list = []
+        gateway = build_gateway(
+            knowledge_store=KnowledgeStore(), audit_sink=records.append
+        )
+
+        class _Greedy:
+            async def __call__(self, ctx):
+                for _ in range(5):
+                    try:
+                        await gateway.ainvoke(
+                            ctx,
+                            ToolRequest(
+                                tool_name="knowledge.search",
+                                arguments={"query": "发热", "top_k": 1},
+                            ),
+                            allowed_tools={
+                                "knowledge.search",
+                                "knowledge.get_fragment",
+                            },
+                            agent_id="qa",
+                        )
+                    except ToolGatewayError:
+                        pass
+                return _agent_execution(tool_calls=0)
+
         m = build_manager(
             registry=registry,
-            agent_runners={"qa": _Runner(result=_agent_execution(tool_calls=5))},
+            agent_runners={"qa": _Greedy()},
             verifier=_Verifier([Verdict(VerifierOutcome.PASS)]),
         )
-        with pytest.raises(ManagerAgentError) as exc:
-            await m.execute(_context(), "发烧怎么办")
-        assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
+        result = await m.execute(_context(), "发烧怎么办")
+        executed, refused = self._split(records)
+        assert len(executed) == 4
+        assert len(refused) == 1
+        assert result.safety_status == "verified"
 
     @mark.asyncio
     async def test_the_counter_spans_the_verifier_handoff_too(self, registry):
-        """4 tools in the first execution + 1 in the revision = 5, refused."""
-        m, runner = self._revision_manager(
-            registry, 4, 1, verifier=_Verifier([Verdict(VerifierOutcome.REVISE)])
+        """4 tools in the first execution + 1 in the revision = the 5th is
+        refused at the boundary (the shared state spans the handoff)."""
+        m, runner, records = self._revision_manager(
+            registry,
+            4,
+            1,
+            verifier=_Verifier(
+                [Verdict(VerifierOutcome.REVISE), Verdict(VerifierOutcome.PASS)]
+            ),
         )
-        with pytest.raises(ManagerAgentError) as exc:
-            await m.execute(_context(), "发烧怎么办")
-        assert exc.value.code is ErrorCode.TOOL_OVER_LIMIT
+        await m.execute(_context(), "发烧怎么办")
+        executed, refused = self._split(records)
+        assert len(executed) == 4
+        assert len(refused) == 1
         assert len(runner.calls) == 2
 
 
