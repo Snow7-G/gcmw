@@ -477,6 +477,9 @@ def verify_tool_quota_audit(audit: _AuditCapture, run_id: str) -> None:
 # -- 启动与编排 ------------------------------------------------------------------
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
 def start_server(
     host: str = "127.0.0.1", port: int = 0, cors_for_dev_frontends: bool = False
 ) -> SimpleNamespace:
@@ -484,7 +487,14 @@ def start_server(
 
     ``port=0`` 自动选择端口（默认行为不变）；``cors_for_dev_frontends`` 只在
     本 demo app 上挂精确的开发前端 Origin 白名单（/qa 页面跨源演示用），
-    绝不使用通配，也不影响 staging/production 的安全配置。"""
+    绝不使用通配，也不影响 staging/production 的安全配置。
+    ``host`` 只接受 loopback：演示服务带固定低熵凭据，直接调用（绕过 CLI）
+    也必须在库层拒绝暴露到局域网。"""
+    if host not in _LOOPBACK_HOSTS:
+        raise ValueError(
+            f"demo server host must be loopback ({'/'.join(sorted(_LOOPBACK_HOSTS))}),"
+            f" got {host!r}: the fixed demo credential must never leave localhost"
+        )
     import uvicorn
 
     settings = Settings(
@@ -588,8 +598,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    # 演示服务带固定低熵凭据：只允许绑定 loopback，拒绝 0.0.0.0/局域网地址
-    _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+    # 演示服务带固定低熵凭据：只允许绑定 loopback（库层 start_server 也会拒绝）
     if args.host not in _LOOPBACK_HOSTS:
         parser.error(
             f"--host 仅允许 loopback（{'/'.join(sorted(_LOOPBACK_HOSTS))}），"

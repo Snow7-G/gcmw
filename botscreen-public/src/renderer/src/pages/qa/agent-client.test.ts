@@ -193,6 +193,19 @@ it('keeps multi-byte characters intact when bytes split across chunks', async ()
   expect(delta).not.toContain('\uFFFD')
 })
 
+it('stops dispatching frames that share a chunk with the terminal event', async () => {
+  // 回归：run.completed 与迟到 answer.delta 位于同一个 Uint8Array ——
+  // streamRun 自身必须停止派发，不能依赖页面 reducer 兜底
+  const body =
+    'id: 1\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n' +
+    'id: 2\nevent: answer.delta\ndata: {"data":{"delta":"LATE"}}\n\n'
+  stubFetch([okResponse(sseBody([body]))])
+
+  const events: AgentSseEvent[] = []
+  await streamRun(OPTS, 'r-1', { onEvent: (e) => events.push(e) })
+  expect(events.map((e) => e.event)).toEqual(['run.completed'])
+})
+
 // -- 8/9/10/11: 终态唯一、迟到事件、stream.error、abort -----------------------
 
 describe('streamRun terminal & failure handling', () => {
@@ -313,11 +326,34 @@ describe('resolveAgentConfig fails closed', () => {
     ).toEqual({ baseUrl: BASE, credential: 'real-looking-demo-token' })
   })
 
-  it('rejects non-loopback demo addresses at config time (zero fetch)', () => {
+  it('accepts exactly the demo contract URL — the one the CSP allows', () => {
+    // the allowed set must match the renderer CSP connect-src entry
+    // (http://127.0.0.1:8001) one-to-one: no extra hosts, no extra ports
+    expect(
+      resolveAgentConfig({
+        VITE_GCMW_AGENT_API_BASE: 'http://127.0.0.1:8001/api/v1',
+        VITE_GCMW_DEMO_CREDENTIAL: 'real-looking-demo-token'
+      })
+    ).toEqual({
+      baseUrl: 'http://127.0.0.1:8001/api/v1',
+      credential: 'real-looking-demo-token'
+    })
+    // trailing slash tolerated (normalized to the contract URL)
+    expect(
+      resolveAgentConfig({
+        VITE_GCMW_AGENT_API_BASE: 'http://127.0.0.1:8001/api/v1/',
+        VITE_GCMW_DEMO_CREDENTIAL: 'real-looking-demo-token'
+      })
+    ).not.toBeNull()
+  })
+
+  it('rejects everything but the contract URL at config time (zero fetch)', () => {
     for (const bad of [
+      'http://localhost:8001/api/v1', // loopback but NOT the CSP-allowed host
+      'http://127.0.0.1:9000/api/v1', // loopback but NOT the CSP-allowed port
       'http://192.168.1.10:8001/api/v1',
       'http://0.0.0.0:8001',
-      'https://demo.example.com/api/v1',
+      'https://127.0.0.1:8001/api/v1',
       'ws://127.0.0.1:8001',
       'not a url'
     ]) {
@@ -327,15 +363,6 @@ describe('resolveAgentConfig fails closed', () => {
           VITE_GCMW_DEMO_CREDENTIAL: 'real-looking-demo-token'
         })
       ).toBeNull()
-    }
-    // loopback HTTP hosts stay allowed
-    for (const good of ['http://localhost:8001/api/v1', 'http://127.0.0.1:8001/api/v1']) {
-      expect(
-        resolveAgentConfig({
-          VITE_GCMW_AGENT_API_BASE: good,
-          VITE_GCMW_DEMO_CREDENTIAL: 'real-looking-demo-token'
-        })
-      ).not.toBeNull()
     }
   })
 })

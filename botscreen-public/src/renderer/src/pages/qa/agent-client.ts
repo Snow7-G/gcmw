@@ -38,6 +38,9 @@ export class AgentStreamError extends Error {
   }
 }
 
+/** The single allowed demo backend URL — must equal the CSP connect-src entry. */
+export const DEMO_BASE_URL = 'http://127.0.0.1:8001/api/v1'
+
 /** Thrown when the demo env config is missing or still a placeholder. */
 export class AgentConfigError extends Error {
   constructor() {
@@ -60,20 +63,14 @@ export function resolveAgentConfig(env: {
   if (!base || !credential || credential === 'YOUR_DEMO_CREDENTIAL_HERE') {
     return null
   }
-  // Demo boundary (development/test only): the fixed demo credential must
-  // never be sent anywhere but the loopback. Anything else — LAN IPs, hosts,
-  // https remotes, garbage — is rejected AT CONFIG TIME with zero fetches.
-  let parsed: URL
-  try {
-    parsed = new URL(base)
-  } catch {
-    return null
-  }
-  if (parsed.protocol !== 'http:') return null
-  if (parsed.hostname !== 'localhost' && parsed.hostname !== '127.0.0.1') {
-    return null
-  }
-  return { baseUrl: base.replace(/\/+$/, ''), credential }
+  // Demo contract is FIXED (development/test only): exactly one loopback
+  // base URL, matching the renderer CSP connect-src entry one-to-one. Any
+  // other value — other loopback ports, LAN IPs, https remotes, garbage — is
+  // rejected AT CONFIG TIME with zero fetches, so a "valid" config can never
+  // be silently blocked by the CSP afterwards.
+  const normalized = base.replace(/\/+$/, '')
+  if (normalized !== DEMO_BASE_URL) return null
+  return { baseUrl: normalized, credential }
 }
 
 export interface AgentClientOptions {
@@ -384,6 +381,15 @@ export async function streamRun(
       }
     }
 
+    const dispatchBatch = (frames: SseFrame[]): void => {
+      for (const frame of frames) {
+        // a terminal frame stops dispatch INSIDE the same chunk: late frames
+        // that share one Uint8Array with run.completed are never emitted
+        if (done) return
+        dispatch(frame)
+      }
+    }
+
     try {
       for (;;) {
         const { done: eof, value } = await reader.read()
@@ -391,15 +397,11 @@ export async function streamRun(
           // flush any final incomplete multi-byte sequence, then any trailing
           // frame residue left in the parser buffer
           const tail = decoder.decode()
-          if (tail.length > 0) {
-            for (const frame of parser.push(tail)) dispatch(frame)
-          }
-          for (const frame of parser.flush()) dispatch(frame)
+          if (tail.length > 0) dispatchBatch(parser.push(tail))
+          dispatchBatch(parser.flush())
           break
         }
-        for (const frame of parser.push(decoder.decode(value, { stream: true }))) {
-          dispatch(frame)
-        }
+        dispatchBatch(parser.push(decoder.decode(value, { stream: true })))
         if (done) break
       }
     } catch {

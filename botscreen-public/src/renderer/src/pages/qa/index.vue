@@ -33,6 +33,7 @@ let legacyVoiceSse: EventSource | null = null
 let legacySseReconnectTimer: ReturnType<typeof setTimeout> | null = null
 let pageAlive = true
 let agentSessionAbort: AbortController | null = null
+let suggestionsAbort: AbortController | null = null
 
 /** 演示确定性：前三个问题固定对应三条后端路径（有引用 / 无证据 / 红旗） */
 const DEMO_QUESTIONS = ['发热怎么办', '空调病怎么预防', '我最近有自杀的念头']
@@ -47,6 +48,13 @@ const AGENT_COPY = {
   genericError: '哎呀，服务暂时不可用，请稍后再试～',
   sourcePrefix: '\n\n资料来源：\n'
 } as const
+
+/** 统一失败出口：清空部分答案、把固定安全文案放到可见的答案面板 */
+function showAgentFailure(copy: string): void {
+  answerText.value = copy
+  showAnswer.value = true
+  mascotState.value = 'idle'
+}
 
 function agentFailCopy(err: unknown): string {
   if (err instanceof AgentStreamError) {
@@ -152,11 +160,7 @@ async function sendQuestion(question: string): Promise<void> {
   if (!question.trim() || isSending.value) return
   if (!agentReady || !agentSessionId.value) {
     messages.value.push({ role: 'user', text: question })
-    messages.value.push({
-      role: 'robot',
-      text: agentReady ? AGENT_COPY.sessionFailed : AGENT_COPY.configMissing,
-      source: 'agent'
-    })
+    showAgentFailure(agentReady ? AGENT_COPY.sessionFailed : AGENT_COPY.configMissing)
     return
   }
 
@@ -207,12 +211,10 @@ async function sendQuestion(question: string): Promise<void> {
     })
   } catch (err) {
     if (!(err instanceof AgentStreamError && err.kind === 'aborted')) {
-      // 统一失败出口：清空部分答案/引用（answerText 整体覆盖），固定安全
-      // 文案放到可见的答案面板，绝不显示服务端异常原文
-      answerText.value = agentFailCopy(err)
-      showAnswer.value = true
+      // 统一失败出口：清空部分答案/引用，固定安全文案可见，绝不显示
+      // 服务端异常原文
+      showAgentFailure(agentFailCopy(err))
       messages.value.push({ role: 'robot', text: answerText.value, source: 'agent' })
-      mascotState.value = 'idle'
     }
   } finally {
     isSending.value = false
@@ -338,55 +340,70 @@ function withDemoQuestionsFirst(questions: string[]): string[] {
   return [...DEMO_QUESTIONS, ...questions.filter((q) => !DEMO_QUESTIONS.includes(q))]
 }
 
-onMounted(async () => {
+onMounted(() => {
   welcomeText.value =
     '你好呀～我是小视，你的眼睛健康小伙伴！\n有什么想知道的，点点按钮或者按一下麦克风跟我说吧～'
   defaultWelcome.value = welcomeText.value
+  // 旧语音链路 FIRST：同步启动，不依赖任何 await，8001 卡住绝不阻塞 8000
+  connectSSE()
+  // 两个相互独立的异步任务，各自带组件级 AbortController，卸载统一中止
+  void loadSuggestions()
+  void initAgentSession()
+})
+
+/** 任务一：建议问题（独立 abort；每次状态写入前检查 pageAlive） */
+async function loadSuggestions(): Promise<void> {
+  suggestionsAbort = new AbortController()
   try {
-    const res = await fetch(`${API_BASE}/suggestions`)
+    const res = await fetch(`${API_BASE}/suggestions`, {
+      signal: suggestionsAbort.signal
+    })
+    if (!pageAlive) return // 卸载后丢弃结果，不写状态
     if (res.ok) {
       const data = await res.json()
-      suggestions.value = withDemoQuestionsFirst(data.suggestions || [])
+      if (pageAlive) suggestions.value = withDemoQuestionsFirst(data.suggestions || [])
     } else throw new Error('fallback')
   } catch {
-    suggestions.value = withDemoQuestionsFirst([
-      '眼轴正常长度',
-      '近视小科普',
-      '近视分级标准',
-      '用眼休息时长',
-      '正确读写姿势',
-      '每日户外时长',
-      '用眼光线环境',
-      '护眼饮食推荐',
-      '定期检查眼睛'
-    ])
-  }
-  // 旧语音链路 FIRST：不依赖 Agent Session，8001 卡住绝不阻塞 8000
-  connectSSE()
-  // 新 Agent 链路：页面加载时创建一次 Session（组件级 AbortController +
-  // 5s 超时；失败则文字问答失败关闭，旧语音链路不受影响）
-  if (agentReady) {
-    agentSessionAbort = new AbortController()
-    const sessionTimeout = setTimeout(() => agentSessionAbort?.abort(), 5000)
-    try {
-      agentSessionId.value = await createSession(
-        agentOptions as AgentClientOptions,
-        agentSessionAbort.signal
-      )
-    } catch {
-      // 失败关闭：session 拿不到时 sendQuestion 会给出固定提示，语音链路不受影响
-    } finally {
-      clearTimeout(sessionTimeout)
-      agentSessionAbort = null
+    if (pageAlive) {
+      suggestions.value = withDemoQuestionsFirst([
+        '眼轴正常长度',
+        '近视小科普',
+        '近视分级标准',
+        '用眼休息时长',
+        '正确读写姿势',
+        '每日户外时长',
+        '用眼光线环境',
+        '护眼饮食推荐',
+        '定期检查眼睛'
+      ])
     }
   }
-})
+}
+
+/** 任务二：Agent Session（组件级 abort + 5s 超时；失败则文字问答失败关闭） */
+async function initAgentSession(): Promise<void> {
+  if (!agentReady || !pageAlive) return
+  agentSessionAbort = new AbortController()
+  const sessionTimeout = setTimeout(() => agentSessionAbort?.abort(), 5000)
+  try {
+    const id = await createSession(agentOptions as AgentClientOptions, agentSessionAbort.signal)
+    if (!pageAlive) return // 卸载后丢弃结果，不再写状态
+    agentSessionId.value = id
+  } catch {
+    // 失败关闭：session 拿不到时 sendQuestion 会给出固定提示，语音链路不受影响
+  } finally {
+    clearTimeout(sessionTimeout)
+    agentSessionAbort = null
+  }
+}
 
 onBeforeUnmount(() => {
   pageAlive = false
   stopMicPolling()
   if (hwTimeoutTimer) clearTimeout(hwTimeoutTimer)
   cancelActiveRun()
+  suggestionsAbort?.abort()
+  suggestionsAbort = null
   agentSessionAbort?.abort()
   agentSessionAbort = null
   if (legacySseReconnectTimer) {
@@ -698,19 +715,15 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
     <div class="absolute inset-0 bg-black/5 backdrop-blur-[3px]"></div>
 
     <!-- Header：深阴影，浮在页面上方 -->
-    <div
-      class="relative z-50 w-full mt-[1.5em] flex flex-col shrink-0"
-      style="filter: drop-shadow(0 4px 16px rgba(0, 60, 60, 0.2))"
-    >
+    <div class="relative z-50 w-full mt-[1.5em] flex flex-col shrink-0" style="filter:drop-shadow(0 4px 16px rgba(0,60,60,0.2));">
       <div class="max-w-3xl mx-auto w-full flex justify-center px-[2em]">
         <LiquidBar title="互动问答" back="/" />
       </div>
     </div>
 
     <!-- 主体：左右布局 -->
-    <div
-      class="relative z-10 flex-1 flex items-center justify-center min-h-0 px-[2em] py-[1em] gap-[1.5em]"
-    >
+    <div class="relative z-10 flex-1 flex items-center justify-center min-h-0 px-[2em] py-[1em] gap-[1.5em]">
+
       <!-- ====== 左侧：表情 + 文字 + 麦克风 ====== -->
       <div class="flex flex-col items-center justify-center gap-8 shrink-0 w-[36%] max-w-[400px]">
         <div class="mascot-container relative">
@@ -720,42 +733,32 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
               'bg-[#168378]/6 scale-115': mascotState === 'listening',
               'bg-[#168378]/5 scale-110': mascotState === 'processing',
               'bg-[#168378]/8 scale-115': mascotState === 'answering',
-              'bg-transparent scale-100': mascotState === 'idle'
+              'bg-transparent scale-100': mascotState === 'idle',
             }"
           ></div>
-          <div
-            v-if="mascotState === 'listening'"
-            class="absolute inset-0 flex items-center justify-center"
-          >
-            <span class="sound-wave-bar" style="--i: 0"></span>
-            <span class="sound-wave-bar" style="--i: 1"></span>
-            <span class="sound-wave-bar" style="--i: 2"></span>
-            <span class="sound-wave-bar" style="--i: 3"></span>
-            <span class="sound-wave-bar" style="--i: 4"></span>
+          <div v-if="mascotState === 'listening'" class="absolute inset-0 flex items-center justify-center">
+            <span class="sound-wave-bar" style="--i:0"></span>
+            <span class="sound-wave-bar" style="--i:1"></span>
+            <span class="sound-wave-bar" style="--i:2"></span>
+            <span class="sound-wave-bar" style="--i:3"></span>
+            <span class="sound-wave-bar" style="--i:4"></span>
           </div>
           <div
             class="led-panel relative z-10 transition-all duration-500"
-            :class="{
-              'scale-105': mascotState === 'answering',
-              'scale-100': mascotState !== 'answering'
-            }"
+            :class="{ 'scale-105': mascotState === 'answering', 'scale-100': mascotState !== 'answering' }"
           >
             <div
               v-for="(dot, di) in getDotsAndColor(mascotState).dots"
               :key="di"
               class="led-dot"
-              :style="{
-                left: dot.x + 'px',
-                top: dot.y + 'px',
-                backgroundColor: dot.color || getDotsAndColor(mascotState).color
-              }"
+              :style="{ left: dot.x + 'px', top: dot.y + 'px', backgroundColor: dot.color || getDotsAndColor(mascotState).color }"
             ></div>
           </div>
         </div>
 
         <!-- 欢迎文字 -->
         <div v-if="!showAnswer && !messages.length" class="text-center max-w-[320px]">
-          <p class="whitespace-pre-wrap text-[#1a3a2a]" style="line-height: 1.6">
+          <p class="whitespace-pre-wrap text-[#1a3a2a]" style="line-height:1.6;">
             <span class="text-lg font-semibold">{{ welcomeText.split('\n')[0] }}</span>
             <br v-if="welcomeText.includes('\n')" />
             <span class="text-sm">{{ welcomeText.split('\n').slice(1).join('\n') }}</span>
@@ -766,46 +769,18 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
         <button
           class="relative w-[72px] h-[72px] rounded-full flex items-center justify-center transition-all duration-300 cursor-pointer border-none outline-none shrink-0"
           :class="{
-            'text-white shadow-md shadow-[#168378]/25 hover:scale-110 hover:shadow-lg hover:shadow-[#168378]/35':
-              !micActive,
-            'bg-[#ef4444] text-white shadow-md shadow-[#ef4444]/25 scale-110': micActive
+            'text-white shadow-md shadow-[#168378]/25 hover:scale-110 hover:shadow-lg hover:shadow-[#168378]/35': !micActive,
+            'bg-[#ef4444] text-white shadow-md shadow-[#ef4444]/25 scale-110': micActive,
           }"
-          :style="
-            !micActive ? { background: 'radial-gradient(circle at 40% 40%, #2dd4bf, #168378)' } : {}
-          "
+          :style="!micActive ? { background: 'radial-gradient(circle at 40% 40%, #2dd4bf, #168378)' } : {}"
           @click="toggleMic"
         >
-          <span
-            v-if="micActive"
-            class="absolute inset-0 rounded-full bg-[#ef4444] animate-ping opacity-25"
-          ></span>
+          <span v-if="micActive" class="absolute inset-0 rounded-full bg-[#ef4444] animate-ping opacity-25"></span>
           <svg viewBox="0 0 36 36" width="28" height="28" fill="none" class="relative z-10">
             <rect x="12" y="4" width="12" height="18" rx="6" fill="currentColor" />
-            <path
-              d="M8 16 Q8 22 18 22 Q28 22 28 16"
-              stroke="currentColor"
-              stroke-width="2.5"
-              fill="none"
-              stroke-linecap="round"
-            />
-            <line
-              x1="18"
-              y1="22"
-              x2="18"
-              y2="29"
-              stroke="currentColor"
-              stroke-width="2.5"
-              stroke-linecap="round"
-            />
-            <line
-              x1="11"
-              y1="29"
-              x2="25"
-              y2="29"
-              stroke="currentColor"
-              stroke-width="2.5"
-              stroke-linecap="round"
-            />
+            <path d="M8 16 Q8 22 18 22 Q28 22 28 16" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" />
+            <line x1="18" y1="22" x2="18" y2="29" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" />
+            <line x1="11" y1="29" x2="25" y2="29" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" />
           </svg>
         </button>
       </div>
@@ -814,63 +789,31 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
       <div class="flex-1 max-w-[580px] flex flex-col justify-center gap-4">
         <template v-if="showAnswer">
           <div class="question-card px-6 py-5 overflow-y-auto max-h-[50vh]">
-            <p
-              class="text-[15px] whitespace-pre-wrap text-[#1a3a2a] animate-fade-in"
-              style="line-height: 1.6"
-            >
+            <p class="text-[15px] whitespace-pre-wrap text-[#1a3a2a] animate-fade-in" style="line-height:1.6;">
               {{ answerText }}
             </p>
-            <button
-              class="mt-3 flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium cursor-pointer transition-all active:scale-95 hover:bg-[#168378]/15"
-              style="background: rgba(22, 131, 120, 0.08); color: #168378"
-              @click="speakText(answerText)"
-            >
+            <button class="mt-3 flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium cursor-pointer transition-all active:scale-95 hover:bg-[#168378]/15" style="background:rgba(22,131,120,0.08);color:#168378;" @click="speakText(answerText)">
               🔊 听播报
             </button>
           </div>
-          <button
-            class="self-center px-5 py-2 rounded-xl text-sm font-medium cursor-pointer transition-all duration-200 active:scale-95"
-            style="
-              background: rgba(255, 255, 255, 0.09);
-              backdrop-filter: blur(14px);
-              -webkit-backdrop-filter: blur(14px);
-              border: 1px solid rgba(22, 131, 120, 0.13);
-              color: #168378;
-            "
-            @click="goBack"
-          >
+          <button class="self-center px-5 py-2 rounded-xl text-sm font-medium cursor-pointer transition-all duration-200 active:scale-95" style="background:rgba(255,255,255,0.09);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);border:1px solid rgba(22,131,120,0.13);color:#168378;" @click="goBack">
             ← 返回
           </button>
         </template>
         <template v-else>
-          <div
-            class="relative mb-3 px-5 py-2.5 mx-auto"
-            style="
-              background: rgba(255, 255, 255, 0.1);
-              backdrop-filter: blur(12px);
-              border-radius: 16px 16px 16px 4px;
-              border: 1px solid rgba(22, 131, 120, 0.15);
-            "
-          >
-            <h3
-              class="text-lg font-extrabold text-[#168378] text-center"
-              style="letter-spacing: 0.02em"
-            >
+          <div class="relative mb-3 px-5 py-2.5 mx-auto" style="background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:16px 16px 16px 4px;border:1px solid rgba(22,131,120,0.15);">
+            <h3 class="text-lg font-extrabold text-[#168378] text-center" style="letter-spacing:0.02em;">
               💬 试试问我这些问题吧～
             </h3>
           </div>
           <div class="grid grid-cols-2 auto-rows-fr gap-4 max-h-[60vh] overflow-y-auto pr-2">
             <button
-              v-for="(q, idx) in suggestions"
-              :key="idx"
+              v-for="(q, idx) in suggestions" :key="idx"
               class="question-card flex items-center gap-2 px-4 py-4 transition-all duration-200 cursor-pointer active:scale-[0.97]"
-              style="min-height: 56px"
-              :disabled="isSending"
-              @click="sendQuestion(q)"
+              style="min-height:56px;"
+              :disabled="isSending" @click="sendQuestion(q)"
             >
-              <span class="text-[15px] font-medium leading-snug text-[#1a3a2a] dark:text-white">{{
-                q
-              }}</span>
+              <span class="text-[15px] font-medium leading-snug text-[#1a3a2a] dark:text-white">{{ q }}</span>
             </button>
           </div>
         </template>
@@ -880,106 +823,46 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
 </template>
 
 <style scoped>
-.qa-kid-root {
-  background: url(rc://bg.png) center / cover no-repeat fixed;
-  zoom: 1.15;
-}
+.qa-kid-root { background: url(rc://bg.png) center / cover no-repeat fixed; zoom: 1.15; }
 
 .led-panel {
-  width: 280px;
-  aspect-ratio: 1.4 / 1;
-  background: rgba(22, 48, 45, 0.35);
-  backdrop-filter: blur(12px) saturate(120%);
-  -webkit-backdrop-filter: blur(12px) saturate(120%);
-  border-radius: 24px;
-  position: relative;
-  overflow: hidden;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  width: 280px; aspect-ratio: 1.4 / 1;
+  background: rgba(22, 48, 45, 0.35); backdrop-filter: blur(12px) saturate(120%); -webkit-backdrop-filter: blur(12px) saturate(120%);
+  border-radius: 24px; position: relative; overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.06);
   box-shadow: 0 3px 12px rgba(15, 32, 30, 0.15);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: flex; align-items: center; justify-content: center;
 }
-.led-dot {
-  position: absolute;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  transition: opacity 0.3s ease;
-  box-shadow:
-    0 0 3px currentColor,
-    0 0 8px currentColor;
-}
+.led-dot { position: absolute; width: 12px; height: 12px; border-radius: 50%; transition: opacity 0.3s ease; box-shadow: 0 0 3px currentColor, 0 0 8px currentColor; }
 
 /* 声波纹 */
 .sound-wave-bar {
-  position: absolute;
-  width: 6px;
-  height: 20px;
-  background: #168378;
-  border-radius: 3px;
-  animation: sound-wave 1.2s ease-in-out infinite;
-  animation-delay: calc(var(--i) * 0.15s);
+  position: absolute; width: 6px; height: 20px; background: #168378; border-radius: 3px;
+  animation: sound-wave 1.2s ease-in-out infinite; animation-delay: calc(var(--i) * 0.15s);
 }
 @keyframes sound-wave {
-  0%,
-  100% {
-    height: 8px;
-    opacity: 0.4;
-  }
-  50% {
-    height: 36px;
-    opacity: 1;
-  }
+  0%, 100% { height: 8px; opacity: 0.4; }
+  50% { height: 36px; opacity: 1; }
 }
-.sound-wave-bar:nth-child(1) {
-  left: calc(50% - 30px);
-}
-.sound-wave-bar:nth-child(2) {
-  left: calc(50% - 15px);
-}
-.sound-wave-bar:nth-child(3) {
-  left: calc(50% - 0px);
-}
-.sound-wave-bar:nth-child(4) {
-  left: calc(50% + 15px);
-}
-.sound-wave-bar:nth-child(5) {
-  left: calc(50% + 30px);
-}
+.sound-wave-bar:nth-child(1) { left: calc(50% - 30px); }
+.sound-wave-bar:nth-child(2) { left: calc(50% - 15px); }
+.sound-wave-bar:nth-child(3) { left: calc(50% - 0px); }
+.sound-wave-bar:nth-child(4) { left: calc(50% + 15px); }
+.sound-wave-bar:nth-child(5) { left: calc(50% + 30px); }
 
-@keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(8px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-.animate-fade-in {
-  animation: fade-in 0.4s ease-out;
-}
+@keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.animate-fade-in { animation: fade-in 0.4s ease-out; }
 
-div.overflow-y-auto::-webkit-scrollbar {
-  width: 0;
-}
+div.overflow-y-auto::-webkit-scrollbar { width: 0; }
 
 /* 问题卡片/答案面板：低白色透明度 + 同色系细边框 */
 .question-card {
-  background: rgba(255, 255, 255, 0.09);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border: 1px solid rgba(22, 131, 120, 0.13);
-  border-radius: 16px;
-  transition: all 0.25s ease;
+  background: rgba(255,255,255,0.09); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(22,131,120,0.13); border-radius: 16px; transition: all 0.25s ease;
 }
 .question-card:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.16);
-  backdrop-filter: blur(16px);
-  border-color: rgba(22, 131, 120, 0.25);
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
-  transform: translateY(-1px);
+  background: rgba(255,255,255,0.16); backdrop-filter: blur(16px);
+  border-color: rgba(22,131,120,0.25);
+  box-shadow: 0 6px 20px rgba(0,0,0,0.08); transform: translateY(-1px);
 }
 </style>

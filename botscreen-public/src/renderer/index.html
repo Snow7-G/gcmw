@@ -12,7 +12,8 @@
         components that set style attributes (verified via Electron smoke);
         styles can never execute code.
       - media-src/img-src keep rc: for local content; connect-src is pinned to
-        the local QA backend (127.0.0.1:8000) instead of all localhost ports.
+        the two local QA backends — legacy voice (127.0.0.1:8000) and the
+        Agent demo service (127.0.0.1:8001) — instead of all localhost ports.
       - No worker-src grant: MathJax v3 (mathjax-full) typesets on the main
         thread and spawns no workers.
     -->
