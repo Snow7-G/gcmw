@@ -30,11 +30,12 @@ from app.agents.manager import (
 )
 from app.agents.medical_qa import MedicalQAAgent
 from app.agents.registry import AgentManifest, AgentRegistry
-from app.contracts.agent import AgentContext, AgentResult, AgentStatus, Evidence
+from app.contracts.agent import AgentContext, AgentStatus
 from app.contracts.common import Channel
 from app.contracts.events import SSEEventType
 from app.orchestration.executor import RunExecutor
 from app.storage.run_repository import MemoryRunRepository, RunIdentity
+from app.tools.quota import RunToolQuota, current_run_quota
 
 APPROVED_AT = datetime(2026, 1, 5, tzinfo=timezone.utc)
 TRUSTED = ("mock", "mock-model", "1.0.0")
@@ -176,10 +177,13 @@ def _manager(runner, verifier, **overrides) -> ManagerAgent:
     )
 
 
-class TestCrossRevisionAccumulation:
+class TestSharedQuotaState:
     @mark.asyncio
-    async def test_a_revision_is_granted_only_the_leftover(self):
-        runner = _RecordingRunner(demand=2)  # each engagement demands 2
+    async def test_the_advisory_grant_does_not_reset_between_revisions(self):
+        """The HARD enforcement lives in the gateway's shared quota state (see
+        test_manager_agent.TestToolBudgetIsRunCumulative); the context integer
+        is advisory only and never restarts the budget for a revision."""
+        runner = _RecordingRunner(demand=2)
         verifier = _ScriptedVerifier(
             [
                 Verdict(VerifierOutcome.REVISE, "ungrounded"),
@@ -188,26 +192,57 @@ class TestCrossRevisionAccumulation:
         )
         manager = _manager(runner, verifier)
         result = await manager.execute(_ctx(), "发热怎么办")
-        assert runner.granted == [4, 2]  # the revision sees the LEFTOVER only
+        assert runner.granted == [4, 4]  # advisory, never re-granted
         assert result.safety_status == "verified"
 
     @mark.asyncio
-    async def test_an_exhausted_budget_grants_zero(self):
-        runner = _RecordingRunner(demand=4)  # burns the whole budget
-        verifier = _ScriptedVerifier(
-            [
-                Verdict(VerifierOutcome.REVISE, "ungrounded"),
-                Verdict(VerifierOutcome.PASS, ""),
-            ]
+    async def test_the_quota_object_is_created_once_per_execute(self):
+        seen = []
+
+        class _SpyVerifier:
+            def __init__(self, inner):
+                self._inner = inner
+
+            async def __call__(self, ctx, execution):
+                seen.append(current_run_quota())
+                return await self._inner(ctx, execution)
+
+        runner = _RecordingRunner(demand=2)
+        manager = _manager(
+            runner, _SpyVerifier(_ScriptedVerifier([Verdict(VerifierOutcome.PASS, "")]))
         )
-        manager = _manager(runner, verifier)
-        result = await manager.execute(_ctx(), "发热怎么办")
-        assert runner.granted == [4, 0]  # zero left: zero calls possible
-        assert runner.reported == [4, 0]  # a well-behaved agent made ZERO calls
-        assert result.safety_status == "verified"
+        await manager.execute(_ctx(), "发热怎么办")
+        # both verifier sightings saw the SAME quota object
+        assert len(seen) == 1
+        assert seen[0] is not None
+        assert seen[0].consumed == 0  # a stub runner never touched the gateway
 
+    def test_zero_limit_quota_refuses_everything(self):
 
-# -- trusted provenance ----------------------------------------------------------
+        quota = RunToolQuota(0)
+        assert quota.try_acquire() is False
+        assert quota.consumed == 0
+        assert quota.refused == 1
+
+    def test_concurrent_acquires_cannot_overshoot_the_limit(self):
+        """Remaining 1, two concurrent callers: exactly ONE enters."""
+        import threading
+
+        quota = RunToolQuota(1)
+        results = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            barrier.wait()
+            results.append(quota.try_acquire())
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sorted(results) == [False, True]
+        assert quota.consumed == 1
 
 
 class TestTrustedProvenance:
@@ -246,81 +281,138 @@ class TestTrustedProvenance:
             await manager.execute(_ctx(deadline=past), "发热怎么办")
 
 
-# -- SSE publishes only the trusted provenance -----------------------------------
-
-
-class _VerifiedManager:
-    """Minimal manager stub delivering a verified answer with provenance."""
-
-    def __init__(self, model: dict[str, str] | None) -> None:
-        self._model = model
-
-    async def execute(self, ctx, text, on_stage=None) -> AgentResult:
-        for stage in ("guarding", "routing", "retrieving", "drafting", "verifying"):
-            if on_stage is not None:
-                await on_stage(stage)
-        return AgentResult(
-            agent_id="manager",
-            status=AgentStatus.COMPLETED,
-            answer_candidate="体温超过38.5建议门诊就诊。",
-            evidence=[
-                Evidence(
-                    source_id="faq-fever",
-                    source_type="faq",
-                    title="发热护理须知",
-                    content="体温超过38.5建议门诊就诊。",
-                    source_uri="kbase://faq-fever",
-                    content_hash="h",
-                    knowledge_version="v1",
-                )
-            ],
-            actions=[],
-            safety_status="verified",
-            model=self._model,
-        )
-
-
 class TestSsePublishesOnlyTrustedProvenance:
-    async def _drive(self, model):
+    """END-TO-END through the REAL Manager and the REAL executor: the wire's
+    ``answer.completed.model`` is the trusted server-side triple when a mapping
+    exists, and is ABSENT when it does not — never the runner's forged claim.
+    (The old stub-based test bypassed the Manager entirely and proved nothing
+    about the fail-open fallback.)"""
+
+    @mark.asyncio
+    async def test_with_a_mapping_the_wire_carries_the_trusted_triple(self):
+        # step 1: the Manager's own result carries the trusted triple
+        runner = _RecordingRunner(demand=0)  # no gateway calls, forged identity
+        manager = _manager(
+            runner, _ScriptedVerifier([Verdict(VerifierOutcome.PASS, "")])
+        )
+        result = await manager.execute(_ctx(), "发热怎么办")
+        assert result.model == {
+            "provider_id": TRUSTED[0],
+            "model_id": TRUSTED[1],
+            "model_version": TRUSTED[2],
+        }
+        # step 2: a FRESH manager (same config) drives the executor — the wire
+        # must publish exactly what the Manager verified, never the forgery
         repository = MemoryRunRepository()
         executor = RunExecutor(
             repository=repository,
-            manager=_VerifiedManager(model),  # type: ignore[arg-type]
+            manager=_manager(
+                _RecordingRunner(demand=0),
+                _ScriptedVerifier([Verdict(VerifierOutcome.PASS, "")]),
+            ),  # type: ignore[arg-type]
         )
         identity = RunIdentity(
             run_id="r-sse-prov", tenant_id="t1", device_id="d1", session_id="s1"
         )
         await repository.create(identity)
-
-        class _Record:
-            pass
-
-        record = _Record()
-        record.identity = identity
-
-        class _Snap:
-            channel = "text"
-            text = "发热怎么办"
-
-        record.snapshot = _Snap()
-        await asyncio.wait_for(executor.execute(record), timeout=5)
+        await asyncio.wait_for(executor.execute(_record_for(identity)), timeout=5)
         page = await repository.snapshot(identity, 0, 0.0)
         completed = [e for e in page.events if e.event is SSEEventType.ANSWER_COMPLETED]
         assert len(completed) == 1
-        return completed[0].data
-
-    @mark.asyncio
-    async def test_the_wire_carries_the_trusted_triple(self):
-        data = await self._drive(
-            {"provider_id": "mock", "model_id": "mock-model", "model_version": "1.0.0"}
-        )
-        assert data["model"] == {
-            "provider_id": "mock",
-            "model_id": "mock-model",
-            "model_version": "1.0.0",
+        assert completed[0].data["model"] == {
+            "provider_id": TRUSTED[0],
+            "model_id": TRUSTED[1],
+            "model_version": TRUSTED[2],
         }
 
     @mark.asyncio
-    async def test_no_provenance_attached_means_no_provenance_on_the_wire(self):
-        data = await self._drive(None)
-        assert "model" not in data  # a Manager without provenance publishes none
+    async def test_without_a_mapping_no_provenance_reaches_the_wire(self):
+        """P1-2: real Manager, NO trusted mapping, runner forges a triple and
+        PASSes — the result carries NO model and the SSE has no model key."""
+        repository = MemoryRunRepository()
+        runner = _RecordingRunner(demand=0)
+        registry = AgentRegistry()
+        registry.register(
+            AgentManifest(
+                agent_id="qa",
+                version="1.0.0",
+                supported_intents=["knowledge"],
+                risk_level="medium",
+            )
+        )
+        red, risk = _rules()
+        manager = ManagerAgent(
+            registry=registry,
+            agent_runners={"qa": runner},
+            # TWO verdicts: the Manager result probe and the executor's own
+            # engagement each consume one
+            verifier=_ScriptedVerifier(
+                [Verdict(VerifierOutcome.PASS, ""), Verdict(VerifierOutcome.PASS, "")]
+            ),
+            red_flag_rules=red,
+            risk_rules=risk,
+            # NO trusted_model_provenance: the fail-open fallback is gone
+        )
+        executor = RunExecutor(repository=repository, manager=manager)  # type: ignore[arg-type]
+        identity = RunIdentity(
+            run_id="r-sse-nomap", tenant_id="t1", device_id="d1", session_id="s1"
+        )
+        await repository.create(identity)
+        result = await manager.execute(_ctx(run_id="r-sse-nomap"), "发热怎么办")
+        assert result.model is None  # fail closed: no model identity at all
+        await asyncio.wait_for(executor.execute(_record_for(identity)), timeout=5)
+        page = await repository.snapshot(identity, 0, 0.0)
+        completed = [e for e in page.events if e.event is SSEEventType.ANSWER_COMPLETED]
+        assert len(completed) == 1
+        assert "model" not in completed[0].data  # never the forged claim
+
+
+def _record_for(identity):
+    """The slice of RunRecord the executor reads."""
+
+    class _Record:
+        pass
+
+    record = _Record()
+    record.identity = identity
+
+    class _Snap:
+        channel = "text"
+        text = "发热怎么办"
+
+    record.snapshot = _Snap()
+    return record
+
+
+class TestProvenanceValidationAtConstruction:
+    @staticmethod
+    def _registry():
+        registry = AgentRegistry()
+        registry.register(
+            AgentManifest(
+                agent_id="qa",
+                version="1.0.0",
+                supported_intents=["knowledge"],
+                risk_level="medium",
+            )
+        )
+        return registry
+
+    @mark.parametrize(
+        "triple",
+        [
+            ("mock", "mock-model"),  # only two fields
+            ("mock", "", "1.0.0"),  # empty model id
+            ("p" * 65, "m", "1.0.0"),  # provider id over the 64-char bound
+            "mock-model",  # not a tuple at all
+        ],
+    )
+    def test_a_malformed_triple_fails_at_assembly(self, triple):
+        red, risk = _rules()
+        with raises(ValueError):
+            ManagerAgent(
+                registry=self._registry(),
+                red_flag_rules=red,
+                risk_rules=risk,
+                trusted_model_provenance={"qa": triple},
+            )

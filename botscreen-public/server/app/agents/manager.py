@@ -72,6 +72,11 @@ from app.contracts.agent import (
     RiskLevel,
 )
 from app.contracts.errors import ErrorCode
+from app.tools.quota import (
+    RunToolQuota,
+    reset_run_quota,
+    set_run_quota,
+)
 
 # PII-ish patterns removed before any model/runner sees the text. The
 # replacement marker never echoes the matched value.
@@ -262,14 +267,15 @@ class ManagerLimits:
     ``float``, ``str``, ``NaN`` and ``Infinity`` raise ``TypeError``, because
     ``NaN > ceiling`` is False and would silently disable the ceiling.
 
-    IMPORTANT (honest scope): the handoff budget is enforced BEFORE each
-    engagement (a tightened ``max_handoffs`` forbids the call rather than
-    reporting it afterwards), but ``max_tool_calls`` is a **POST-HOC,
-    RUN-CUMULATIVE check** — the counts are read from the sub-agent's own reports
-    after each engagement and SUMMED over the whole run (first execution plus
-    every revision). Call-time hard counting requires the ToolGateway quota path
-    and lands with #55A; until then this PR must not claim the tool budget is
-    preemptively enforced.
+    IMPORTANT (honest scope, #55A-B): the handoff budget is enforced BEFORE
+    each engagement, and ``max_tool_calls`` is now enforced AT CALL TIME inside
+    the ToolGateway itself: one :class:`~app.tools.quota.RunToolQuota` is created
+    per ``execute()``, shared by the first execution and every revision, and the
+    gateway atomically acquires a unit BEFORE each submission — an exhausted
+    budget makes the call impossible. The authoritative count is that quota
+    state; a sub-agent's self-reported ``tool_calls`` is ignored. The POST-HOC
+    comparison against ``quota.consumed`` is retained only as a belt for the
+    quota-less legacy path.
     """
 
     max_input_chars: int = 2000
@@ -474,9 +480,26 @@ class ManagerAgent:
         # output) claims about its own identity is DISCARDED and overwritten
         # with these values in ``_trusted_snapshot`` — a forged provenance can
         # never reach the verdict, the markers or the delivered result.
-        self._trusted_provenance: dict[str, tuple[str, str, str]] = dict(
-            trusted_model_provenance or {}
-        )
+        provenance: dict[str, tuple[str, str, str]] = {}
+        for agent_id, triple in (trusted_model_provenance or {}).items():
+            # #55A-B: a trusted triple must be EXACTLY three non-empty, bounded
+            # strings — a malformed entry fails at assembly, never at runtime
+            if not isinstance(triple, tuple) or len(triple) != 3:
+                raise ValueError(
+                    f"trusted_model_provenance[{agent_id!r}] must be a "
+                    "(provider_id, model_id, model_version) tuple"
+                )
+            bounds = (64, 128, 64)
+            for part, bound, label in zip(
+                triple, bounds, ("provider", "model", "version")
+            ):
+                if not isinstance(part, str) or not part.strip() or len(part) > bound:
+                    raise ValueError(
+                        f"trusted_model_provenance[{agent_id!r}].{label}_id must "
+                        f"be a non-empty string of at most {bound} chars"
+                    )
+            provenance[agent_id] = triple
+        self._trusted_provenance = provenance
 
     # -- guard ----------------------------------------------------------------
 
@@ -681,24 +704,20 @@ class ManagerAgent:
             raise ManagerAgentError(
                 ErrorCode.MODEL_OUTPUT_UNPARSEABLE, _INVALID_EXECUTION
             )
-        # #55A-B: provenance is SERVER-SIDE ONLY. Whatever the sub-agent (or
-        # the model output) claimed is discarded and replaced with the trusted
-        # ModelGateway/Provider configuration for this agent — a forged
-        # provider/model identity can never reach the verdict or the SSE layer.
+        # #55A-B: provenance is SERVER-SIDE ONLY, and there is NO fallback to
+        # what the sub-agent (or the model output) claimed — an unmapped agent
+        # carries EMPTY provenance fields, never raw values. A missing mapping
+        # must fail closed: empty provenance means the SSE layer publishes no
+        # model identity at all, rather than one the model invented.
         trusted = self._trusted_provenance.get(agent_id)
-        provenance = (
-            {
+        if trusted is not None:
+            provenance = {
                 "provider_id": trusted[0],
                 "model_id": trusted[1],
                 "model_version": trusted[2],
             }
-            if trusted is not None
-            else {
-                "provider_id": raw.provider_id,
-                "model_id": raw.model_id,
-                "model_version": raw.model_version,
-            }
-        )
+        else:
+            provenance = {"provider_id": "", "model_id": "", "model_version": ""}
         return AgentExecution(
             agent_id=agent_id,
             status=raw.status,
@@ -745,6 +764,25 @@ class ManagerAgent:
         problem (the executor swallows storage faults and lets the run finish).
         The default ``None`` keeps this call exactly as it was, so no existing
         behaviour or test changes."""
+        # #55A-B: ONE Manager-owned, run-wide tool quota binds to THIS task's
+        # context — the ToolGateway acquires from it atomically before every
+        # submission, so the enforcement is INSIDE the gateway, not an integer
+        # the sub-agent may ignore. The ContextVar needs no global registry and
+        # is released when this task context ends.
+        quota = RunToolQuota(self._limits.max_tool_calls)
+        quota_token = set_run_quota(quota)
+        try:
+            return await self._execute_turn(ctx, text, on_stage, quota)
+        finally:
+            reset_run_quota(quota_token)
+
+    async def _execute_turn(
+        self,
+        ctx: AgentContext,
+        text: str,
+        on_stage: Any,
+        quota: RunToolQuota,
+    ) -> AgentResult:
         actions: list[dict[str, Any]] = []
         await _emit_stage(on_stage, "guarding")
         self._mark(actions, "manager.guard")
@@ -807,7 +845,11 @@ class ManagerAgent:
         # untrusted output -> validated, isolated snapshot (identity bound to the
         # trusted routing decision, impossible statuses and bad types refused)
         execution = self._trusted_snapshot(raw, agent_id=agent_id)
-        run_tool_calls += execution.tool_calls
+        # #55A-B: the AUTHORITATIVE count is the quota state the gateway
+        # enforced — the sub-agent's self-report is ignored (a rogue runner can
+        # claim anything). The POST-HOC cap stays as a belt: with the gateway
+        # enforcement it can only fire for a quota-less legacy path.
+        run_tool_calls = quota.consumed
         self._raise_if_tool_over_budget(run_tool_calls)
         self._mark(
             actions,
@@ -852,21 +894,15 @@ class ManagerAgent:
             ):
                 revisions += 1
                 self._mark(actions, "verify.revise", revision=revisions)
-                # #55A-B: the revision is granted ONLY the leftover of the
-                # run-cumulative tool budget — counts accumulate across
-                # revisions, so a revision can never start a fresh quota
-                sub_ctx = sub_ctx.model_copy(
-                    update={
-                        "tool_budget_granted": max(
-                            0, self._limits.max_tool_calls - run_tool_calls
-                        )
-                    }
-                )
+                # #55A-B: NO fresh grant for the revision — first execution and
+                # every revision share the SAME quota state, enforced inside the
+                # gateway; the advisory ``tool_budget_granted`` stays at its
+                # initial value and never resets the run-wide budget
                 raw = await self._run_with_deadline(
                     lambda sc=sub_ctx: runner(sc), self._remaining_ms(ctx)
                 )
                 execution = self._trusted_snapshot(raw, agent_id=agent_id)
-                run_tool_calls += execution.tool_calls
+                run_tool_calls = quota.consumed  # authoritative, shared state
                 self._raise_if_tool_over_budget(run_tool_calls)
                 if execution.status is not AgentStatus.COMPLETED:
                     # a revision that did not complete is not verifiable: stop
@@ -931,6 +967,7 @@ class ManagerAgent:
         # validation + snapshot is taken here so nothing the runner or the
         # verifier still holds a reference to can alter the delivered result.
         delivered = self._trusted_snapshot(execution, agent_id=agent_id)
+        trusted = self._trusted_provenance.get(agent_id)
         return self._finalize(
             ctx,
             actions,
@@ -939,11 +976,17 @@ class ManagerAgent:
             answer=delivered.answer_candidate,
             safety="verified",
             confidence="high",
-            model_provenance={
-                "provider_id": delivered.provider_id,
-                "model_id": delivered.model_id,
-                "model_version": delivered.model_version,
-            },
+            # provenance attaches ONLY from the trusted mapping — never from
+            # the execution's fields, which are empty without one
+            model_provenance=(
+                {
+                    "provider_id": trusted[0],
+                    "model_id": trusted[1],
+                    "model_version": trusted[2],
+                }
+                if trusted is not None
+                else None
+            ),
         )
 
     # -- helpers ---------------------------------------------------------------

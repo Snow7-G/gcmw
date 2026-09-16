@@ -129,20 +129,27 @@ class MedicalQAAgent:
         # exhausted grant makes the call impossible — never a post-hoc count
         if budget["calls"] >= budget["ceiling"]:
             return []
-        result = await self._tools.ainvoke(
-            ctx,  # trusted identity: the gateway derives tenant/session/run here
-            ToolRequest(
-                tool_name="knowledge.search",
-                # NO identity arguments: tenant/session come from the context the
-                # gateway injects, and the schema forbids extra properties
-                arguments={
-                    "query": ctx.normalized_input,
-                    "top_k": self._max_fragments + 2,
-                },
-            ),
-            allowed_tools=self._allowed_tools,
-            agent_id=self._agent_id,
-        )
+        try:
+            result = await self._tools.ainvoke(
+                ctx,  # trusted identity: the gateway derives tenant/session/run here
+                ToolRequest(
+                    tool_name="knowledge.search",
+                    # NO identity arguments: tenant/session come from the context
+                    # the gateway injects, and the schema forbids extra properties
+                    arguments={
+                        "query": ctx.normalized_input,
+                        "top_k": self._max_fragments + 2,
+                    },
+                ),
+                allowed_tools=self._allowed_tools,
+                agent_id=self._agent_id,
+            )
+        except ToolGatewayError as exc:
+            if exc.code is ErrorCode.TOOL_OVER_LIMIT:
+                # the run quota is exhausted AT THE GATEWAY BOUNDARY: the call
+                # never started, so stop calling gracefully (no_evidence below)
+                return []
+            raise
         budget["calls"] += 1
         if not result.ok:
             return []
@@ -199,6 +206,10 @@ class MedicalQAAgent:
                 agent_id=self._agent_id,
             )
         except ToolGatewayError as exc:
+            if exc.code is ErrorCode.TOOL_OVER_LIMIT:
+                # a quota refusal at the boundary is NOT a started attempt: the
+                # call never executed, so it is neither counted nor retried
+                return None
             # the round-trip still happened and was audited, so it counts
             budget["calls"] += 1
             if exc.code is ErrorCode.NOT_FOUND_KNOWLEDGE:
