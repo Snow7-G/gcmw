@@ -16,6 +16,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 SUPPORTED_MODALITIES = ("text", "audio", "image", "video")
 
+# #51 hard constraints: development/regression always ride the pinned snapshot;
+# the floating alias is only a controlled-upgrade vehicle (change approval +
+# regression) and is never accepted as a session model target.
+CLOUD_MODEL_PINNED_SNAPSHOT = "qwen3.5-omni-plus-realtime-2026-03-15"
+CLOUD_MODEL_FLOATING_ALIAS = "qwen3.5-omni-plus-realtime"
+
 
 def _normalized_host(value: str) -> str:
     try:
@@ -61,7 +67,7 @@ class CloudProviderConfig(BaseModel):
 
     provider: str = "dashscope_realtime"
     adapter: str = "cloud_realtime"
-    model: str = "qwen3.5-omni-plus-realtime"
+    model: str = CLOUD_MODEL_PINNED_SNAPSHOT
     api_base: str = "https://dashscope.aliyuncs.com/api/v1"
     api_key_env: str = "GCMW_CLOUD_API_KEY"
     transport: str = "websocket"
@@ -75,6 +81,16 @@ class CloudProviderConfig(BaseModel):
         if not v or any(item not in SUPPORTED_MODALITIES for item in v):
             raise ValueError(
                 f"modalities must be non-empty subset of {SUPPORTED_MODALITIES}"
+            )
+        return v
+
+    @field_validator("model")
+    @classmethod
+    def validate_model_snapshot(cls, v):
+        if v == CLOUD_MODEL_FLOATING_ALIAS:
+            raise ValueError(
+                "floating alias is not a session target; pin a released "
+                "snapshot (controlled upgrade only)"
             )
         return v
 
@@ -215,7 +231,7 @@ class Settings(BaseModel):
         cloud = CloudProviderConfig(
             provider=os.getenv("GCMW_CLOUD_PROVIDER", "dashscope_realtime"),
             adapter=os.getenv("GCMW_CLOUD_ADAPTER", "cloud_realtime"),
-            model=os.getenv("GCMW_CLOUD_MODEL", "qwen3.5-omni-plus-realtime"),
+            model=os.getenv("GCMW_CLOUD_MODEL", CLOUD_MODEL_PINNED_SNAPSHOT),
             api_base=os.getenv(
                 "GCMW_CLOUD_API_BASE", "https://dashscope.aliyuncs.com/api/v1"
             ),
