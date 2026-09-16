@@ -18,6 +18,7 @@ import contextvars
 import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import ClassVar
 
 from pytest import mark, raises
 
@@ -42,6 +43,8 @@ from app.storage.run_repository import MemoryRunRepository, RunIdentity
 from app.tools.builtins import build_gateway
 from app.tools.gateway import ToolGatewayError
 from app.tools.quota import (
+    CLOSED,
+    GRANTED,
     RunToolQuota,
     current_run_quota,
     reset_run_quota,
@@ -435,20 +438,22 @@ class TestProvenanceValidationAtConstruction:
 
 class _BackgroundSpawner:
     """A rogue runner that spawns a background task whose LATE gateway calls
-    fire only after the Manager has ended. It also reports tool_calls=0."""
+    fire only when the TEST releases them (after the Manager has ended, so a
+    slow CI can never make a "late" call land while the quota is still open).
+    It also reports tool_calls=0."""
 
-    def __init__(self, gateway, late_calls=1, delay=0.1, stall_s=0.0):
+    def __init__(self, gateway, late_calls=1, stall_s=0.0):
         self.gateway = gateway
         self.late_calls = late_calls
-        self.delay = delay
         self.stall_s = stall_s
         self.tasks = []
         self.late_codes = []
         self.spawned = asyncio.Event()
+        self.release = asyncio.Event()
 
     def _spawn(self, ctx):
         async def late():
-            await asyncio.sleep(self.delay)  # the Manager ends before this
+            await self.release.wait()  # the test decides when "late" happens
             for _ in range(self.late_calls):
                 try:
                     await self.gateway.ainvoke(
@@ -506,7 +511,8 @@ class TestQuotaLifecycle:
 
     async def _spawn_and_wait_late(self, runner):
         await asyncio.wait_for(runner.spawned.wait(), timeout=2)
-        await asyncio.gather(*runner.tasks)  # the late attempts happen now
+        runner.release.set()  # the Manager has ENDED; the late attempts fire now
+        await asyncio.gather(*runner.tasks)
 
     @mark.asyncio
     async def test_after_a_normal_return_the_background_task_executes_nothing(self):
@@ -514,7 +520,7 @@ class TestQuotaLifecycle:
         gateway = build_gateway(
             knowledge_store=KnowledgeStore(), audit_sink=records.append
         )
-        runner = _BackgroundSpawner(gateway, delay=0.5)
+        runner = _BackgroundSpawner(gateway)
         manager = _manager(
             runner, _ScriptedVerifier([Verdict(VerifierOutcome.PASS, "")])
         )
@@ -532,7 +538,7 @@ class TestQuotaLifecycle:
         gateway = build_gateway(
             knowledge_store=KnowledgeStore(), audit_sink=records.append
         )
-        runner = _BackgroundSpawner(gateway, delay=0.5, stall_s=2.0)
+        runner = _BackgroundSpawner(gateway, stall_s=2.0)
         manager = _manager(
             runner, _ScriptedVerifier([Verdict(VerifierOutcome.PASS, "")])
         )
@@ -552,7 +558,7 @@ class TestQuotaLifecycle:
         gateway = build_gateway(
             knowledge_store=KnowledgeStore(), audit_sink=records.append
         )
-        runner = _BackgroundSpawner(gateway, delay=0.5, stall_s=30.0)
+        runner = _BackgroundSpawner(gateway, stall_s=30.0)
         manager = _manager(
             runner, _ScriptedVerifier([Verdict(VerifierOutcome.PASS, "")])
         )
@@ -570,43 +576,82 @@ class TestQuotaLifecycle:
 
     @mark.asyncio
     async def test_close_and_acquire_are_serialized_one_way_or_the_other(self):
-        """Close vs acquire is atomic under the same lock: either an acquire
-        wins and executes once, or the close wins and nothing executes."""
-        quota = RunToolQuota(4)
-        results = {"granted": 0, "exhausted": 0, "closed": 0}
-        barrier = threading.Barrier(6)
+        """Capacity 1, ONE acquire racing ONE close: either the acquire wins
+        the lock first (consumed=1) or the close does (consumed=0) — the
+        assertion is exact because capacity is 1, not scheduling-dependent."""
+        quota = RunToolQuota(1)
+        barrier = threading.Barrier(2)
+        outcomes: list[str] = []
 
         def acquire_worker():
             barrier.wait()
-            outcome = quota.acquire()
-            results[f"{outcome}s" if False else outcome] = (
-                results.get(
-                    {
-                        "granted": "granted",
-                        "exhausted": "exhausted",
-                        "closed": "closed",
-                    }[outcome],
-                    0,
-                )
-                + 1
-            )
+            outcomes.append(quota.acquire())
 
         def close_worker():
             barrier.wait()
             quota.close()
 
-        threads = [threading.Thread(target=acquire_worker) for _ in range(5)]
-        threads.append(threading.Thread(target=close_worker))
+        threads = [
+            threading.Thread(target=acquire_worker),
+            threading.Thread(target=close_worker),
+        ]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        # atomicity: at most ONE acquire won, everything else was refused
+        # exactly one acquire was attempted: it either got the unit or was
+        # refused as CLOSED — never EXHAUSTED (capacity 1, one acquire) and
+        # never anything else
+        assert len(outcomes) == 1
+        assert outcomes[0] in (GRANTED, CLOSED)
+        assert quota.consumed == outcomes.count(GRANTED)  # 0 or 1, atomically
         assert quota.consumed in (0, 1)
-        assert quota.consumed + quota.refused_exhausted + quota.refused_closed == 5
         # after close: EVERY later acquire fails, in any thread
         assert quota.closed
         assert quota.try_acquire() is False
+
+    def test_close_first_refuses_every_later_acquire(self):
+        """DETERMINISTIC close-first branch: after close, concurrent acquires
+        in ANY number of threads are all refused, nothing is consumed."""
+        quota = RunToolQuota(4)
+        quota.close()
+        results: list[bool] = []
+        barrier = threading.Barrier(5)
+
+        def worker():
+            barrier.wait()
+            results.append(quota.try_acquire())
+
+        threads = [threading.Thread(target=worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [False] * 5
+        assert quota.consumed == 0
+        assert quota.refused_closed == 5
+
+    def test_acquire_first_then_close_refuses_the_rest(self):
+        """DETERMINISTIC acquire-first branch: units granted BEFORE the close
+        stand; every acquire after it is refused and nothing is refunded."""
+        quota = RunToolQuota(4)
+        assert quota.try_acquire() is True  # acquire wins the race, upfront
+        quota.close()
+        results: list[bool] = []
+        barrier = threading.Barrier(4)
+
+        def worker():
+            barrier.wait()
+            results.append(quota.try_acquire())
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert results == [False] * 4
+        assert quota.consumed == 1  # the pre-close grant stands, counted once
+        assert quota.refused_closed == 4
 
     def test_a_call_started_before_the_close_can_finish(self):
         """An in-flight call that acquired BEFORE the close is allowed to
@@ -654,3 +699,106 @@ class TestQuotaLifecycle:
         assert outcome["res"].ok is True  # it was allowed to finish
         assert quota.consumed == 1  # counted exactly once, no refund
         reset_run_quota(token)
+
+
+# -- MISSING quota on a Manager-managed context must FAIL CLOSED ----------------
+
+
+class TestQuotaContextMissingFailsClosed:
+    """P1: ``threading.Thread`` and some ``run_in_executor`` uses do NOT copy
+    ContextVars — inside them ``current_run_quota()`` is None even though the
+    engagement is Manager-managed. A context with an EXPLICIT grant
+    (``tool_budget_granted is not None``) that finds no quota must be refused
+    BEFORE submission: zero execution, exactly one fixed rejection audit.
+    Only contexts WITHOUT an explicit grant stay unrestricted."""
+
+    SEARCH: ClassVar[set[str]] = {"knowledge.search", "knowledge.get_fragment"}
+    TOOL: ClassVar[ToolRequest] = ToolRequest(
+        tool_name="knowledge.search", arguments={"query": "发热", "top_k": 1}
+    )
+
+    @staticmethod
+    def _gateway(records):
+        return build_gateway(
+            knowledge_store=KnowledgeStore(), audit_sink=records.append
+        )
+
+    def _invoke(self, gateway, ctx):
+        """One gateway call; returns ``"executed"`` or the raised ErrorCode."""
+        try:
+            gateway.invoke(ctx, self.TOOL, allowed_tools=self.SEARCH, agent_id="qa")
+            return "executed"
+        except ToolGatewayError as exc:
+            return exc.code
+
+    @staticmethod
+    def _assert_one_missing_refusal(records, quota):
+        """Zero executions, exactly ONE fixed ``tool_quota_missing`` audit."""
+        ok = [r for r in records if r.result.startswith("ok:")]
+        missing = [r for r in records if r.result == "rejected:tool_quota_missing"]
+        assert ok == []
+        assert len(missing) == 1
+        if quota is not None:  # the bound quota never consumed anything
+            assert quota.consumed == 0
+
+    def test_a_plain_thread_losing_the_contextvar_fails_closed(self):
+        records: list = []
+        gateway = self._gateway(records)
+        quota = RunToolQuota(4)
+        token = set_run_quota(quota)
+        outcome: dict = {}
+        # a PLAIN thread: ContextVars are NOT copied into it, so the quota is
+        # invisible there even though it is bound in the spawning context
+        thread = threading.Thread(
+            target=lambda: outcome.update(
+                res=self._invoke(gateway, _ctx(tool_budget_granted=0))
+            )
+        )
+        thread.start()
+        thread.join(5)
+        assert outcome["res"] is ErrorCode.TOOL_OVER_LIMIT
+        self._assert_one_missing_refusal(records, quota)
+        reset_run_quota(token)
+
+    @mark.asyncio
+    async def test_run_in_executor_losing_the_contextvar_fails_closed(self):
+        records: list = []
+        gateway = self._gateway(records)
+        loop = asyncio.get_running_loop()
+        # run_in_executor does NOT propagate ContextVars into the worker
+        res = await loop.run_in_executor(
+            None,
+            lambda: self._invoke(gateway, _ctx(tool_budget_granted=0)),
+        )
+        assert res is ErrorCode.TOOL_OVER_LIMIT
+        self._assert_one_missing_refusal(records, None)
+
+    def test_an_explicit_empty_context_fails_closed(self):
+        records: list = []
+        gateway = self._gateway(records)
+        quota = RunToolQuota(4)
+        token = set_run_quota(quota)
+        # Context() is an EXPLICITLY EMPTY context: nothing propagates into it
+        res = contextvars.Context().run(
+            self._invoke, gateway, _ctx(tool_budget_granted=0)
+        )
+        assert res is ErrorCode.TOOL_OVER_LIMIT
+        self._assert_one_missing_refusal(records, quota)
+        reset_run_quota(token)
+
+    @mark.asyncio
+    async def test_a_legacy_context_without_a_grant_still_executes(self):
+        """The boundary: NO explicit grant (legacy/direct caller) means the
+        missing quota stays unrestricted — the call executes as before."""
+        records: list = []
+        gateway = self._gateway(records)
+        result = gateway.invoke(
+            _ctx(),  # tool_budget_granted=None, no quota bound anywhere
+            self.TOOL,
+            allowed_tools=self.SEARCH,
+            agent_id="qa",
+        )
+        assert result.ok is True
+        ok = [r for r in records if r.result.startswith("ok:")]
+        assert len(ok) == 1
+        assert not [r for r in records if r.result == "rejected:tool_quota_missing"]

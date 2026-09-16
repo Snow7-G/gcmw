@@ -473,8 +473,28 @@ class ToolGateway:
         # impossible (zero side effects), and the refusal is audited exactly
         # like every other gate denial. A started attempt (timeout / tool fault
         # / cancellation) is never refunded.
+        #
+        # FAIL CLOSED on a missing quota: a Manager-managed context is
+        # recognizable by its EXPLICIT grant (``tool_budget_granted is not
+        # None``) and MUST find its quota here. ``threading.Thread`` and some
+        # ``run_in_executor`` uses do NOT copy ContextVars — if the gate simply
+        # read ``None`` as "legacy/unrestricted", any such thread would bypass
+        # the budget entirely. So a grant without a quota is refused BEFORE
+        # submission (``rejected:tool_quota_missing``, zero execution); the
+        # ``None = unrestricted`` reading is reserved for callers WITHOUT an
+        # explicit grant (legacy/direct gateway users, bare TenantContext).
         quota = current_run_quota()
-        if quota is not None:
+        if quota is None:
+            if getattr(context, "tool_budget_granted", None) is not None:
+                audit(
+                    result="rejected:tool_quota_missing",
+                    code=ErrorCode.TOOL_OVER_LIMIT,
+                )
+                raise ToolGatewayError(
+                    ErrorCode.TOOL_OVER_LIMIT,
+                    "run tool quota context is missing",
+                )
+        else:
             outcome = quota.acquire()
             if outcome != GRANTED:
                 # DISTINGUISHABLE refusals: the budget ran out vs the run has

@@ -16,6 +16,18 @@ the gateway's own submission boundary, so the quota lives there:
 * a unit is consumed when the attempt STARTS: a timeout, a tool fault or a
   cancellation afterwards never refunds it.
 
+CONTEXT BOUNDARY — what ``quota is None`` means: a ContextVar does NOT
+propagate into a plain ``threading.Thread`` or every ``run_in_executor`` use,
+so the gateway cannot treat a missing quota as harmless. It FAILS CLOSED when
+the context carries an EXPLICIT grant (``AgentContext.tool_budget_granted is
+not None`` — the marker of a Manager-managed engagement) but no quota object
+is bound: such a call is refused before submission (audited as
+``rejected:tool_quota_missing``, zero execution). ``None = unrestricted`` is
+reserved for callers WITHOUT an explicit grant: legacy/direct gateway users
+whose context is a bare :class:`~app.contracts.common.TenantContext` or an
+``AgentContext`` without a grant. The Manager ALWAYS grants an explicit
+number, so every Manager-driven call is fail-closed by construction.
+
 LIFETIME — explicit close, not context teardown: ``ContextVar.reset()`` only
 unbinds the CURRENT task. ``asyncio.create_task()`` copies the context, so a
 background task spawned by a runner would keep holding a live quota object and
