@@ -68,6 +68,10 @@ class CloudProviderConfig(BaseModel):
     modalities: tuple[str, ...] = ("text", "audio", "image", "video")
     timeout_ms: int = Field(15_000, gt=0)
     connect_timeout_ms: int = Field(5_000, gt=0)
+    # text-QA chat model (#53 路径，OpenAI 兼容接口)；realtime model 留给语音
+    # 通道（#51）。chat_base 指向 DashScope 的 OpenAI 兼容模式。
+    chat_model: str = "qwen-plus"
+    chat_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     @field_validator("modalities")
     @classmethod
@@ -226,6 +230,11 @@ class Settings(BaseModel):
             ),
             timeout_ms=_int("GCMW_CLOUD_TIMEOUT_MS", 15_000),
             connect_timeout_ms=_int("GCMW_CLOUD_CONNECT_TIMEOUT_MS", 5_000),
+            chat_model=os.getenv("GCMW_CLOUD_CHAT_MODEL", "qwen-plus"),
+            chat_base=os.getenv(
+                "GCMW_CLOUD_CHAT_BASE",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            ),
         )
         local = LocalProviderConfig(
             provider=os.getenv("GCMW_LOCAL_PROVIDER", "vllm"),

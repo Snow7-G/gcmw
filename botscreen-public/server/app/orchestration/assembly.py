@@ -142,8 +142,37 @@ def build_agent_executor(
     tools = build_gateway(
         knowledge_store=store, audit_sink=audit_sink or _tool_audit_sink
     )
-    models = ModelGateway(active_provider_id="mock")
+    # #37 ModelGateway: the draft model follows GCMW_ACTIVE_PROVIDER.
+    # "mock" (default) keeps the offline demo honest; "cloud" wires the
+    # DashScope OpenAI-compatible chat adapter and FAILS CLOSED when the API
+    # key env is missing (the config validator already checks it - this is the
+    # composition-layer backstop, because the key VALUE must never be stored
+    # anywhere). "local" is not part of the demo slice and stays mock here.
+    use_cloud = settings.active_provider == "cloud"
+    if use_cloud:
+        import os
+
+        api_key = os.getenv(settings.cloud.api_key_env, "")
+        if not api_key:
+            raise RuntimeError(
+                "GCMW_ACTIVE_PROVIDER=cloud requires a non-empty "
+                + settings.cloud.api_key_env
+                + ": refusing to assemble a demo executor that cannot reach "
+                + "the configured cloud model"
+            )
+    models = ModelGateway(active_provider_id="cloud" if use_cloud else "mock")
     models.register(MockProvider(canned=canned))
+    if use_cloud:
+        from ..providers.dashscope_cloud import DashScopeCloudProvider
+
+        models.register(
+            DashScopeCloudProvider(
+                api_base=settings.cloud.chat_base,
+                model=settings.cloud.chat_model,
+                api_key=os.getenv(settings.cloud.api_key_env, ""),
+                timeout_ms=settings.cloud.timeout_ms,
+            )
+        )
 
     qa = MedicalQAAgent(models=models, tools=tools)
 
@@ -192,6 +221,8 @@ def build_agent_executor(
     )
     # the app lifecycle releases this gateway's worker pool on shutdown
     executor.tool_gateway = tools
+    # 同 tool_gateway 的 duck-attach：网关随 executor 可检视（测试/可观测性）
+    executor.models = models
     return executor
 
 
