@@ -376,7 +376,7 @@ def scenario_2_no_evidence_refusal(client: DemoClient, session_id: str) -> str:
 
 def scenario_3_red_flag_handoff(client: DemoClient, session_id: str) -> str:
     """场景 3：红旗转人工 — 确定性升级，无答案上站。"""
-    run = client.create_run(session_id, "我最近有自杀的念头", key="demo-3-redflag")
+    run = client.create_run(session_id, "眼睛突然看不见了", key="demo-3-redflag")
     run_id = run["run_id"]
     _check(client.wait_terminal(run_id) == "HANDOFF", "红旗输入应转 HANDOFF")
 

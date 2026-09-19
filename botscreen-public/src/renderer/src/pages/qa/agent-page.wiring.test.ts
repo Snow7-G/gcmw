@@ -138,7 +138,7 @@ afterEach(() => {
 describe('qa page agent wiring', () => {
   it('renders the transparent mascot image instead of the LED panel', async () => {
     stubFetch((url) => {
-      if (url.includes('/suggestions')) return okJson({ suggestions: ['发热怎么办'] })
+      if (url.includes('/suggestions')) return okJson({ suggestions: ['眼部不适怎么办'] })
       if (url.includes('/api/v1/sessions')) return okJson({ session_id: 's-1' })
       throw new Error('unexpected ' + url)
     })
@@ -153,12 +153,12 @@ describe('qa page agent wiring', () => {
   it('shows the fixed config error VISIBLY when the demo config is missing', async () => {
     vi.stubEnv('VITE_GCMW_DEMO_CREDENTIAL', '') // 缺配置
     stubFetch((url) => {
-      if (url.includes('/suggestions')) return okJson({ suggestions: ['发热怎么办'] })
+      if (url.includes('/suggestions')) return okJson({ suggestions: ['眼部不适怎么办'] })
       throw new Error('agent APIs must not be called without config')
     })
     mountPage()
     await flush()
-    clickSuggestion('发热怎么办')
+    clickSuggestion('眼部不适怎么办')
     await flush()
     // 可见面板出现固定文案（而不是只写进未渲染的 messages）
     expect(text()).toContain('演示服务还没配置好')
@@ -167,14 +167,14 @@ describe('qa page agent wiring', () => {
 
   it('shows a fixed visible error when the Agent session creation fails', async () => {
     stubFetch((url) => {
-      if (url.includes('/suggestions')) return okJson({ suggestions: ['发热怎么办'] })
+      if (url.includes('/suggestions')) return okJson({ suggestions: ['眼部不适怎么办'] })
       if (url.includes('/api/v1/sessions')) return httpError(500)
       throw new Error('unexpected ' + url)
     })
     mountPage()
     await flush()
     expect(agentSessionCount()).toBe(1)
-    clickSuggestion('发热怎么办')
+    clickSuggestion('眼部不适怎么办')
     await flush()
     expect(text()).toContain('暂时连不上问答服务') // 固定安全文案，可见
     expect(text()).not.toContain('HTTP 500') // 不泄漏服务端细节
@@ -251,7 +251,7 @@ describe('qa page agent wiring', () => {
 
   it('restores the default welcome text after returning from an answer', async () => {
     stubFetch((url) => {
-      if (url.includes('/suggestions')) return okJson({ suggestions: ['发热怎么办'] })
+      if (url.includes('/suggestions')) return okJson({ suggestions: ['眼部不适怎么办'] })
       if (url.includes('/api/v1/sessions')) return okJson({ session_id: 's-1' })
       if (url.includes('/events')) {
         const body = [
@@ -271,7 +271,7 @@ describe('qa page agent wiring', () => {
     })
     mountPage()
     await flush()
-    clickSuggestion('发热怎么办')
+    clickSuggestion('眼部不适怎么办')
     await flush()
     // 已进入答案态：回答与引用必须真实展示过，防止请求意外走进固定失败
     // 页面时测试假绿（失败页同样有"返回"按钮）
@@ -292,7 +292,7 @@ describe('qa page agent wiring', () => {
     expect(text()).toContain('眼睛健康小伙伴')
     expect(text()).not.toContain('正在思考中...')
     expect(text()).not.toContain('资料来源')
-    expect(text()).toContain('发热怎么办') // 建议问题重新可见
+    expect(text()).toContain('眼部不适怎么办') // 建议问题重新可见
   })
 
   function agentSessionCount(): number {

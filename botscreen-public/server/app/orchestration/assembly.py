@@ -67,7 +67,10 @@ _DEMO_KNOWLEDGE: tuple[dict[str, str], ...] = (
 )
 
 #: red-flag / risk markers. RECORDED ATTESTATION ONLY — see module docstring.
-_DEMO_RED_FLAGS: tuple[str, ...] = ("自杀",)
+#: "自杀" 保留（心理危机在任何科室都可能发生，页面演示不展示该问题但守卫
+#: 对 API 输入始终生效）；"突然看不见" 为眼科急症（甲方要求演示页不得
+#: 出现心理危机措辞，红旗守卫按科室扩展）。
+_DEMO_RED_FLAGS: tuple[str, ...] = ("自杀", "突然看不见")
 _DEMO_RISK_MARKERS: tuple[str, ...] = ("剧烈", "出血")
 
 #: the demo slice's OWN tool-audit logger — the same "gcmw.audit" channel the

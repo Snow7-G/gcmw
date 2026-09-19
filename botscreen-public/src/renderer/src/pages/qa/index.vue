@@ -37,7 +37,7 @@ let agentSessionAbort: AbortController | null = null
 let suggestionsAbort: AbortController | null = null
 
 /** 演示确定性：前三个问题固定对应三条后端路径（有引用 / 无证据 / 红旗） */
-const DEMO_QUESTIONS = ['发热怎么办', '空调病怎么预防', '我最近有自杀的念头']
+const DEMO_QUESTIONS = ['眼部不适怎么办', '色盲能治好吗', '眼睛突然看不见了']
 
 const AGENT_COPY = {
   configMissing: '演示服务还没配置好，请先在 .env.local 里填写演示配置～',
