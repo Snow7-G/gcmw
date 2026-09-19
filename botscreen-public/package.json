@@ -57,7 +57,7 @@
     "@vitejs/plugin-vue": "^6.0.3",
     "autoprefixer": "^10.4.23",
     "docx": "^9.7.1",
-    "electron": "^40.0.0",
+    "electron": "44.2.0",
     "electron-builder": "26.16.0",
     "electron-vite": "^5.0.0",
     "eslint": "^9.39.2",
