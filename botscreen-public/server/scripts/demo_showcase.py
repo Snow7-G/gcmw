@@ -64,9 +64,28 @@ POLL_DEADLINE_S = 15.0
 TERMINAL_STATES = {"COMPLETED", "DEGRADED", "HANDOFF", "FAILED", "CANCELLED"}
 
 
-def _expected_trusted_model() -> dict:
-    """按当前 Provider 计算服务端可信三元组（与 assembly provenance 一致）。"""
-    import os
+#: 运行期 Settings 引用（main 构造后填充；场景断言与装配层零漂移用）
+_SETTINGS_REF: dict = {"settings": None}
+
+
+def _expected_trusted_model(settings: Settings | None = None) -> dict:
+    """按当前 Provider 计算服务端可信三元组（与 assembly provenance 一致）。
+
+    settings 缺省时回退读环境变量（CLI 入口构造 Settings 前的静态检查用）；
+    运行期一律传 server.settings，保证与装配层零漂移。
+    """
+    if settings is not None:
+        if settings.active_provider == "cloud":
+            return {
+                "provider_id": "cloud",
+                "model_id": settings.cloud.chat_model,
+                "model_version": "compatible-mode",
+            }
+        return {
+            "provider_id": "mock",
+            "model_id": "mock-model",
+            "model_version": "1.0.0",
+        }
 
     if os.getenv("GCMW_ACTIVE_PROVIDER", "mock") == "cloud":
         return {
@@ -321,7 +340,7 @@ def scenario_1_cited_answer(client: DemoClient, session_id: str) -> str:
     )
     # 可信模型溯源：线上只允许服务端三元组（跟随当前 Provider）
     _check(
-        payload.get("model") == _expected_trusted_model(),
+        payload.get("model") == _expected_trusted_model(_SETTINGS_REF["settings"]),
         f"模型溯源不是服务端可信三元组: {payload.get('model')}",
     )
 
@@ -494,8 +513,6 @@ _DEMO_HOST = "127.0.0.1"
 def start_server(
     host: str = _DEMO_HOST, port: int = 0, cors_for_dev_frontends: bool = False
 ) -> SimpleNamespace:
-    import os
-
     """进程内启动真实 uvicorn + demo 装配（合成知识、MockProvider、零出网）。
 
     ``port=0`` 自动选择端口（默认行为不变）；``cors_for_dev_frontends`` 只在
@@ -519,8 +536,6 @@ def start_server(
         rate_limit_device_per_minute=10_000,
         rate_limit_session_per_minute=10_000,
     )
-    import os
-
     env_name = settings.auth_credentials_env
     previous = os.environ.get(env_name)
     os.environ[env_name] = json.dumps(
@@ -571,13 +586,13 @@ def start_server(
         instance=instance,
         thread=thread,
         base=f"http://{host}:{bound_port}",
+        settings=settings,
         _env_name=env_name,
         _env_previous=previous,
     )
 
 
 def stop_server(server: SimpleNamespace) -> None:
-    import os
 
     server.instance.should_exit = True
     server.thread.join(timeout=15)
@@ -633,11 +648,12 @@ def main() -> int:
         port=args.port,
         cors_for_dev_frontends=args.cors_for_dev_frontends,
     )
-    provider = os.getenv("GCMW_ACTIVE_PROVIDER", "mock")
+    _SETTINGS_REF["settings"] = server.settings
+    provider = server.settings.active_provider
     provider_note = (
         "MockProvider · 合成数据 · 零出网"
         if provider == "mock"
-        else f"云模型 {os.getenv('GCMW_CLOUD_CHAT_MODEL', 'qwen-plus')} · 合成知识 · 出网至 DashScope"
+        else f"云模型 {server.settings.cloud.chat_model} · 合成知识 · 出网至 DashScope"
     )
     print(f"[demo] 服务已启动: {server.base}  ({provider_note})")
 

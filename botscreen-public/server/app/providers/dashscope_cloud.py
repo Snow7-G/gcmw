@@ -25,7 +25,14 @@ from typing import Any
 import httpx
 
 from ..contracts.errors import ErrorCode
-from ..contracts.model import ContentType, ModelInfo, ModelRequest, ModelResponse
+from ..contracts.model import (
+    ContentType,
+    ModelInfo,
+    ModelRequest,
+    ModelResponse,
+    ProviderHealth,
+    ProviderStatus,
+)
 from .model_gateway import ModelGatewayError
 
 
@@ -132,8 +139,38 @@ class DashScopeCloudProvider:
             latency_ms=int((time.monotonic() - started) * 1000),
         )
 
-    async def stream(self, request: ModelRequest) -> Any:
-        """Streaming is a separate transport for this provider (see module docstring)."""
+    def stream(self, request: ModelRequest) -> Any:
+        """Streaming is a separate transport for this provider (see module docstring).
+
+        Plain ``def`` (matching the Protocol signature ``def stream(...) ->
+        AsyncIterator``): the error raises SYNCHRONOUSLY at call time, so a
+        caller doing ``async for ... in adapter.stream(req)`` gets the stable
+        "unsupported" error instead of a coroutine TypeError.
+        """
+        raise ModelGatewayError(ErrorCode.PROVIDER_CAPABILITY_UNSUPPORTED)
+
+    def is_available(self) -> bool:
+        """No network probe: the adapter is usable iff it holds a credential.
+
+        The constructor already fails closed on an empty key, so this is True
+        by construction; kept explicit for the ProviderAdapter contract.
+        """
+        return bool(self._api_key)
+
+    async def health(self) -> ProviderHealth:
+        """Local health only — never a network probe (health fan-out must not
+        burn provider quota or leak timing). A configured adapter is
+        AVAILABLE; reachability is proven by the next real chat call."""
+        return ProviderHealth(
+            provider_id=self.provider_id,
+            status=ProviderStatus.AVAILABLE
+            if self._api_key
+            else ProviderStatus.UNAVAILABLE,
+            message="configured" if self._api_key else "missing credential",
+        )
+
+    async def open_realtime_session(self, request: ModelRequest) -> Any:
+        """Realtime (WebSocket omni) is the #51 voice channel, out of scope."""
         raise ModelGatewayError(ErrorCode.PROVIDER_CAPABILITY_UNSUPPORTED)
 
     def _error_for_status(self, status: int) -> ErrorCode:

@@ -18,6 +18,71 @@ from app.contracts.model import ModelRequest
 from app.providers.dashscope_cloud import DashScopeCloudProvider
 from app.providers.model_gateway import ModelGatewayError
 
+# --- 审计修复回归：ProviderAdapter 协议符合性与安全降级 -------------------
+
+
+def test_adapter_satisfies_provider_protocol():
+    """ProviderAdapter 协议要求的全部方法都必须存在（结构化协议无注册期校验，
+    缺方法只会在调用点炸 —— 这里显式锁定）。"""
+    provider = DashScopeCloudProvider(**OPTS)
+    for method in (
+        "chat",
+        "stream",
+        "open_realtime_session",
+        "is_available",
+        "health",
+        "model_info",
+    ):
+        assert callable(getattr(provider, method, None)), method
+
+
+def test_stream_raises_synchronously_not_a_coroutine():
+    """stream 必须是普通 def：调用即同步抛"不支持"，绝不能返回 coroutine
+    ——否则 async for 迭代到它时得到 TypeError 而非稳定错误。"""
+    import asyncio
+
+    provider = DashScopeCloudProvider(**OPTS)
+    result = None
+    with pytest.raises(ModelGatewayError) as exc:
+        result = provider.stream(make_request())
+    assert exc.value.code == ErrorCode.PROVIDER_CAPABILITY_UNSUPPORTED
+    assert not asyncio.iscoroutine(result), "stream 不得返回 coroutine"
+
+
+@pytest.mark.asyncio
+async def test_health_and_availability_are_local_only():
+    """health/is_available 不触网：配置即 AVAILABLE，零配额消耗。"""
+    import asyncio
+
+    provider = DashScopeCloudProvider(**OPTS)
+    assert provider.is_available() is True
+    health = await asyncio.wait_for(provider.health(), timeout=1)
+    assert health.provider_id == "cloud"
+    assert health.status.value == "available"
+
+
+@pytest.mark.asyncio
+async def test_open_realtime_session_is_explicitly_unsupported():
+    """realtime（WebSocket omni）是 #51 语音通道：显式拒绝而非 AttributeError。"""
+    import asyncio
+
+    provider = DashScopeCloudProvider(**OPTS)
+    with pytest.raises(ModelGatewayError) as exc:
+        await asyncio.wait_for(
+            provider.open_realtime_session(make_request()), timeout=1
+        )
+    assert exc.value.code == ErrorCode.PROVIDER_CAPABILITY_UNSUPPORTED
+
+
+def test_httpx_is_a_runtime_dependency():
+    """反回归：httpx 是云适配器的运行时依赖，必须在 requirements.txt ——
+    只在 dev 依赖时，生产安装 + GCMW_ACTIVE_PROVIDER=cloud 启动即 ImportError。"""
+    from pathlib import Path
+
+    req = Path(__file__).resolve().parent.parent / "requirements.txt"
+    assert "httpx" in req.read_text()
+
+
 OPTS = {
     "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     "model": "qwen-plus",
