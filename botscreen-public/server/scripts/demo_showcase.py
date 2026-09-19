@@ -10,7 +10,7 @@
 
 * 在本进程内启动真实 uvicorn（127.0.0.1，随机端口），装配 demo 栈——
   合成知识走真实 #56 治理生命周期（候选→审核→已批准，仅 DEMO_TENANT_ID）、
-  MockProvider（罐头回复，零出网）、RAG + SafetyEvidenceVerifier + ManagerAgent；
+  MockProvider（罐头回复）或云模型（GCMW_ACTIVE_PROVIDER=cloud 时出网至 DashScope）、RAG + SafetyEvidenceVerifier + ManagerAgent；
 * 对真实 TCP 跑五个场景，任一断言失败即收集并在最后以**非零退出码**结束：
     1. 有引用回答（双层 SSE + 引用三元组 + 可信模型溯源 + 工具配额审计）
     2. 无证据拒答（不编造答案）
@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import threading
 import time
@@ -62,12 +63,41 @@ DEMO_STALL_S = 1.0  # 每次运行在 RETRIEVING 的可见停留窗口
 POLL_DEADLINE_S = 15.0
 TERMINAL_STATES = {"COMPLETED", "DEGRADED", "HANDOFF", "FAILED", "CANCELLED"}
 
-#: MockProvider 的服务端可信三元组（assembly 用 models.provenance() 注入）
-TRUSTED_MODEL = {
-    "provider_id": "mock",
-    "model_id": "mock-model",
-    "model_version": "1.0.0",
-}
+
+#: 运行期 Settings 引用（main 构造后填充；场景断言与装配层零漂移用）
+_SETTINGS_REF: dict = {"settings": None}
+
+
+def _expected_trusted_model(settings: Settings | None = None) -> dict:
+    """按当前 Provider 计算服务端可信三元组（与 assembly provenance 一致）。
+
+    settings 缺省时回退读环境变量（CLI 入口构造 Settings 前的静态检查用）；
+    运行期一律传 server.settings，保证与装配层零漂移。
+    """
+    if settings is not None:
+        if settings.active_provider == "cloud":
+            return {
+                "provider_id": "cloud",
+                "model_id": settings.cloud.chat_model,
+                "model_version": "compatible-mode",
+            }
+        return {
+            "provider_id": "mock",
+            "model_id": "mock-model",
+            "model_version": "1.0.0",
+        }
+
+    if os.getenv("GCMW_ACTIVE_PROVIDER", "mock") == "cloud":
+        return {
+            "provider_id": "cloud",
+            "model_id": os.getenv("GCMW_CLOUD_CHAT_MODEL", "qwen-plus"),
+            "model_version": "compatible-mode",
+        }
+    return {
+        "provider_id": "mock",
+        "model_id": "mock-model",
+        "model_version": "1.0.0",
+    }
 
 
 class DemoFailure(AssertionError):
@@ -308,9 +338,9 @@ def scenario_1_cited_answer(client: DemoClient, session_id: str) -> str:
         payload["content_origin"] == "approved_faq",
         f"content_origin 应为 approved_faq: {payload['content_origin']}",
     )
-    # 可信模型溯源：线上只允许服务端三元组
+    # 可信模型溯源：线上只允许服务端三元组（跟随当前 Provider）
     _check(
-        payload.get("model") == TRUSTED_MODEL,
+        payload.get("model") == _expected_trusted_model(_SETTINGS_REF["settings"]),
         f"模型溯源不是服务端可信三元组: {payload.get('model')}",
     )
 
@@ -497,15 +527,15 @@ def start_server(
         )
     import uvicorn
 
+    # 尊重 GCMW_ACTIVE_PROVIDER（与真实应用 from_env 一致）：cloud 时走
+    # DashScope 兼容模式，缺 Key 由 Settings 校验 fail-closed 拒绝启动
     settings = Settings(
         environment="test",
-        active_provider="mock",
+        active_provider=os.getenv("GCMW_ACTIVE_PROVIDER", "mock"),
         rate_limit_tenant_per_minute=10_000,
         rate_limit_device_per_minute=10_000,
         rate_limit_session_per_minute=10_000,
     )
-    import os
-
     env_name = settings.auth_credentials_env
     previous = os.environ.get(env_name)
     os.environ[env_name] = json.dumps(
@@ -556,13 +586,13 @@ def start_server(
         instance=instance,
         thread=thread,
         base=f"http://{host}:{bound_port}",
+        settings=settings,
         _env_name=env_name,
         _env_previous=previous,
     )
 
 
 def stop_server(server: SimpleNamespace) -> None:
-    import os
 
     server.instance.should_exit = True
     server.thread.join(timeout=15)
@@ -618,7 +648,14 @@ def main() -> int:
         port=args.port,
         cors_for_dev_frontends=args.cors_for_dev_frontends,
     )
-    print(f"[demo] 服务已启动: {server.base}  (MockProvider · 合成数据 · 零出网)")
+    _SETTINGS_REF["settings"] = server.settings
+    provider = server.settings.active_provider
+    provider_note = (
+        "MockProvider · 合成数据 · 零出网"
+        if provider == "mock"
+        else f"云模型 {server.settings.cloud.chat_model} · 合成知识 · 出网至 DashScope"
+    )
+    print(f"[demo] 服务已启动: {server.base}  ({provider_note})")
 
     results: list[tuple[str, str]] = []
 

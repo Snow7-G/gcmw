@@ -11,3 +11,7 @@ __pycache__/
 # local demo credentials / env overrides (never commit)
 .env.local
 .env.*.local
+
+# 云端模型本地凭据与启动器（绝不提交）
+.env.cloud.local
+launch-cloud.sh
