@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onBeforeUnmount, ref } from 'vue'
 import LiquidBar from '@renderer/components/LiquidBar.vue'
+import qaMascotUrl from '@renderer/assets/qa-mascot-cutout.png'
 import {
   AgentRunView,
   AgentStreamError,
@@ -526,190 +527,6 @@ function speakText(text: string): void {
   u.pitch = 1.1
   window.speechSynthesis.speak(u)
 }
-
-// ========== LED 点阵表情：坐标点数据 ==========
-interface LedDot {
-  x: number
-  y: number
-  color?: string
-}
-
-const HAPPY_COLOR = '#36c7b7'
-// 280×200 卡片，像素块排布
-const HAPPY_DOTS: LedDot[] = [
-  // 左眼 — 弯弯月牙（上弯弧）
-  { x: 58, y: 78 },
-  { x: 65, y: 72 },
-  { x: 72, y: 68 },
-  { x: 79, y: 72 },
-  { x: 86, y: 78 },
-  // 右眼 — 弯弯月牙
-  { x: 194, y: 78 },
-  { x: 201, y: 72 },
-  { x: 208, y: 68 },
-  { x: 215, y: 72 },
-  { x: 222, y: 78 },
-  // 嘴 — 5点横排
-  { x: 110, y: 140 },
-  { x: 126, y: 144 },
-  { x: 140, y: 145 },
-  { x: 154, y: 144 },
-  { x: 170, y: 140 },
-  // 腮红（极淡）
-  { x: 44, y: 100, color: '#f1aaaa' },
-  { x: 236, y: 100, color: '#f1aaaa' }
-]
-
-const THINKING_COLOR = '#36c7b7'
-const THINKING_DOTS: LedDot[] = [
-  // 左眼 — 缩小
-  { x: 62, y: 62 },
-  { x: 76, y: 62 },
-  { x: 62, y: 76 },
-  { x: 76, y: 76 },
-  // 右眼 — 正常
-  { x: 194, y: 58 },
-  { x: 208, y: 58 },
-  { x: 222, y: 58 },
-  { x: 194, y: 72 },
-  { x: 208, y: 72 },
-  { x: 222, y: 72 },
-  { x: 194, y: 86 },
-  { x: 208, y: 86 },
-  { x: 222, y: 86 },
-  // 小椭圆嘴
-  { x: 124, y: 142 },
-  { x: 140, y: 144 },
-  { x: 156, y: 142 }
-]
-
-const LISTEN_COLOR = '#36c7b7'
-const LISTEN_DOTS: LedDot[] = [
-  // 左眼 — 两条横线
-  { x: 44, y: 66 },
-  { x: 60, y: 66 },
-  { x: 76, y: 66 },
-  { x: 92, y: 66 },
-  { x: 44, y: 78 },
-  { x: 60, y: 78 },
-  { x: 76, y: 78 },
-  { x: 92, y: 78 },
-  // 右眼 — 两条横线
-  { x: 188, y: 66 },
-  { x: 204, y: 66 },
-  { x: 220, y: 66 },
-  { x: 236, y: 66 },
-  { x: 188, y: 78 },
-  { x: 204, y: 78 },
-  { x: 220, y: 78 },
-  { x: 236, y: 78 },
-  // 小横线嘴
-  { x: 120, y: 140 },
-  { x: 140, y: 140 },
-  { x: 160, y: 140 },
-  // 轻侧边点
-  { x: 24, y: 70 },
-  { x: 28, y: 80 },
-  { x: 28, y: 60 },
-  { x: 256, y: 70 },
-  { x: 252, y: 80 },
-  { x: 252, y: 60 }
-]
-
-const SPEAK_COLOR = '#36c7b7'
-const SPEAK_DOTS: LedDot[] = [
-  // 眼
-  { x: 58, y: 58 },
-  { x: 72, y: 58 },
-  { x: 86, y: 58 },
-  { x: 58, y: 72 },
-  { x: 72, y: 72 },
-  { x: 86, y: 72 },
-  { x: 58, y: 86 },
-  { x: 72, y: 86 },
-  { x: 86, y: 86 },
-  { x: 194, y: 58 },
-  { x: 208, y: 58 },
-  { x: 222, y: 58 },
-  { x: 194, y: 72 },
-  { x: 208, y: 72 },
-  { x: 222, y: 72 },
-  { x: 194, y: 86 },
-  { x: 208, y: 86 },
-  { x: 222, y: 86 },
-  // 三段嘴
-  { x: 110, y: 136 },
-  { x: 126, y: 138 },
-  { x: 140, y: 140 },
-  { x: 154, y: 138 },
-  { x: 170, y: 136 },
-  { x: 120, y: 148 },
-  { x: 140, y: 150 },
-  { x: 160, y: 148 }
-]
-
-const ENCOURAGE_COLOR = '#36c7b7'
-const ENCOURAGE_DOTS: LedDot[] = [
-  { x: 58, y: 58 },
-  { x: 72, y: 58 },
-  { x: 86, y: 58 },
-  { x: 58, y: 72 },
-  { x: 72, y: 72 },
-  { x: 86, y: 72 },
-  { x: 58, y: 86 },
-  { x: 72, y: 86 },
-  { x: 86, y: 86 },
-  { x: 194, y: 58 },
-  { x: 208, y: 58 },
-  { x: 222, y: 58 },
-  { x: 194, y: 72 },
-  { x: 208, y: 72 },
-  { x: 222, y: 72 },
-  { x: 194, y: 86 },
-  { x: 208, y: 86 },
-  { x: 222, y: 86 },
-  { x: 104, y: 136 },
-  { x: 118, y: 144 },
-  { x: 132, y: 148 },
-  { x: 148, y: 148 },
-  { x: 162, y: 144 },
-  { x: 176, y: 136 },
-  { x: 44, y: 100, color: '#f1aaaa' },
-  { x: 236, y: 100, color: '#f1aaaa' }
-]
-
-const REST_COLOR = '#36c7b7'
-const REST_DOTS: LedDot[] = [
-  // 半闭眼 — 横条
-  { x: 58, y: 70 },
-  { x: 72, y: 70 },
-  { x: 86, y: 70 },
-  { x: 194, y: 70 },
-  { x: 208, y: 70 },
-  { x: 222, y: 70 },
-  // 小弧嘴
-  { x: 118, y: 136 },
-  { x: 132, y: 142 },
-  { x: 148, y: 142 },
-  { x: 162, y: 136 }
-]
-
-function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
-  switch (state) {
-    case 'listening':
-      return { dots: LISTEN_DOTS, color: LISTEN_COLOR }
-    case 'processing':
-      return { dots: THINKING_DOTS, color: THINKING_COLOR }
-    case 'answering':
-      return { dots: SPEAK_DOTS, color: SPEAK_COLOR }
-    case 'encourage':
-      return { dots: ENCOURAGE_DOTS, color: ENCOURAGE_COLOR }
-    case 'rest':
-      return { dots: REST_DOTS, color: REST_COLOR }
-    default:
-      return { dots: HAPPY_DOTS, color: HAPPY_COLOR }
-  }
-}
 </script>
 
 <template>
@@ -738,24 +555,13 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
               'bg-transparent scale-100': mascotState === 'idle',
             }"
           ></div>
-          <div v-if="mascotState === 'listening'" class="absolute inset-0 flex items-center justify-center">
-            <span class="sound-wave-bar" style="--i:0"></span>
-            <span class="sound-wave-bar" style="--i:1"></span>
-            <span class="sound-wave-bar" style="--i:2"></span>
-            <span class="sound-wave-bar" style="--i:3"></span>
-            <span class="sound-wave-bar" style="--i:4"></span>
-          </div>
-          <div
-            class="led-panel relative z-10 transition-all duration-500"
+          <img
+            :src="qaMascotUrl"
+            alt="小视"
+            class="mascot-image relative z-10 transition-all duration-500"
             :class="{ 'scale-105': mascotState === 'answering', 'scale-100': mascotState !== 'answering' }"
-          >
-            <div
-              v-for="(dot, di) in getDotsAndColor(mascotState).dots"
-              :key="di"
-              class="led-dot"
-              :style="{ left: dot.x + 'px', top: dot.y + 'px', backgroundColor: dot.color || getDotsAndColor(mascotState).color }"
-            ></div>
-          </div>
+            draggable="false"
+          />
         </div>
 
         <!-- 欢迎文字 -->
@@ -827,30 +633,14 @@ function getDotsAndColor(state: string): { dots: LedDot[]; color: string } {
 <style scoped>
 .qa-kid-root { background: url(rc://bg.png) center / cover no-repeat fixed; zoom: 1.15; }
 
-.led-panel {
-  width: 280px; aspect-ratio: 1.4 / 1;
-  background: rgba(22, 48, 45, 0.35); backdrop-filter: blur(12px) saturate(120%); -webkit-backdrop-filter: blur(12px) saturate(120%);
-  border-radius: 24px; position: relative; overflow: hidden;
-  border: 1px solid rgba(255,255,255,0.06);
-  box-shadow: 0 3px 12px rgba(15, 32, 30, 0.15);
-  display: flex; align-items: center; justify-content: center;
+.mascot-image {
+  display: block;
+  width: 300px;
+  height: auto;
+  max-width: 100%;
+  user-select: none;
+  filter: drop-shadow(0 8px 14px rgba(15, 32, 30, 0.16));
 }
-.led-dot { position: absolute; width: 12px; height: 12px; border-radius: 50%; transition: opacity 0.3s ease; box-shadow: 0 0 3px currentColor, 0 0 8px currentColor; }
-
-/* 声波纹 */
-.sound-wave-bar {
-  position: absolute; width: 6px; height: 20px; background: #168378; border-radius: 3px;
-  animation: sound-wave 1.2s ease-in-out infinite; animation-delay: calc(var(--i) * 0.15s);
-}
-@keyframes sound-wave {
-  0%, 100% { height: 8px; opacity: 0.4; }
-  50% { height: 36px; opacity: 1; }
-}
-.sound-wave-bar:nth-child(1) { left: calc(50% - 30px); }
-.sound-wave-bar:nth-child(2) { left: calc(50% - 15px); }
-.sound-wave-bar:nth-child(3) { left: calc(50% - 0px); }
-.sound-wave-bar:nth-child(4) { left: calc(50% + 15px); }
-.sound-wave-bar:nth-child(5) { left: calc(50% + 30px); }
 
 @keyframes fade-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
 .animate-fade-in { animation: fade-in 0.4s ease-out; }

@@ -136,6 +136,20 @@ afterEach(() => {
 })
 
 describe('qa page agent wiring', () => {
+  it('renders the transparent mascot image instead of the LED panel', async () => {
+    stubFetch((url) => {
+      if (url.includes('/suggestions')) return okJson({ suggestions: ['发热怎么办'] })
+      if (url.includes('/api/v1/sessions')) return okJson({ session_id: 's-1' })
+      throw new Error('unexpected ' + url)
+    })
+    mountPage()
+    await flush()
+
+    const mascot = root?.querySelector<HTMLImageElement>('img[alt="小视"]')
+    expect(mascot?.getAttribute('src')).toContain('qa-mascot-cutout')
+    expect(root?.querySelector('.led-panel')).toBeNull()
+  })
+
   it('shows the fixed config error VISIBLY when the demo config is missing', async () => {
     vi.stubEnv('VITE_GCMW_DEMO_CREDENTIAL', '') // 缺配置
     stubFetch((url) => {
