@@ -18,6 +18,13 @@ import rospy
 from std_msgs.msg import String, Int8
 
 API_URL = "http://127.0.0.1:8000"
+
+# 端到端语音预算：与 voice_agent_adapter 对齐（业务 60s + 清理 grace + 余量）。
+# 调用方超时必须大于适配器预算，否则旧请求未结束就允许下一次唤醒。
+try:
+    from voice_agent_adapter import VOICE_TURN_TIMEOUT_S as VOICE_CHAT_TIMEOUT_S
+except ImportError:  # 仅拷贝节点脚本部署时的回退值，必须与适配器保持同步
+    VOICE_CHAT_TIMEOUT_S = 75.0
 WAKEUP_TOPIC = "/wheeltec_mic/wakeup_trigger"
 POLL_INTERVAL = 0.5  # 轮询间隔（秒）
 
@@ -74,7 +81,7 @@ def voice_callback(msg: String) -> None:
     # 发送给问答后端
     try:
         res = requests.post(f"{API_URL}/chat",
-                            json={"question": text}, timeout=15)
+                            json={"question": text}, timeout=VOICE_CHAT_TIMEOUT_S)
         res.raise_for_status()
         data = res.json()
         answer = data.get("robot_answer", "")

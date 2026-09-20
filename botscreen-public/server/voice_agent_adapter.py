@@ -18,11 +18,19 @@ Design contract (do not weaken):
   partial answer;
 * the credential lives ONLY in the ``Authorization: Bearer`` header — never in
   URLs, logs, exception texts, or anything this module returns;
+* ONE absolute deadline covers the whole voice turn: it is generated at
+  ``ask()`` entry and propagated as the remaining budget into session
+  creation, run creation, and the SSE stream; a blocking read is actively
+  interrupted by a watchdog that closes the connection at the deadline —
+  a silent server cannot stretch the turn past the budget;
+* cleanup is BOUNDED best-effort: each cleanup request gets its own short
+  grace (independent of the business budget), success terminal does not
+  delete the Run (the server already finished it), and a cleanup failure
+  never changes the already-decided safe return;
 * one throwaway Agent Session per voice question (no multi-turn voice memory
-  in this slice), always cleaned up best-effort;
-* three distinct timeouts: connect, per-chunk read, and an absolute deadline
-  for the whole voice turn — a chatty keep-alive stream cannot stretch a run
-  forever.
+  in this slice);
+* configuration errors report FIELD NAMES and fixed reasons only — the
+  rejected raw value is never echoed (it may be a misplaced secret).
 
 This module is deliberately SYNC (``requests``): the legacy ``/chat`` endpoint
 runs in FastAPI's threadpool and the ROS nodes are plain scripts.
@@ -34,6 +42,7 @@ import codecs
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass
@@ -49,7 +58,14 @@ PLACEHOLDER_CREDENTIAL = "YOUR_DEMO_CREDENTIAL_HERE"
 
 _CONNECT_TIMEOUT_S = 5.0
 _READ_TIMEOUT_S = 30.0
+#: 业务预算：整个语音问答（Session + Run + SSE 流）从 ask() 入口起算
 _TOTAL_DEADLINE_S = 60.0
+#: 清理预算：每个清理请求独立、短且总量有界（与业务预算无关）
+_CLEANUP_GRACE_S = 2.0
+#: ROS1/ROS2 调用方的端到端超时 = 业务预算 + 清理 grace + 传输余量。
+#: 两节点必须共用本常量（调用方超时若小于适配器预算，旧请求未结束就允许
+#: 下一次唤醒，会产生并发与答案次序问题）。勿在节点里另行写死。
+VOICE_TURN_TIMEOUT_S = _TOTAL_DEADLINE_S + _CLEANUP_GRACE_S + 5.0
 
 #: 64 位小写十六进制（引用三元组的 content_hash 门槛）
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -70,11 +86,12 @@ _TERMINAL_COPY = {
 
 
 class VoiceAgentConfigError(RuntimeError):
-    """启动期配置错误：必须显式失败，不得静默回退 legacy。"""
+    """启动期配置错误：只报告字段名与固定原因，绝不回显原始值
+    （错误值可能是误填进配置的机密串）。"""
 
 
 class VoiceAgentBackendError(RuntimeError):
-    """运行期故障（网络/HTTP/畸形流/未知终态）：失败关闭。
+    """运行期故障（网络/HTTP/畸形流/未知终态/超时）：失败关闭。
 
     文本中绝不包含凭据或服务端响应正文。
     """
@@ -96,27 +113,28 @@ def resolve_voice_agent_config(env: dict[str, str] | None = None) -> VoiceAgentC
     """解析 GCMW_VOICE_* 配置。
 
     ``env`` 缺省读真实环境变量；测试可传 dict。非法值一律 raise
-    :class:`VoiceAgentConfigError` —— 调用方（qa_server）在启动期把它变成
-    显式退出，绝不静默回退 legacy。
+    :class:`VoiceAgentConfigError`，异常文本只含字段名与固定原因——
+    **绝不回显非法 mode/base/credential 的原始值**。调用方（qa_server）
+    在启动期把它变成显式退出，绝不静默回退 legacy。
     """
     env = os.environ if env is None else env
     mode = (env.get("GCMW_VOICE_ANSWER_BACKEND", "legacy") or "legacy").strip().lower()
     if mode not in ("legacy", "agent"):
         raise VoiceAgentConfigError(
-            f"GCMW_VOICE_ANSWER_BACKEND 只允许 legacy|agent，收到 {mode!r}"
+            "GCMW_VOICE_ANSWER_BACKEND 配置非法：只允许 legacy 或 agent"
         )
     if mode == "legacy":
         return VoiceAgentConfig(mode="legacy", base_url="", credential="")
     base = (env.get("GCMW_VOICE_AGENT_API_BASE", "") or "").strip().rstrip("/")
     if base != DEMO_CONTRACT_BASE_URL:
         raise VoiceAgentConfigError(
-            f"GCMW_VOICE_AGENT_API_BASE 第一版只允许 {DEMO_CONTRACT_BASE_URL}，"
-            f"收到 {base!r}"
+            f"GCMW_VOICE_AGENT_API_BASE 配置非法：必须精确等于 {DEMO_CONTRACT_BASE_URL}"
         )
     credential = (env.get("GCMW_VOICE_AGENT_CREDENTIAL", "") or "").strip()
     if not credential or credential == PLACEHOLDER_CREDENTIAL:
         raise VoiceAgentConfigError(
-            "GCMW_VOICE_AGENT_CREDENTIAL 缺失、为空或仍是占位符：agent 模式拒绝启动"
+            "GCMW_VOICE_AGENT_CREDENTIAL 配置非法：缺失、为空或仍是占位符，"
+            "agent 模式拒绝启动"
         )
     return VoiceAgentConfig(mode="agent", base_url=base, credential=credential)
 
@@ -200,13 +218,19 @@ class VoiceAgentClient:
     # ---------- 公共入口 ----------
 
     def ask(self, question: str) -> tuple[str, str]:
-        """返回 (robot_answer, source)；source ∈ {"agent", "error"}。"""
+        """返回 (robot_answer, source)；source ∈ {"agent", "error"}。
+
+        绝对 deadline 在本入口生成，贯穿 Session/Run/SSE 全部阶段。
+        """
+        deadline = time.monotonic() + _TOTAL_DEADLINE_S
         session_id: str | None = None
         run_id: str | None = None
+        reached_terminal = False
         try:
-            session_id = self._create_session()
-            run_id = self._create_run(session_id, question)
-            answer = self._collect(run_id)
+            session_id = self._create_session(deadline)
+            run_id = self._create_run(session_id, question, deadline)
+            answer = self._collect(run_id, deadline)
+            reached_terminal = True
             return answer, "agent"
         except VoiceAgentBackendError:
             return COPY_UNAVAILABLE, "error"
@@ -214,12 +238,23 @@ class VoiceAgentClient:
             # 任何未预期异常都失败关闭，绝不携带原始错误文本
             return COPY_UNAVAILABLE, "error"
         finally:
-            if run_id is not None:
+            # 有界 best-effort 清理（每个请求独立短 grace，总量有界；
+            # 清理失败不改变已确定的返回）：
+            # - 成功终态不删 Run：服务端已完成该 Run，删除没有意义；
+            # - 失败路径取消 Run（可能仍在执行）；Session 总是删除。
+            if run_id is not None and not reached_terminal:
                 self._best_effort_delete(f"/agent/runs/{run_id}")
             if session_id is not None:
                 self._best_effort_delete(f"/sessions/{session_id}")
 
-    # ---------- Agent 调用序列 ----------
+    # ---------- 内部工具 ----------
+
+    @staticmethod
+    def _remaining_or_raise(deadline: float) -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise VoiceAgentBackendError("absolute deadline exceeded")
+        return remaining
 
     def _headers(self) -> dict[str, str]:
         # 凭据只出现在这里
@@ -228,17 +263,20 @@ class VoiceAgentClient:
             "Content-Type": "application/json",
         }
 
-    def _create_session(self) -> str:
+    # ---------- Agent 调用序列 ----------
+
+    def _create_session(self, deadline: float) -> str:
+        remaining = self._remaining_or_raise(deadline)
         try:
             resp = self._http.post(
                 f"{self._cfg.base_url}/sessions",
                 json={"channel": "text", "locale": "zh-CN"},
                 headers=self._headers(),
-                timeout=(_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S),
+                timeout=(_CONNECT_TIMEOUT_S, min(_READ_TIMEOUT_S, remaining)),
             )
         except requests.RequestException as exc:
             raise VoiceAgentBackendError("session connect failed") from exc
-        if resp.status_code not in (200, 201):  # 201 = 资源创建成功（Agent API 契约）
+        if resp.status_code != 201:  # 契约严格锁定：session 创建返回 201
             raise VoiceAgentBackendError(f"session http {resp.status_code}")
         try:
             session_id = resp.json().get("session_id")
@@ -248,7 +286,8 @@ class VoiceAgentClient:
             raise VoiceAgentBackendError("session malformed payload")
         return session_id
 
-    def _create_run(self, session_id: str, question: str) -> str:
+    def _create_run(self, session_id: str, question: str, deadline: float) -> str:
+        remaining = self._remaining_or_raise(deadline)
         try:
             resp = self._http.post(
                 f"{self._cfg.base_url}/agent/runs",
@@ -258,7 +297,7 @@ class VoiceAgentClient:
                     "idempotency_key": f"voice-{uuid.uuid4()}",
                 },
                 headers=self._headers(),
-                timeout=(_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S),
+                timeout=(_CONNECT_TIMEOUT_S, min(_READ_TIMEOUT_S, remaining)),
             )
         except requests.RequestException as exc:
             raise VoiceAgentBackendError("run connect failed") from exc
@@ -273,30 +312,37 @@ class VoiceAgentClient:
         return run_id
 
     def _best_effort_delete(self, path: str) -> None:
+        # 独立短 grace：清理失败/悬挂都不改变已确定的返回，也不追加业务预算
         try:
             self._http.delete(
                 f"{self._cfg.base_url}{path}",
                 headers=self._headers(),
-                timeout=(_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S),
+                timeout=(1.0, _CLEANUP_GRACE_S),
             )
         except Exception:  # noqa: BLE001, S110 — best-effort 清理：静默是设计
-            pass  # 清理失败绝不影响已确定的返回
+            pass
 
     # ---------- SSE 收集与交付门槛 ----------
 
-    def _collect(self, run_id: str) -> str:
-        deadline = time.monotonic() + _TOTAL_DEADLINE_S
+    def _collect(self, run_id: str, deadline: float) -> str:
+        remaining = self._remaining_or_raise(deadline)
         try:
             resp = self._http.get(
                 f"{self._cfg.base_url}/agent/runs/{run_id}/events",
                 headers={**self._headers(), "Accept": "text/event-stream"},
                 stream=True,
-                timeout=(_CONNECT_TIMEOUT_S, _READ_TIMEOUT_S),
+                timeout=(_CONNECT_TIMEOUT_S, min(_READ_TIMEOUT_S, remaining)),
             )
         except requests.RequestException as exc:
             raise VoiceAgentBackendError("events connect failed") from exc
         if resp.status_code != 200:
             raise VoiceAgentBackendError(f"events http {resp.status_code}")
+
+        # 看门狗：deadline 一到就主动 close 连接，主动打断阻塞中的
+        # iter_content —— 不能指望"等下一个 chunk 再检查"
+        watchdog = threading.Timer(max(0.05, deadline - time.monotonic()), resp.close)
+        watchdog.daemon = True
+        watchdog.start()
 
         state = _CollectState()
         try:
@@ -315,9 +361,15 @@ class VoiceAgentClient:
                     state.apply(frame)
                     if state.finished():
                         break
-        except requests.RequestException as exc:
+        except VoiceAgentBackendError:
+            raise
+        except Exception as exc:
+            # 看门狗 close 或网络层中断：越过 deadline 记为超时，否则记为流故障
+            if time.monotonic() >= deadline:
+                raise VoiceAgentBackendError("absolute deadline exceeded") from exc
             raise VoiceAgentBackendError("stream read failed") from exc
         finally:
+            watchdog.cancel()
             resp.close()
 
         if state.failed:
@@ -333,7 +385,7 @@ class VoiceAgentClient:
             return "".join(state.parts)
         copy = _TERMINAL_COPY.get(state.terminal)
         if copy is None:
-            raise VoiceAgentBackendError(f"unknown terminal {state.terminal!r}")
+            raise VoiceAgentBackendError("unknown terminal result")
         return copy
 
 

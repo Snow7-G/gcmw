@@ -10,6 +10,8 @@ All HTTP is stubbed — zero network.
 from __future__ import annotations
 
 import json
+import pathlib
+import time
 from typing import Any
 
 import pytest
@@ -79,7 +81,7 @@ class StubHttp:
         self.routes[(method, url_fragment)] = resp
 
     def _record(
-        self, method: str, url: str, headers: Any, json_body: Any
+        self, method: str, url: str, headers: Any, json_body: Any, timeout: Any
     ) -> StubResponse:
         self.calls.append(
             {
@@ -87,6 +89,7 @@ class StubHttp:
                 "url": url,
                 "headers": dict(headers or {}),
                 "json": json_body,
+                "timeout": timeout,
             }
         )
         for (m, frag), resp in self.routes.items():
@@ -95,13 +98,23 @@ class StubHttp:
         return StubResponse(status_code=404)
 
     def post(self, url: str, **kwargs: Any) -> StubResponse:
-        return self._record("POST", url, kwargs.get("headers"), kwargs.get("json"))
+        return self._record(
+            "POST",
+            url,
+            kwargs.get("headers"),
+            kwargs.get("json"),
+            kwargs.get("timeout"),
+        )
 
     def get(self, url: str, **kwargs: Any) -> StubResponse:
-        return self._record("GET", url, kwargs.get("headers"), None)
+        return self._record(
+            "GET", url, kwargs.get("headers"), None, kwargs.get("timeout")
+        )
 
     def delete(self, url: str, **kwargs: Any) -> StubResponse:
-        return self._record("DELETE", url, kwargs.get("headers"), None)
+        return self._record(
+            "DELETE", url, kwargs.get("headers"), None, kwargs.get("timeout")
+        )
 
 
 def agent_config() -> VoiceAgentConfig:
@@ -114,7 +127,7 @@ def make_client(
     chunks: list[bytes], run_status: int = 200
 ) -> tuple[VoiceAgentClient, StubHttp]:
     http = StubHttp()
-    http.add_route("POST", "/sessions", StubResponse(200, {"session_id": "s-1"}))
+    http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
     http.add_route("POST", "/agent/runs", StubResponse(run_status, {"run_id": "r-1"}))
     http.add_route("GET", "/events", StubResponse(200, chunks=chunks))
     return VoiceAgentClient(agent_config(), http=http), http
@@ -208,18 +221,60 @@ class TestConfig:
                 }
             )
 
-    def test_error_message_never_contains_credential(self):
-        # 非法 mode 报错只回显 mode，绝不回显凭据值
-        with pytest.raises(VoiceAgentConfigError) as exc:
-            resolve_voice_agent_config(
+    @pytest.mark.parametrize(
+        ("bad_env", "sentinel"),
+        [
+            (
                 {
-                    "GCMW_VOICE_ANSWER_BACKEND": "weird",
+                    "GCMW_VOICE_ANSWER_BACKEND": "MODE-SENTINEL-xyz",
                     "GCMW_VOICE_AGENT_API_BASE": DEMO_CONTRACT_BASE_URL,
-                    "GCMW_VOICE_AGENT_CREDENTIAL": "sk-secret-value-xyz",
-                }
-            )
-        assert "weird" in str(exc.value)
-        assert "sk-secret-value-xyz" not in str(exc.value)
+                    "GCMW_VOICE_AGENT_CREDENTIAL": "CRED-SENTINEL-xyz",
+                },
+                ["MODE-SENTINEL-xyz", "CRED-SENTINEL-xyz"],
+            ),
+            (
+                {
+                    "GCMW_VOICE_ANSWER_BACKEND": "agent",
+                    "GCMW_VOICE_AGENT_API_BASE": "http://127.0.0.1:8001/api/v1?secret=URL-SENTINEL-xyz",
+                    "GCMW_VOICE_AGENT_CREDENTIAL": "CRED-SENTINEL-xyz",
+                },
+                ["URL-SENTINEL-xyz", "CRED-SENTINEL-xyz"],
+            ),
+        ],
+    )
+    def test_rejected_config_never_echoes_values(self, bad_env, sentinel):
+        """P1-3：配置错误只报字段名与固定原因——mode/base/credential 的
+        原始值绝不进入 str/repr/args。"""
+        with pytest.raises(VoiceAgentConfigError) as exc:
+            resolve_voice_agent_config(bad_env)
+        for leak in sentinel:
+            assert leak not in str(exc.value)
+            assert leak not in repr(exc.value)
+            assert all(leak not in str(a) for a in exc.value.args)
+
+    def test_startup_output_never_contains_sentinel(self, tmp_path, capfd):
+        """P1-3：qa_server 启动期配置失败时，stdout/stderr 不含原始值。"""
+        import os
+        import subprocess
+        import sys
+
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GCMW_VOICE_")}
+        env.update(
+            GCMW_VOICE_ANSWER_BACKEND="agent",
+            GCMW_VOICE_AGENT_API_BASE="http://127.0.0.1:8001/api/v1?secret=STARTUP-SENTINEL",
+            GCMW_VOICE_AGENT_CREDENTIAL="cred",
+        )
+        proc = subprocess.run(
+            [sys.executable, "qa_server.py"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+            cwd=str(pathlib.Path(__file__).resolve().parent.parent),
+        )
+        assert proc.returncode != 0
+        assert "STARTUP-SENTINEL" not in (proc.stdout + proc.stderr)
 
 
 # ============ Agent 客户端（交付门槛 / 映射 / 卫生） ============
@@ -401,7 +456,7 @@ class TestClientDeliveryGate:
     def test_network_failure_cancels_run(self):
         # sessions/runs 正常创建，events 阶段网络故障 → best-effort 取消 run
         http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(200, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
 
         class FlakyGet:
@@ -642,3 +697,237 @@ class TestChatRoute:
         assert qa_server._latest_answer is not None
         assert qa_server._latest_answer["robot_answer"] == "广播验证"
         assert qa_server._latest_answer["source"] == "agent"
+
+
+# ============ P1-1：绝对 deadline 贯穿 + 可中断阻塞读 ============
+
+
+class BlockingStreamResponse(StubResponse):
+    """模拟阻塞的 SSE 流：每块之间等 interval；close() 由看门狗触发后，
+    下一次等待立刻以 OSError 中断（等价于真实 socket 被 close）。"""
+
+    def __init__(self, chunks: list[bytes], interval: float) -> None:
+        super().__init__(200, chunks=chunks)
+        import threading
+
+        self._interval = interval
+        self._close_evt = threading.Event()
+
+    def close(self) -> None:
+        self._close_evt.set()
+        self.closed = True
+
+    def iter_content(self, chunk_size: int) -> list[bytes]:
+        out = []
+        for c in self._chunks:
+            if self._close_evt.wait(self._interval):
+                raise OSError("connection closed by watchdog")
+            out.append(c)
+        return out
+
+
+class TestAbsoluteDeadline:
+    """P1-1：deadline 从 ask() 入口起算、贯穿全部阶段、能主动打断阻塞读，
+    总耗时存在硬上界。"""
+
+    def test_watchdog_interrupts_blocking_stream_within_deadline(self, monkeypatch):
+        import time
+
+        import voice_agent_adapter as mod
+
+        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.05)
+        http = StubHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
+        # 心跳流：每块间隔 0.2s，永远到不了终态 —— 阻塞读必须被看门狗打断
+        http.add_route(
+            "GET",
+            "/events",
+            BlockingStreamResponse(
+                [b": keep-alive\n\n", b": keep-alive\n\n", b": keep-alive\n\n"],
+                interval=0.2,
+            ),
+        )
+        client = VoiceAgentClient(agent_config(), http=http)
+        t0 = time.monotonic()
+        answer, source = client.ask("q")
+        elapsed = time.monotonic() - t0
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert elapsed < 0.15, f"看门狗未在 deadline 处打断阻塞读：{elapsed:.3f}s"
+
+    def test_answer_arriving_within_deadline_still_succeeds(self, monkeypatch):
+        """近 deadline 回归：预算内完成的回答正常交付（对应 ROS 调用方
+        不得先超时的语义 —— 适配器预算内成功 = 调用方窗口内成功）。"""
+
+        import voice_agent_adapter as mod
+
+        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.5)
+        http = StubHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
+        http.add_route("GET", "/events", StubResponse(200, chunks=good_answer_stream()))
+        client = VoiceAgentClient(agent_config(), http=http)
+        answer, source = client.ask("q")
+        assert source == "agent" and answer == "眼部不适需及时就诊"
+
+    def test_budget_propagates_to_session_and_run_timeouts(self, monkeypatch):
+        """Session/Run 的读超时必须 ≤ 剩余预算（阻塞创建被 socket 级打断）。"""
+        import voice_agent_adapter as mod
+
+        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.05)
+
+        class SlowCreateHttp(StubHttp):
+            def post(self, url: str, **kwargs: Any) -> StubResponse:
+                time.sleep(0.2)  # 模拟阻塞中的创建请求
+                return super().post(url, **kwargs)
+
+        http = SlowCreateHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        client = VoiceAgentClient(agent_config(), http=http)
+        _answer, source = client.ask("q")
+        assert source == "error"
+        session_calls = [c for c in http.calls if c["url"].endswith("/sessions")]
+        connect, read = session_calls[0]["timeout"]
+        assert connect == mod._CONNECT_TIMEOUT_S
+        assert read <= 0.06, f"读超时未按剩余预算收缩：{read}"
+
+    def test_total_turn_elapsed_is_bounded_on_failure_paths(self, monkeypatch):
+        import time
+
+        import voice_agent_adapter as mod
+
+        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.05)
+        http = StubHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
+        http.add_route(
+            "GET",
+            "/events",
+            BlockingStreamResponse([b": keep-alive\n\n"] * 5, interval=0.2),
+        )
+        client = VoiceAgentClient(agent_config(), http=http)
+        t0 = time.monotonic()
+        client.ask("q")
+        # 失败路径总耗时上界：预算 + 少量余量（清理另有独立 2s×2 有界 grace）
+        assert time.monotonic() - t0 < 0.5
+
+
+# ============ P2-1：有界 best-effort 清理 ============
+
+
+class HangingDeleteHttp(StubHttp):
+    """模拟永久悬挂的 DELETE：按调用方给定的 timeout 停留后以超时失败
+    （等价于真实 socket 被读超时打断）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.delete_signal: list[float] = []
+
+    def delete(self, url: str, **kwargs: Any) -> StubResponse:
+        timeout = kwargs.get("timeout") or (0, 0)
+        self.delete_signal.append(timeout[1])
+        time.sleep(min(timeout[1], 0.3))
+        raise vaa.requests.ReadTimeout("hung delete interrupted by socket timeout")
+
+
+class TestBoundedCleanup:
+    def test_success_terminal_does_not_delete_run(self):
+        """P2-1 裁剪：成功终态后服务端已完成 Run，不再先删 Run。"""
+        client, http = make_client(good_answer_stream())
+        client.ask("q")
+        deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
+        assert any("/sessions/" in u for u in deletes)
+        assert not any("/agent/runs/" in u for u in deletes)
+
+    def test_failure_cancels_run_and_deletes_session(self):
+        client, http = make_client([frame_bytes(1, "stream.error", {})])
+        client.ask("q")
+        deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
+        assert any("/agent/runs/" in u for u in deletes)
+        assert any("/sessions/" in u for u in deletes)
+
+    def test_cleanup_requests_use_bounded_short_grace(self):
+        """清理超时必须是独立的短预算，绝不复用业务预算。"""
+        client, http = make_client([frame_bytes(1, "stream.error", {})])
+        client.ask("q")
+        import voice_agent_adapter as mod
+
+        for c in http.calls:
+            if c["method"] == "DELETE":
+                connect, read = c["timeout"]
+                assert connect <= 1.0 and read == mod._CLEANUP_GRACE_S
+
+    def test_hanging_cleanups_are_bounded_and_return_unchanged(self):
+        import time
+
+        import voice_agent_adapter as mod
+
+        http = HangingDeleteHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
+        http.add_route("GET", "/events", StubResponse(200, chunks=good_answer_stream()))
+        client = VoiceAgentClient(agent_config(), http=http)
+        t0 = time.monotonic()
+        answer, source = client.ask("q")
+        elapsed = time.monotonic() - t0
+        # 成功终态只删 Session（P2-1 裁剪），悬挂被 2s grace 打断
+        # （stub 压缩为 0.3s 模拟），返回不变
+        assert source == "agent" and answer == "眼部不适需及时就诊"
+        assert http.delete_signal == [mod._CLEANUP_GRACE_S]
+        assert elapsed < 1.5
+
+    def test_failure_path_two_hanging_cleanups_bounded(self):
+        import voice_agent_adapter as mod
+
+        http = HangingDeleteHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
+        http.add_route(
+            "GET",
+            "/events",
+            StubResponse(200, chunks=[frame_bytes(1, "stream.error", {})]),
+        )
+        client = VoiceAgentClient(agent_config(), http=http)
+        t0 = time.monotonic()
+        answer, source = client.ask("q")
+        elapsed = time.monotonic() - t0
+        # 失败路径：取消 Run + 删 Session，两个悬挂清理都有界，返回不变
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert http.delete_signal == [mod._CLEANUP_GRACE_S, mod._CLEANUP_GRACE_S]
+        assert elapsed < 1.5
+
+    def test_cleanup_non_2xx_does_not_change_return(self):
+        http = StubHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
+        http.add_route("GET", "/events", StubResponse(200, chunks=good_answer_stream()))
+        http.add_route("DELETE", "/sessions", StubResponse(500))
+        client = VoiceAgentClient(agent_config(), http=http)
+        answer, source = client.ask("q")
+        assert source == "agent" and answer == "眼部不适需及时就诊"
+
+
+# ============ P1-2：ROS 调用方超时契约 ============
+
+
+class TestVoiceTurnTimeoutContract:
+    def test_ros_timeout_exceeds_adapter_budget(self):
+        import voice_agent_adapter as mod
+
+        assert mod.VOICE_TURN_TIMEOUT_S >= (
+            mod._TOTAL_DEADLINE_S + mod._CLEANUP_GRACE_S
+        )
+        assert mod.VOICE_TURN_TIMEOUT_S == 67.0
+
+    def test_both_ros_nodes_share_the_same_semantics(self):
+        """P1-2：两个 ROS 节点必须从适配器取同一端到端预算，不得各自写死。"""
+        import voice_agent_adapter as mod
+
+        server_dir = pathlib.Path(__file__).resolve().parent.parent
+        for node in ("voice_transfer_node.py", "voice_transfer_node_ros2.py"):
+            src = (server_dir / node).read_text()
+            assert "from voice_agent_adapter import VOICE_TURN_TIMEOUT_S" in src
+            assert "timeout=15)" not in src, node
+        # 适配器预算本身即 ROS 预算的组成部分：预算内完成的回答必然早于
+        # ROS 超时窗口（近 deadline 回归见 TestAbsoluteDeadline）
+        assert mod.VOICE_TURN_TIMEOUT_S > mod._TOTAL_DEADLINE_S
