@@ -359,3 +359,24 @@ cage -s -- \
 - 当前版本：1.0.0
 - 默认后端地址：http://127.0.0.1:8000
 - 默认分支：main
+
+## 语音回答后端：legacy / agent 双模式（#58 语音快速切片）
+
+机器人语音链路（M260C + 讯飞 AIUI → ROS → `/mic/*` → `/chat` → `/sse` → 页面 TTS 播报）保持不变，仅 `/chat` 的**回答引擎**可通过环境变量切换：
+
+| 变量 | 说明 |
+|---|---|
+| `GCMW_VOICE_ANSWER_BACKEND` | `legacy`（默认，KB → DeepSeek，行为不变）或 `agent`（走新 Agent：Manager → RAG → Verifier） |
+| `GCMW_VOICE_AGENT_API_BASE` | agent 模式的后端地址，当前固定为 `http://127.0.0.1:8001/api/v1` |
+| `GCMW_VOICE_AGENT_CREDENTIAL` | Agent 设备凭据（只进入 `Authorization` 头，缺失/占位符时拒绝启动） |
+
+双服务启动顺序（agent 模式）：
+
+1. **8001 新 Agent**：`PYTHONPATH=. python3 scripts/demo_showcase.py --serve --port 8001 --cors-for-dev-frontends`
+2. **8000 兼容服务**：设好上面三个变量后 `python qa_server.py`
+
+要点：
+
+- agent 模式下任何故障（8001 不可达 / 超时 / 证据不足）都返回**固定安全文案**，**不会回退**到 DeepSeek；
+- 未通过 Verifier 核验的医疗内容不会显示或播报（引用三元组门槛）；
+- 语音回答为「一次性问答」：每个问题一个临时 Agent 会话，当前**不含**多轮语音记忆、流式 ASR/TTS、打断播报与云端实时音频。

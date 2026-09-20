@@ -8,37 +8,39 @@
 端口: 8000
 """
 from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
 import threading
 import time
-import zipfile
 import xml.etree.ElementTree as ET
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-import uvicorn
-import requests
+import zipfile
 
 # ========== jieba 分词 ==========
 import jieba
 import jieba.analyse as jieba_analyse
+import requests
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+# ========== 语音回答后端（legacy | agent 兼容桥，#58 快速切片） ==========
+import voice_agent_adapter
 
 # ========== 全局配置 ==========
 KB_MATCH_THRESHOLD = 0.22  # 知识库匹配阈值（0~1，低于此分数走 LLM）
 
-STOP_WORDS = set([
+STOP_WORDS = {
     "的", "了", "是", "吗", "呢", "啊", "吧", "呀", "哦", "么", "嘛",
     "我", "你", "他", "她", "它", "这", "那", "什么", "怎么", "怎样",
     "一个", "一下", "一些", "一点", "不", "很", "都", "就", "也", "还",
     "要", "会", "能", "可以", "应该", "在", "有", "和", "与", "或",
     "对", "把", "被", "让", "给", "从", "到", "向", "跟", "用",
-])
+}
 
 # ========== FastAPI 初始化 ==========
 app = FastAPI(title="互动问答后端", version="3.0.0")
@@ -77,7 +79,7 @@ def extract_paragraphs(docx_path: str) -> list[str]:
                     paragraphs.append(line)
     except FileNotFoundError:
         print(f"[WARN]  文档不存在: {docx_path}，使用内置知识库")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — 历史容错：解析失败回退内置知识库
         print(f"[WARN]  文档解析失败: {e}，使用内置知识库")
     return paragraphs
 
@@ -109,8 +111,6 @@ def parse_qa_pairs(paragraphs: list[str]) -> list[dict]:
 
     # ── 旧格式：从对话脚本中提取知识点 ──
     # 匹配「机器人：xxx」作为答案
-    robot_lines = re.findall(r"机器人[：:]\s*(.+?)(?=\n|$)", full_text)
-
     # 匹配标题/主题行
     topics: list[dict] = [
         {
@@ -407,8 +407,8 @@ def call_deepseek(question: str, history: list[dict] | None = None) -> tuple[str
         if status in (401, 403):
             return f"DeepSeek API Key 认证失败 (HTTP {status})，请检查 Key。", "error"
         return f"DeepSeek 返回错误 (HTTP {status})，请稍后再试。", "error"
-    except Exception as e:
-        return f"服务异常：{str(e)}", "error"
+    except Exception as e:  # noqa: BLE001 — 历史容错：DeepSeek 任意故障转 error
+        return f"服务异常：{e!s}", "error"
 
 
 # ================================================
@@ -427,6 +427,15 @@ print(f"  匹配阈值: {KB_MATCH_THRESHOLD}")
 print(f"  DeepSeek: {'[OK]' if len(DEEPSEEK_API_KEY) > 20 else '❌'}")
 print("=" * 50)
 
+# ── 语音回答后端开关：解析失败（非法 mode / 非契约 URL / 缺凭据）显式退出，
+#    绝不静默回退 legacy —— 配置错误必须被人看见 ──
+try:
+    VOICE_AGENT_CONFIG = voice_agent_adapter.resolve_voice_agent_config()
+except voice_agent_adapter.VoiceAgentConfigError as _exc:
+    print(f"[FATAL] 语音回答后端配置错误: {_exc}")
+    raise SystemExit(1)
+print(f"  语音回答后端: {VOICE_AGENT_CONFIG.mode}")
+
 
 # ================================================
 # 第六部分：API 模型
@@ -440,7 +449,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     user_question: str
     robot_answer: str
-    source: str          # "kb" | "deepseek" | "error"
+    source: str          # "kb" | "deepseek" | "error" | "agent"
 
 
 class SuggestionsResponse(BaseModel):
@@ -490,7 +499,19 @@ def chat_api(req: ChatRequest):
             user_question="", robot_answer="跟我说说话吧～你想问什么呢？😊", source="error"
         )
 
-    # ── 第一步：搜知识库 ──
+    if VOICE_AGENT_CONFIG.mode == "agent":
+        # ── Agent 模式：只走新 Agent（Manager → RAG → Verifier），任何故障
+        #    都由适配器失败关闭为固定安全文案，严禁回退 KB/DeepSeek ──
+        answer, source = voice_agent_adapter.ask(q, VOICE_AGENT_CONFIG)
+        print(f"   [AGENT] source={source}")
+        result = ChatResponse(user_question=q, robot_answer=answer, source=source)
+        with _answer_lock:
+            _answer_id += 1
+            _latest_answer = result.model_dump()
+            _latest_answer["id"] = _answer_id
+        return result
+
+    # ── legacy 模式：行为逐字不变 ──
     best_entry, score = kb_searcher.search(q)
 
     if best_entry is not None and score >= KB_MATCH_THRESHOLD:
@@ -643,6 +664,7 @@ def health_check():
         "kb_entries": len(qa_list),
         "docx_path": DOCX_PATH,
         "match_threshold": KB_MATCH_THRESHOLD,
+        "answer_backend": VOICE_AGENT_CONFIG.mode,
     }
 
 

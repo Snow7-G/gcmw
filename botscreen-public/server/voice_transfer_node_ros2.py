@@ -118,7 +118,8 @@ class VoiceTransferNode(Node):
             source = data.get("source", "unknown")
             label = (
                 "本地知识库" if source == "kb" else
-                ("DeepSeek" if source == "deepseek" else "错误")
+                ("DeepSeek" if source == "deepseek" else
+                 ("安全Agent" if source == "agent" else "错误"))
             )
             self.get_logger().info(f"回复 [{label}]: {answer}")
             print(f"\n问题: {text}\n来源: {label}\n回答: {answer}\n")

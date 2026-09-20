@@ -81,7 +81,8 @@ def voice_callback(msg: String) -> None:
         source = data.get("source", "unknown")
         label = (
             "本地知识库" if source == "kb" else
-            ("DeepSeek" if source == "deepseek" else "错误")
+            ("DeepSeek" if source == "deepseek" else
+             ("安全Agent" if source == "agent" else "错误"))
         )
         rospy.loginfo("回复 [%s]: %s", label, answer)
         print(f"\n问题: {text}\n来源: {label}\n回答: {answer}\n")

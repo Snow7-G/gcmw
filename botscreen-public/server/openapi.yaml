@@ -256,8 +256,8 @@ components:
           type: string
         source:
           type: string
-          enum: [kb, deepseek, error]
-          description: 回答来源：本地知识库、DeepSeek 或错误兜底。
+          enum: [kb, deepseek, error, agent]
+          description: 回答来源：本地知识库、DeepSeek、错误兜底，或已核验的 Agent 回答。
 
     SuggestionsResponse:
       type: object
