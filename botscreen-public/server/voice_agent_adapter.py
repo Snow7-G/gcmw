@@ -17,48 +17,67 @@ Design contract (do not weaken):
   ``run.completed`` with ``result == "answered"``. Anything else discards the
   partial answer;
 * the credential lives ONLY in the ``Authorization: Bearer`` header — never in
-  URLs, logs, exception texts, or anything this module returns;
-* ONE absolute WALL-CLOCK deadline covers the whole voice turn. It is
-  generated at ``ask()`` entry. Every HTTP call (session, run, events) runs
-  through a bounded worker: ``future.result(timeout=remaining)`` enforces the
-  deadline even against slow-drip responses that defeat per-read timeouts,
-  and the remaining budget also shrinks the connect timeout. The SSE stream
-  additionally gets a watchdog that closes the connection at the deadline,
-  interrupting a blocked ``iter_content``;
-* cleanup is BOUNDED best-effort with its own total grace shared by both
-  cleanup requests. Semantics are EXPLICIT: on SUCCESS the temporary Session
-  (and its Run/events) is intentionally LEFT to the server TTL — the audit
-  record survives; on FAILURE the Session is deleted, which CASCADES to the
-  Run and events (transient voice turns are not meant to be auditable). A
-  cleanup failure never changes the already-decided safe return;
+  URLs, logs, exception texts, or anything this module returns.
+
+Timeout model (fourth review round — replaces the abandoned threadpool):
+
+* ONE absolute monotonic deadline covers the whole voice turn. It is generated
+  at ``ask()`` entry and enforced as a REAL cancellation domain: the turn runs
+  inside ``asyncio.timeout_at(deadline)`` over an ``httpx.AsyncClient``. When
+  the deadline fires, the in-flight request coroutine is actually cancelled
+  and its connection is closed on context exit — there is NO worker thread
+  whose execution keeps running past the caller's return.
+* the client-side business deadline is a WAITING hard bound only. A
+  distributed POST that hits it has an UNKNOWN outcome: the server may have
+  committed. Client cancellation can never PROVE "nothing was written", so
+  result-unknown is reconciled explicitly:
+  - the Session POST carries a per-turn ``idempotency_key`` (minted BEFORE the
+    request). During cleanup, the creation is replayed with the SAME key — the
+    server's session idempotency contract returns the already-committed (or
+    freshly created) session, which is then deleted along its cascade.
+    Retrying with a NEW key is forbidden: it would create a second session.
+  - the Run POST key is likewise minted before the request and reused by any
+    retry of the same turn; if the Session id is known, deleting the Session
+    cascades to any possibly-committed Run.
+* cleanup is BOUNDED and genuinely cancellable, under its own
+  ``_CLEANUP_TOTAL_GRACE_S`` deadline. Semantics are EXPLICIT: on SUCCESS
+  nothing is deleted — the temporary Session (and its Run/events) is left for
+  the server's ACTIVE TTL sweeper to reclaim (the audit record survives until
+  TTL); on FAILURE the Session is deleted, which CASCADES to the Run and
+  events (transient voice turns are not meant to be auditable). A cleanup that
+  hits its own deadline is cancelled mid-flight; the server-side TTL remains
+  the final backstop. A cleanup failure never changes the already-decided safe
+  return;
 * one throwaway Agent Session per voice question (no multi-turn voice memory
   in this slice);
 * configuration errors report FIELD NAMES and fixed reasons only — the
-  rejected raw value is never echoed (it may be a misplaced secret).
+  rejected raw value is never echoed (it may be a misplaced secret);
+* logging: this module logs nothing — no response bodies, no question text,
+  no credentials.
 
-Honest limitation: a bounded worker whose future timed out is abandoned, not
-killed — its socket lives on until the server closes it or its own read
-timeout fires. It can never deliver a result (the future is discarded) and
-has no effect on the returned answer.
+Lifecycle: every turn creates its own AsyncClient inside an ``async with`` and
+closes it before ``ask()`` returns; no module-level executor, thread, task, or
+connection pool survives a turn. The sync surface is preserved on purpose:
+the legacy ``/chat`` endpoint runs in FastAPI's threadpool and the ROS nodes
+are plain scripts — ``ask()`` bridges to async internally via ``asyncio.run``.
 
-This module is deliberately SYNC (``requests``): the legacy ``/chat`` endpoint
-runs in FastAPI's threadpool and the ROS nodes are plain scripts.
+Still NOT included: multi-turn voice memory, streaming ASR/TTS, barge-in
+playback interruption, real knowledge base, production-durable auditing.
 """
 
 from __future__ import annotations
 
+import asyncio
 import codecs
-import concurrent.futures
 import json
 import os
 import re
-import threading
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-import requests
+import httpx
 
 # ============ 固定契约常量 ============
 
@@ -69,9 +88,10 @@ PLACEHOLDER_CREDENTIAL = "YOUR_DEMO_CREDENTIAL_HERE"
 _CONNECT_TIMEOUT_S = 5.0
 _READ_TIMEOUT_S = 30.0
 #: 业务预算：整个语音问答（Session + Run + SSE 流）从 ask() 入口起算的
-#: 墙钟硬上界（对慢速滴流响应同样生效，见 _bounded）
+#: 墙钟硬上界——以真正的 asyncio 取消域执行，不是"停止等待"
 _TOTAL_DEADLINE_S = 60.0
-#: 清理总 grace：失败路径上"取消 Run + 删除 Session"共享的墙钟上界
+#: 清理总 grace：失败路径上"幂等对账 + 取消 Run + 删除 Session"共享的
+#: 墙钟上界；到点即真取消（可中断），服务端 TTL 是最终兜底
 _CLEANUP_TOTAL_GRACE_S = 4.0
 #: 清理单请求预算（≤ 清理总 grace 的一半，保证两个请求都能被调度）
 _CLEANUP_GRACE_S = 2.0
@@ -96,12 +116,6 @@ _TERMINAL_COPY = {
     "cancelled": COPY_CANCELLED,
     "deadline_exceeded": COPY_TIMEOUT,
 }
-
-#: 有界执行器：被放弃的 future 在 daemon 线程里自然消亡（socket 由
-#: 对端关闭或自身读超时终结），不影响调用方返回。
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="voice-agent-bounded"
-)
 
 
 class VoiceAgentConfigError(RuntimeError):
@@ -147,8 +161,7 @@ def resolve_voice_agent_config(env: dict[str, str] | None = None) -> VoiceAgentC
     base = (env.get("GCMW_VOICE_AGENT_API_BASE", "") or "").strip().rstrip("/")
     if base != DEMO_CONTRACT_BASE_URL:
         raise VoiceAgentConfigError(
-            "GCMW_VOICE_AGENT_API_BASE 配置非法："
-            f"必须精确等于 {DEMO_CONTRACT_BASE_URL}"
+            f"GCMW_VOICE_AGENT_API_BASE 配置非法：必须精确等于 {DEMO_CONTRACT_BASE_URL}"
         )
     credential = (env.get("GCMW_VOICE_AGENT_CREDENTIAL", "") or "").strip()
     if not credential or credential == PLACEHOLDER_CREDENTIAL:
@@ -157,30 +170,6 @@ def resolve_voice_agent_config(env: dict[str, str] | None = None) -> VoiceAgentC
             "agent 模式拒绝启动"
         )
     return VoiceAgentConfig(mode="agent", base_url=base, credential=credential)
-
-
-# ============ 硬边界工具 ============
-
-
-def _remaining_or_raise(deadline: float) -> float:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise VoiceAgentBackendError("absolute deadline exceeded")
-    return remaining
-
-
-def _bounded(fn: Any, deadline: float, what: str) -> Any:
-    """在共享有界执行器里运行 ``fn``，以剩余预算为墙钟硬上界。
-
-    超时 → :class:`VoiceAgentBackendError`（失败关闭）。被放弃的 future 在
-    daemon 线程里自然消亡（见模块 docstring 的诚实限制）。
-    """
-    remaining = _remaining_or_raise(deadline)
-    future = _EXECUTOR.submit(fn)
-    try:
-        return future.result(timeout=remaining)
-    except concurrent.futures.TimeoutError as exc:
-        raise VoiceAgentBackendError(f"absolute deadline exceeded during {what}") from exc
 
 
 # ============ SSE 帧解析（流式 UTF-8 安全） ============
@@ -235,9 +224,9 @@ class SseFrameParser:
                 continue  # keep-alive 注释
             is_comment = False
             if line.startswith("event:"):
-                event = line[len("event:"):].strip()
+                event = line[len("event:") :].strip()
             elif line.startswith("data:"):
-                data_lines.append(line[len("data:"):].lstrip(" "))
+                data_lines.append(line[len("data:") :].lstrip(" "))
             # 其余字段（id:/retry:）与交付无关，忽略
         if is_comment:
             return None
@@ -247,63 +236,117 @@ class SseFrameParser:
 # ============ 客户端 ============
 
 
-class VoiceAgentClient:
-    """同步 Agent 客户端：一次语音问题 = 一个临时 Session + 一个 Run。
+@dataclass
+class _TurnState:
+    """One voice turn's mutable bookkeeping (idempotency + result-unknown)."""
 
-    ``http`` 可注入（测试零网络）；缺省用 :mod:`requests`。返回值只有
+    session_id: str | None = None
+    run_id: str | None = None
+    #: the Session POST was ISSUED — the server may have committed it even if
+    #: the client never saw the response
+    session_sent: bool = False
+    #: the Run POST was issued — cascaded by the Session delete
+    run_sent: bool = False
+
+
+class VoiceAgentClient:
+    """同步外观的 Agent 客户端：一次语音问题 = 一个临时 Session + 一个 Run。
+
+    ``ask()`` 保持同步（FastAPI sync 路由线程池 + ROS 纯脚本调用方），
+    内部经 ``asyncio.run()`` 进入真正的取消域：每轮一个 ``httpx.AsyncClient``、
+    一条贯穿 Session/Run/SSE 的绝对 deadline（``asyncio.timeout_at``）。
+    ``http`` 可注入异步测试替身（零网络）；返回值只有
     ``(固定文案或已核验答案, "agent"|"error")`` —— 不向外暴露响应正文、
     异常原文或凭据。
     """
 
     def __init__(self, config: VoiceAgentConfig, http: Any = None) -> None:
         self._cfg = config
-        self._http = http if http is not None else requests
+        # None → 每轮真实 httpx.AsyncClient；否则为异步测试替身
+        # （须提供 async post/get/delete 与 stream() 异步上下文管理器）
+        self._http = http
 
     # ---------- 公共入口 ----------
 
     def ask(self, question: str) -> tuple[str, str]:
         """返回 (robot_answer, source)；source ∈ {"agent", "error"}。
 
-        绝对墙钟 deadline 在本入口生成，贯穿 Session/Run/SSE 全部阶段。
+        绝对墙钟 deadline 在本入口生成，贯穿 Session/Run/SSE 全部阶段，
+        由 asyncio 取消域真实执行：到点即取消在途请求并关闭连接。
         """
-        deadline = time.monotonic() + _TOTAL_DEADLINE_S
-        session_id: str | None = None
-        run_id: str | None = None
-        reached_terminal = False
         try:
-            session_id = self._create_session(deadline)
-            run_id = self._create_run(session_id, question, deadline)
-            answer = self._collect(run_id, deadline)
-            reached_terminal = True
-            return answer, "agent"
+            return asyncio.run(self._ask_async(question))
         except VoiceAgentBackendError:
             return COPY_UNAVAILABLE, "error"
         except Exception:  # noqa: BLE001 — 兜底失败关闭是安全要求，不是疏忽
-            # 任何未预期异常都失败关闭，绝不携带原始错误文本
+            # 任何未预期异常（含事件循环层故障）都失败关闭，
+            # 绝不携带原始错误文本
             return COPY_UNAVAILABLE, "error"
+
+    # ---------- 异步主体 ----------
+
+    async def _ask_async(self, question: str) -> tuple[str, str]:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _TOTAL_DEADLINE_S
+        # 幂等键在任何受保护请求发出之前生成；同一轮的任何重试必须复用
+        session_key = f"voice-session-{uuid.uuid4().hex}"
+        run_key = f"voice-run-{uuid.uuid4().hex}"
+        state = _TurnState()
+
+        own_client = self._http is None
+        client = (
+            httpx.AsyncClient(timeout=self._httpx_timeout(_TOTAL_DEADLINE_S))
+            if own_client
+            else self._http
+        )
+        reached_terminal = False
+        try:
+            try:
+                async with asyncio.timeout_at(deadline):
+                    session_id = await self._create_session(
+                        client, state, session_key, deadline
+                    )
+                    state.session_id = session_id
+                    run_id = await self._create_run(
+                        client, state, session_id, run_key, question, deadline
+                    )
+                    state.run_id = run_id
+                    answer = await self._collect(client, run_id, deadline)
+                reached_terminal = True
+                return answer, "agent"
+            except TimeoutError:
+                # 取消域到点：在途请求已被真实取消。交给 finally 清理
+                # （结果未知的 POST 用幂等键对账）
+                raise VoiceAgentBackendError("absolute deadline exceeded") from None
+            except VoiceAgentBackendError:
+                raise
+            except Exception as exc:
+                raise VoiceAgentBackendError("unexpected client failure") from exc
+            finally:
+                # 结果已确定的异常路径也要走有界清理；此处的 return 不受
+                # 清理结果影响（清理异常在 _bounded_cleanup 内部吞掉）
+                if not reached_terminal:
+                    await self._bounded_cleanup(client, state, session_key)
         finally:
-            # 有界 best-effort 清理（共享一个清理总期限；清理失败不改变
-            # 已确定的返回）：
-            # - 成功终态：**不删任何东西** —— Session 交给服务端 TTL 回收，
-            #   Run/事件保留，保证成功问答可审计；
-            # - 失败路径：删除 Session（后端级联删除该 Session 下的 Run 与
-            #   事件）——一次性语音问答的失败轮次不留痕。显式取消 Run 的
-            #   语义由级联删除覆盖。
-            if not reached_terminal:
-                cleanup_deadline = time.monotonic() + _CLEANUP_TOTAL_GRACE_S
-                if run_id is not None:
-                    self._best_effort_delete(f"/agent/runs/{run_id}", cleanup_deadline)
-                if session_id is not None:
-                    self._best_effort_delete(f"/sessions/{session_id}", cleanup_deadline)
+            if own_client:
+                await client.aclose()  # 每轮关闭，退出后零残留连接
 
     # ---------- 内部工具 ----------
 
     @staticmethod
-    def _remaining_or_raise(deadline: float) -> float:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise VoiceAgentBackendError("absolute deadline exceeded")
-        return remaining
+    def _httpx_timeout(remaining: float) -> httpx.Timeout:
+        """Per-phase HTTP timeouts; the connect budget also shrinks with the
+        remaining wall clock (a sub-second budget must not spend a full 5s
+        connect). The absolute deadline on top is the REAL hard bound."""
+        connect = min(_CONNECT_TIMEOUT_S, max(remaining, 0.05))
+        read = min(_READ_TIMEOUT_S, max(remaining, 0.05))
+        return httpx.Timeout(connect=connect, read=read, write=read, pool=read)
+
+    @staticmethod
+    def _remaining_timeout(deadline: float) -> httpx.Timeout:
+        # the deadline lives on the loop clock, which on the default event loop
+        # IS time.monotonic() — same epoch, so the subtraction is sound
+        return VoiceAgentClient._httpx_timeout(deadline - time.monotonic())
 
     def _headers(self) -> dict[str, str]:
         # 凭据只出现在这里
@@ -314,20 +357,25 @@ class VoiceAgentClient:
 
     # ---------- Agent 调用序列 ----------
 
-    def _create_session(self, deadline: float) -> str:
-        remaining = self._remaining_or_raise(deadline)
-        resp = _bounded(
-            lambda: self._http.post(
+    async def _create_session(
+        self, client: Any, state: _TurnState, session_key: str, deadline: float
+    ) -> str:
+        state.session_sent = True  # 先置位：请求在途即视为"结果可能已提交"
+        try:
+            resp = await client.post(
                 f"{self._cfg.base_url}/sessions",
-                json={"channel": "text", "locale": "zh-CN"},
+                json={
+                    "channel": "text",
+                    "locale": "zh-CN",
+                    "idempotency_key": session_key,
+                },
                 headers=self._headers(),
-                # 连接超时随剩余预算收缩：剩余不足 5s 时不得用满额 connect
-                timeout=(min(_CONNECT_TIMEOUT_S, remaining),
-                         min(_READ_TIMEOUT_S, remaining)),
-            ),
-            deadline,
-            "session creation",
-        )
+                timeout=self._remaining_timeout(deadline),
+            )
+        except VoiceAgentBackendError:
+            raise
+        except Exception as exc:
+            raise VoiceAgentBackendError("session request failed") from exc
         if resp.status_code != 201:  # 契约严格锁定：session 创建返回 201
             raise VoiceAgentBackendError(f"session http {resp.status_code}")
         try:
@@ -338,23 +386,31 @@ class VoiceAgentClient:
             raise VoiceAgentBackendError("session malformed payload")
         return session_id
 
-    def _create_run(self, session_id: str, question: str, deadline: float) -> str:
-        remaining = self._remaining_or_raise(deadline)
-        resp = _bounded(
-            lambda: self._http.post(
+    async def _create_run(
+        self,
+        client: Any,
+        state: _TurnState,
+        session_id: str,
+        run_key: str,
+        question: str,
+        deadline: float,
+    ) -> str:
+        state.run_sent = True  # 先置位：同轮重试必须复用同一 key
+        try:
+            resp = await client.post(
                 f"{self._cfg.base_url}/agent/runs",
                 json={
                     "session_id": session_id,
                     "input": {"type": "text", "text": question},
-                    "idempotency_key": f"voice-{uuid.uuid4()}",
+                    "idempotency_key": run_key,
                 },
                 headers=self._headers(),
-                timeout=(min(_CONNECT_TIMEOUT_S, remaining),
-                         min(_READ_TIMEOUT_S, remaining)),
-            ),
-            deadline,
-            "run creation",
-        )
+                timeout=self._remaining_timeout(deadline),
+            )
+        except VoiceAgentBackendError:
+            raise
+        except Exception as exc:
+            raise VoiceAgentBackendError("run request failed") from exc
         if resp.status_code != 200:
             raise VoiceAgentBackendError(f"run http {resp.status_code}")
         try:
@@ -365,76 +421,110 @@ class VoiceAgentClient:
             raise VoiceAgentBackendError("run malformed payload")
         return run_id
 
-    def _best_effort_delete(self, path: str, cleanup_deadline: float) -> None:
-        # 共享清理总期限：单请求预算 = min(单请求 grace, 剩余清理期限)；
-        # 悬挂请求被 future.result 打断（被放弃的线程自然消亡）。
-        remaining = cleanup_deadline - time.monotonic()
-        if remaining <= 0:
-            return
+    # ---------- 有界清理（可真取消） ----------
+
+    async def _bounded_cleanup(
+        self, client: Any, state: _TurnState, session_key: str
+    ) -> None:
+        """失败路径的有界 best-effort 清理，共享一个总期限。
+
+        到点后**真取消**在途清理请求（asyncio 取消域，不是"停止等待"）；
+        服务端主动 TTL sweeper 是未回收残留的最终兜底。清理失败/超时
+        绝不改变已确定的返回。
+        """
+        loop = asyncio.get_running_loop()
+        cleanup_deadline = loop.time() + _CLEANUP_TOTAL_GRACE_S
         try:
-            future = _EXECUTOR.submit(
-                lambda: self._http.delete(
-                    f"{self._cfg.base_url}{path}",
-                    headers=self._headers(),
-                    timeout=(1.0, min(_CLEANUP_GRACE_S, remaining)),
-                )
-            )
-            future.result(timeout=min(_CLEANUP_GRACE_S, remaining))
-        except concurrent.futures.TimeoutError:
-            pass  # 悬挂：被放弃的线程自然消亡（有界泄漏，见模块 docstring）
-        except Exception:  # noqa: BLE001, S110 — best-effort 清理：静默是设计
+            async with asyncio.timeout_at(cleanup_deadline):
+                session_id = state.session_id
+                # (1) Session 结果未知 → 用同一 idempotency_key 重放对账。
+                #     禁止换新 key：那会创建第二个 Session。
+                if session_id is None and state.session_sent:
+                    session_id = await self._reconcile_session(client, session_key)
+                    state.session_id = session_id
+                # (2) 已知 Run：显式有界取消
+                if state.run_id is not None:
+                    await self._best_effort_delete(
+                        client, f"/agent/runs/{state.run_id}"
+                    )
+                # (3) 删除 Session：级联回收一切可能已提交的 Run 与事件
+                if session_id is not None:
+                    await self._best_effort_delete(client, f"/sessions/{session_id}")
+        except (TimeoutError, asyncio.CancelledError):
+            pass  # 清理到点被真取消：有界放弃（TTL 兜底），设计如此
+        except Exception:  # noqa: BLE001, S110 — best-effort：静默是设计
             pass  # 非 2xx / 网络错误：不影响已确定的返回
+
+    async def _reconcile_session(self, client: Any, session_key: str) -> str | None:
+        """结果未知时按同一 idempotency_key 重放 Session 创建。
+
+        服务端幂等契约保证：已提交 → 返回原 Session（不建第二个）；
+        未提交 → 这次创建后随即被删除。返回拿到的 session_id 或 None。
+        """
+        try:
+            resp = await client.post(
+                f"{self._cfg.base_url}/sessions",
+                json={
+                    "channel": "text",
+                    "locale": "zh-CN",
+                    "idempotency_key": session_key,
+                },
+                headers=self._headers(),
+                timeout=self._httpx_timeout(_CLEANUP_GRACE_S),
+            )
+        except Exception:  # noqa: BLE001 — 对账失败：TTL 兜底
+            return None
+        if resp.status_code != 201:
+            return None
+        try:
+            session_id = resp.json().get("session_id")
+        except ValueError:
+            return None
+        return session_id if isinstance(session_id, str) and session_id else None
+
+    async def _best_effort_delete(self, client: Any, path: str) -> None:
+        try:
+            await client.delete(
+                f"{self._cfg.base_url}{path}",
+                headers=self._headers(),
+                timeout=self._httpx_timeout(_CLEANUP_GRACE_S),
+            )
+        except Exception:  # noqa: BLE001, S110 — best-effort：静默是设计
+            pass  # 非 2xx / 网络错误 / 到点取消：不影响已确定的返回
 
     # ---------- SSE 收集与交付门槛 ----------
 
-    def _collect(self, run_id: str, deadline: float) -> str:
-        remaining = self._remaining_or_raise(deadline)
-        resp = _bounded(
-            lambda: self._http.get(
-                f"{self._cfg.base_url}/agent/runs/{run_id}/events",
-                headers={**self._headers(), "Accept": "text/event-stream"},
-                stream=True,
-                timeout=(_CONNECT_TIMEOUT_S, min(_READ_TIMEOUT_S, remaining)),
-            ),
-            deadline,
-            "events connect",
-        )
-        if resp.status_code != 200:
-            raise VoiceAgentBackendError(f"events http {resp.status_code}")
-
-        # 看门狗：deadline 一到就主动 close 连接，主动打断阻塞中的
-        # iter_content —— 不能指望"等下一个 chunk 再检查"
-        watchdog = threading.Timer(max(0.05, deadline - time.monotonic()), resp.close)
-        watchdog.daemon = True
-        watchdog.start()
-
+    async def _collect(self, client: Any, run_id: str, deadline: float) -> str:
         state = _CollectState()
         try:
-            for chunk in resp.iter_content(chunk_size=1024):
-                if time.monotonic() > deadline:
-                    raise VoiceAgentBackendError("absolute deadline exceeded")
-                for frame in state.parser.feed(chunk):
-                    state.apply(frame)
+            async with client.stream(
+                "GET",
+                f"{self._cfg.base_url}/agent/runs/{run_id}/events",
+                headers={**self._headers(), "Accept": "text/event-stream"},
+                timeout=self._remaining_timeout(deadline),
+            ) as resp:
+                if resp.status_code != 200:
+                    raise VoiceAgentBackendError(f"events http {resp.status_code}")
+                async for chunk in resp.aiter_bytes():
+                    for frame in state.parser.feed(chunk):
+                        state.apply(frame)
+                        if state.finished():
+                            break
                     if state.finished():
                         break
-                if state.finished():
-                    break
-            else:
-                # 流正常结束（无 break）：先 EOF flush，再判定是否缺失终态
-                for frame in state.parser.flush():
-                    state.apply(frame)
-                    if state.finished():
-                        break
+                else:
+                    # 流正常结束（无 break）：先 EOF flush，再判定是否缺失终态
+                    for frame in state.parser.flush():
+                        state.apply(frame)
+                        if state.finished():
+                            break
         except VoiceAgentBackendError:
             raise
+        except (TimeoutError, asyncio.CancelledError):
+            # 取消域到点（流读取被真实取消）：按超时失败关闭
+            raise VoiceAgentBackendError("absolute deadline exceeded") from None
         except Exception as exc:
-            # 看门狗 close 或网络层中断：越过 deadline 记为超时，否则记为流故障
-            if time.monotonic() >= deadline:
-                raise VoiceAgentBackendError("absolute deadline exceeded") from exc
             raise VoiceAgentBackendError("stream read failed") from exc
-        finally:
-            watchdog.cancel()
-            resp.close()
 
         if state.failed:
             raise VoiceAgentBackendError("stream failed (stream.error/malformed)")
@@ -515,9 +605,14 @@ def _citations_valid(citations: Any) -> bool:
             return False
         if not isinstance(c.get("source_id"), str) or not c["source_id"]:
             return False
-        if not isinstance(c.get("knowledge_version"), str) or not c["knowledge_version"]:
+        if (
+            not isinstance(c.get("knowledge_version"), str)
+            or not c["knowledge_version"]
+        ):
             return False
-        if not isinstance(c.get("content_hash"), str) or not _HASH_RE.match(c["content_hash"]):
+        if not isinstance(c.get("content_hash"), str) or not _HASH_RE.match(
+            c["content_hash"]
+        ):
             return False
     return True
 

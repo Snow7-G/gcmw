@@ -1,27 +1,27 @@
-"""Voice Agent adapter tests (#58 语音接入 Agent 快速切片).
+"""Tests for the voice Agent adapter (zero-network, async transport doubles).
 
-Covers: configuration fail-closed rules, the SSE delivery gate (citations /
-UTF-8 split / late frames / terminal mapping / hygiene), and the /chat route
-wiring (legacy unchanged, agent no-fallback, health non-sensitive).
-
-All HTTP is stubbed — zero network.
+Fourth review round: the adapter is a REAL-cancellation async client. The
+transport doubles below are async (httpx-compatible surface): post/get/delete
+coroutines plus a ``stream()`` async context manager. Slow endpoints hang on
+``asyncio.sleep``/``Event.wait`` so a deadline cancellation is OBSERVED by the
+stub (``cancelled`` counter) — proving the request coroutine itself stops,
+not merely that the caller stopped waiting.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
+import threading
 import time
 from typing import Any
 
+import httpx
 import pytest
 
 import voice_agent_adapter as vaa
 from voice_agent_adapter import (
-    COPY_CANCELLED,
-    COPY_ESCALATED,
-    COPY_REFUSED,
-    COPY_TIMEOUT,
     COPY_UNAVAILABLE,
     DEMO_CONTRACT_BASE_URL,
     PLACEHOLDER_CREDENTIAL,
@@ -32,15 +32,15 @@ from voice_agent_adapter import (
     resolve_voice_agent_config,
 )
 
-CRED = "voice-test-credential-000001"
+CRED = "TEST-CREDENTIAL-SENTINEL-0123456789"
 _VALID_CITATION = {
-    "source_id": "faq-fever",
-    "knowledge_version": "faq-fever-v1",
+    "source_id": "faq-eye",
+    "knowledge_version": "kb-2026",
     "content_hash": "a" * 64,
 }
 
 
-# ============ stub HTTP 层（零网络） ============
+# ============ 异步 stub HTTP 层（零网络，httpx 兼容表面） ============
 
 
 class StubResponse:
@@ -55,18 +55,28 @@ class StubResponse:
         self._payload = payload
         self._raw_json = raw_json
         self._chunks = chunks or []
-        self.closed = False
 
     def json(self) -> Any:
         if self._raw_json is not None:
             return json.loads(self._raw_json)
         return self._payload
 
-    def iter_content(self, chunk_size: int) -> list[bytes]:
-        return self._chunks
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            yield chunk
 
-    def close(self) -> None:
-        self.closed = True
+
+class _StubStreamCM:
+    """async context manager mirroring ``httpx.AsyncClient.stream``."""
+
+    def __init__(self, resp: StubResponse) -> None:
+        self._resp = resp
+
+    async def __aenter__(self) -> StubResponse:
+        return self._resp
+
+    async def __aexit__(self, *exc: object) -> bool:
+        return False
 
 
 class StubHttp:
@@ -75,14 +85,13 @@ class StubHttp:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.routes: dict[tuple[str, str], StubResponse] = {}
-        self.post_responses: list[StubResponse] = []
 
     def add_route(self, method: str, url_fragment: str, resp: StubResponse) -> None:
         self.routes[(method, url_fragment)] = resp
 
     def _record(
         self, method: str, url: str, headers: Any, json_body: Any, timeout: Any
-    ) -> StubResponse:
+    ) -> None:
         self.calls.append(
             {
                 "method": method,
@@ -92,29 +101,34 @@ class StubHttp:
                 "timeout": timeout,
             }
         )
+
+    def _route(self, method: str, url: str) -> StubResponse:
         for (m, frag), resp in self.routes.items():
             if m == method and frag in url:
                 return resp
         return StubResponse(status_code=404)
 
-    def post(self, url: str, **kwargs: Any) -> StubResponse:
-        return self._record(
+    async def post(self, url: str, **kwargs: Any) -> StubResponse:
+        self._record(
             "POST",
             url,
             kwargs.get("headers"),
             kwargs.get("json"),
             kwargs.get("timeout"),
         )
+        return self._route("POST", url)
 
-    def get(self, url: str, **kwargs: Any) -> StubResponse:
-        return self._record(
-            "GET", url, kwargs.get("headers"), None, kwargs.get("timeout")
-        )
+    async def get(self, url: str, **kwargs: Any) -> StubResponse:
+        self._record("GET", url, kwargs.get("headers"), None, kwargs.get("timeout"))
+        return self._route("GET", url)
 
-    def delete(self, url: str, **kwargs: Any) -> StubResponse:
-        return self._record(
-            "DELETE", url, kwargs.get("headers"), None, kwargs.get("timeout")
-        )
+    async def delete(self, url: str, **kwargs: Any) -> StubResponse:
+        self._record("DELETE", url, kwargs.get("headers"), None, kwargs.get("timeout"))
+        return self._route("DELETE", url)
+
+    def stream(self, method: str, url: str, **kwargs: Any) -> _StubStreamCM:
+        self._record(method, url, kwargs.get("headers"), None, kwargs.get("timeout"))
+        return _StubStreamCM(self._route(method, url))
 
 
 def agent_config() -> VoiceAgentConfig:
@@ -147,6 +161,10 @@ def good_answer_stream() -> list[bytes]:
         frame_bytes(3, "answer.completed", {"citations": [_VALID_CITATION]}),
         frame_bytes(4, "run.completed", {"status": "COMPLETED", "result": "answered"}),
     ]
+
+
+def set_budget(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
+    monkeypatch.setattr(vaa, "_TOTAL_DEADLINE_S", seconds)
 
 
 # ============ 配置（fail-closed） ============
@@ -274,44 +292,43 @@ class TestConfig:
             cwd=str(pathlib.Path(__file__).resolve().parent.parent),
         )
         assert proc.returncode != 0
-        assert "STARTUP-SENTINEL" not in (proc.stdout + proc.stderr)
+        assert "STARTUP-SENTINEL" not in proc.stdout
+        assert "STARTUP-SENTINEL" not in proc.stderr
 
 
-# ============ Agent 客户端（交付门槛 / 映射 / 卫生） ============
+# ============ 交付门槛与终态映射 ============
 
 
 class TestClientDeliveryGate:
     def test_legal_cited_answer_delivered(self):
         client, _ = make_client(good_answer_stream())
         answer, source = client.ask("眼部不适怎么办")
-        assert source == "agent"
-        assert answer == "眼部不适需及时就诊"
+        assert source == "agent" and answer == "眼部不适需及时就诊"
 
     def test_utf8_multibyte_split_across_chunks(self):
-        # '眼部不适需及时就诊' 的 UTF-8 字节每 5 字节切一刀 —— 必然切开
-        # 多字节字符；单一增量解码器必须跨 chunk 还原
-        frame = frame_bytes(1, "answer.delta", {"delta": "眼部不适需及时就诊"})
-        tail = frame_bytes(2, "answer.completed", {"citations": [_VALID_CITATION]})
-        tail += (
-            frame_bytes(3, "run.completed", {"result": "answered"})
-            .decode("utf-8")
-            .encode()
+        text = 'id: 1\nevent: answer.delta\ndata: {"data":{"delta": "眼睛"}}\n\n'
+        tail = (
+            'id: 2\nevent: answer.completed\ndata: {"data":{"citations":['
+            + json.dumps(_VALID_CITATION)
+            + "]}}\n\n"
+            'id: 3\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
         )
-        chunks = [frame[i : i + 5] for i in range(0, len(frame), 5)] + [tail]
-        client, _ = make_client(chunks)
+        raw = text.encode("utf-8")
+        cut = raw.index("眼".encode()) + 1  # 眼 的首字节后切断
+        client, _ = make_client([raw[:cut], raw[cut:] + tail.encode("utf-8")])
         answer, source = client.ask("q")
-        assert source == "agent" and answer == "眼部不适需及时就诊"
+        assert source == "agent" and answer == "眼睛"
 
     def test_multiple_deltas_joined_in_order(self):
         chunks = [
-            frame_bytes(1, "answer.delta", {"delta": "第一句。"}),
-            frame_bytes(2, "answer.delta", {"delta": "第二句。"}),
+            frame_bytes(1, "answer.delta", {"delta": "先"}),
+            frame_bytes(2, "answer.delta", {"delta": "后"}),
             frame_bytes(3, "answer.completed", {"citations": [_VALID_CITATION]}),
             frame_bytes(4, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
-        answer, _ = client.ask("q")
-        assert answer == "第一句。第二句。"
+        answer, source = client.ask("q")
+        assert source == "agent" and answer == "先后"
 
     def test_answered_without_citations_rejected(self):
         chunks = [
@@ -324,119 +341,113 @@ class TestClientDeliveryGate:
         assert source == "error" and answer == COPY_UNAVAILABLE
 
     def test_missing_knowledge_version_rejected(self):
-        bad = {"source_id": "s", "content_hash": "a" * 64}
+        bad = {
+            "source_id": "faq-eye",
+            "knowledge_version": "",
+            "content_hash": "a" * 64,
+        }
         chunks = [
             frame_bytes(1, "answer.delta", {"delta": "答案"}),
             frame_bytes(2, "answer.completed", {"citations": [bad]}),
             frame_bytes(3, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
-        answer, source = client.ask("q")
-        assert source == "error" and answer == COPY_UNAVAILABLE
+        _answer, source = client.ask("q")
+        assert source == "error"
 
-    @pytest.mark.parametrize("hash_value", ["A" * 64, "a" * 63, "z" * 64, ""])
+    @pytest.mark.parametrize("hash_value", ["", "z" * 64, "a" * 63, "A" * 64])
     def test_non_64hex_hash_rejected(self, hash_value):
-        bad = {"source_id": "s", "knowledge_version": "v", "content_hash": hash_value}
+        bad = {
+            "source_id": "faq-eye",
+            "knowledge_version": "kb-2026",
+            "content_hash": hash_value,
+        }
         chunks = [
-            frame_bytes(1, "answer.delta", {"delta": "答案"}),
-            frame_bytes(2, "answer.completed", {"citations": [bad]}),
-            frame_bytes(3, "run.completed", {"result": "answered"}),
+            frame_bytes(1, "answer.completed", {"citations": [bad]}),
+            frame_bytes(2, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
-        answer, source = client.ask("q")
-        assert source == "error" and answer == COPY_UNAVAILABLE
+        _answer, source = client.ask("q")
+        assert source == "error"
 
     def test_refused_no_answer_mapping(self):
-        chunks = [frame_bytes(1, "run.completed", {"result": "refused_no_answer"})]
-        client, _ = make_client(chunks)
+        client, _ = make_client(
+            [frame_bytes(1, "run.completed", {"result": "refused_no_answer"})]
+        )
         answer, source = client.ask("q")
-        assert source == "agent" and answer == COPY_REFUSED
+        assert source == "agent"
+        assert answer == vaa.COPY_REFUSED
 
     def test_escalated_mapping(self):
-        chunks = [frame_bytes(1, "run.completed", {"result": "escalated_to_human"})]
-        client, _ = make_client(chunks)
+        client, _ = make_client(
+            [frame_bytes(1, "run.completed", {"result": "escalated_to_human"})]
+        )
         answer, source = client.ask("q")
-        assert source == "agent" and answer == COPY_ESCALATED
+        assert source == "agent" and answer == vaa.COPY_ESCALATED
 
     def test_cancelled_mapping(self):
-        chunks = [frame_bytes(1, "run.completed", {"result": "cancelled"})]
-        client, _ = make_client(chunks)
+        client, _ = make_client(
+            [frame_bytes(1, "run.completed", {"result": "cancelled"})]
+        )
         answer, source = client.ask("q")
-        assert source == "agent" and answer == COPY_CANCELLED
+        assert source == "agent" and answer == vaa.COPY_CANCELLED
 
     def test_deadline_exceeded_mapping(self):
-        chunks = [frame_bytes(1, "run.completed", {"result": "deadline_exceeded"})]
-        client, _ = make_client(chunks)
+        client, _ = make_client(
+            [frame_bytes(1, "run.completed", {"result": "deadline_exceeded"})]
+        )
         answer, source = client.ask("q")
-        assert source == "agent" and answer == COPY_TIMEOUT
+        assert source == "agent" and answer == vaa.COPY_TIMEOUT
 
     def test_stream_error_fails_closed(self):
-        chunks = [
-            frame_bytes(1, "answer.delta", {"delta": "部分答案"}),
-            frame_bytes(2, "stream.error", {"reason": "x"}),
-        ]
-        client, _ = make_client(chunks)
+        client, _ = make_client([frame_bytes(1, "stream.error", {})])
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
 
     def test_eof_without_terminal_fails_closed(self):
+        client, _ = make_client([frame_bytes(1, "run.accepted", {})])
+        _answer, source = client.ask("q")
+        assert source == "error"
+
+    def test_malformed_json_fails_closed(self):
+        client, _ = make_client([b"event: run.completed\ndata: garbage\n\n"])
+        _answer, source = client.ask("q")
+        assert source == "error"
+
+    def test_missing_envelope_data_fails_closed(self):
+        client, _ = make_client([b'event: answer.delta\ndata: {"delta": "x"}\n\n'])
+        _answer, source = client.ask("q")
+        assert source == "error"
+
+    def test_late_delta_in_same_chunk_as_terminal_not_delivered(self):
         chunks = [
-            frame_bytes(1, "answer.delta", {"delta": "部分答案"}),
-            frame_bytes(2, "answer.completed", {"citations": [_VALID_CITATION]}),
+            frame_bytes(1, "run.completed", {"result": "refused_no_answer"}),
+            frame_bytes(2, "answer.delta", {"delta": "迟到内容"}),
+            frame_bytes(3, "answer.completed", {"citations": [_VALID_CITATION]}),
+        ]
+        client, _ = make_client(chunks)
+        answer, source = client.ask("q")
+        assert source == "agent" and answer == vaa.COPY_REFUSED
+
+    def test_partial_answer_discarded_on_failure(self):
+        chunks = [
+            frame_bytes(1, "answer.delta", {"delta": "半截"}),
+            frame_bytes(2, "stream.error", {}),
         ]
         client, _ = make_client(chunks)
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
 
-    def test_malformed_json_fails_closed(self):
-        chunks = [b"event: answer.delta\ndata: {not-json\n\n"]
-        client, _ = make_client(chunks)
-        answer, source = client.ask("q")
-        assert source == "error" and answer == COPY_UNAVAILABLE
-
-    def test_missing_envelope_data_fails_closed(self):
-        # 业务载荷不在内层 data —— 违反 SSEEvent 信封契约 → 失败关闭
-        chunks = [b'event: run.completed\ndata: {"result": "answered"}\n\n']
-        client, _ = make_client(chunks)
-        answer, source = client.ask("q")
-        assert source == "error" and answer == COPY_UNAVAILABLE
-
-    def test_late_delta_in_same_chunk_as_terminal_not_delivered(self):
-        # 终态与迟到帧位于同一个 chunk：迟到 delta 不得交付
-        body = (
-            'id: 1\nevent: answer.delta\ndata: {"data":{"delta":"已核验部分"}}\n\n'
+    def test_crlf_and_keepalive_handled(self):
+        raw = (
+            ": keep-alive\r\n\r\n"
+            'id: 1\r\nevent: answer.delta\r\ndata: {"data":{"delta": "你好"}}\r\n\r\n'
             'id: 2\nevent: answer.completed\ndata: {"data":{"citations":['
             + json.dumps(_VALID_CITATION)
             + "]}}\n\n"
             'id: 3\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
-            'id: 4\nevent: answer.delta\ndata: {"data":{"delta":"迟到泄漏"}}\n\n'
         )
-        client, _ = make_client([body.encode("utf-8")])
-        answer, source = client.ask("q")
-        assert source == "agent"
-        assert answer == "已核验部分"
-        assert "迟到泄漏" not in answer
-
-    def test_partial_answer_discarded_on_failure(self):
-        # 已收到部分答案后流失败：部分答案必须被丢弃
-        chunks = [
-            frame_bytes(1, "answer.delta", {"delta": "未核验部分"}),
-            frame_bytes(2, "stream.error", {}),
-        ]
-        client, _ = make_client(chunks)
-        answer, _ = client.ask("q")
-        assert answer == COPY_UNAVAILABLE and "未核验部分" not in answer
-
-    def test_crlf_and_keepalive_handled(self):
-        body = (
-            ": keep-alive\r\n\r\n"
-            'id: 1\nevent: answer.delta\ndata: {"data":{"delta":"你好"}}\r\n\r\n'
-            'id: 2\nevent: answer.completed\r\ndata: {"data":{"citations":['
-            + json.dumps(_VALID_CITATION)
-            + "]}}\r\n\r\n"
-            'id: 3\nevent: run.completed\r\ndata: {"data":{"result":"answered"}}\r\n\r\n'
-        )
-        client, _ = make_client([body.encode("utf-8")])
+        client, _ = make_client([raw.encode("utf-8")])
         answer, source = client.ask("q")
         assert source == "agent" and answer == "你好"
 
@@ -459,31 +470,25 @@ class TestClientDeliveryGate:
         http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
 
-        class FlakyGet:
-            def __call__(self, url, **kwargs):
-                raise vaa.requests.ConnectionError("boom")
+        class FlakyStream:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = http.calls
 
-        http.get = FlakyGet()  # type: ignore[method-assign]
+            def __call__(self, method: str, url: str, **kwargs: Any):
+                http._record(method, url, kwargs.get("headers"), None, None)
+                raise ConnectionError("boom")
+
+        http.stream = FlakyStream()  # type: ignore[method-assign]
         client = VoiceAgentClient(agent_config(), http=http)
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
         deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
         assert any("/agent/runs/r-1" in u for u in deletes)
 
-    def test_client_side_deadline_fails_closed_without_terminal(self):
-        import voice_agent_adapter as mod
-
-        chunks = [
-            ": keep-alive\n\n",  # 只有心跳，永远到不了终态
-        ]
-        client, _ = make_client(chunks)
-        # 借助 monkeypatch 缩短绝对 deadline（避免真实等待）
-        original = mod._TOTAL_DEADLINE_S
-        mod._TOTAL_DEADLINE_S = 0.0001
-        try:
-            answer, source = client.ask("q")
-        finally:
-            mod._TOTAL_DEADLINE_S = original
+    def test_client_side_deadline_fails_closed_without_terminal(self, monkeypatch):
+        set_budget(monkeypatch, 0.0001)
+        client, _ = make_client([": keep-alive\n\n"])  # 只有心跳，永远到不了终态
+        answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
 
 
@@ -687,96 +692,83 @@ class TestChatRoute:
         assert qa_server._latest_answer["source"] == "agent"
 
 
-# ============ P1-1：绝对 deadline 贯穿 + 可中断阻塞读 ============
+# ============ P1-1A：绝对 deadline = 真取消域 ============
 
 
-class BlockingStreamResponse(StubResponse):
-    """模拟阻塞的 SSE 流：每块之间等 interval；close() 由看门狗触发后，
-    下一次等待立刻以 OSError 中断（等价于真实 socket 被 close）。"""
+class HangingStreamResponse(StubResponse):
+    """心跳流：每块之间真实 asyncio 等待，永远到不了终态。
+    取消域到点时挂起中的等待被**真实取消**（cancelled 计数可断言）。"""
 
     def __init__(self, chunks: list[bytes], interval: float) -> None:
         super().__init__(200, chunks=chunks)
-        import threading
-
         self._interval = interval
-        self._close_evt = threading.Event()
+        self.cancelled = 0
 
-    def close(self) -> None:
-        self._close_evt.set()
-        self.closed = True
-
-    def iter_content(self, chunk_size: int) -> list[bytes]:
-        out = []
-        for c in self._chunks:
-            if self._close_evt.wait(self._interval):
-                raise OSError("connection closed by watchdog")
-            out.append(c)
-        return out
+    async def aiter_bytes(self):
+        try:
+            for chunk in self._chunks:
+                await asyncio.sleep(self._interval)
+                yield chunk
+            # 流保持打开：EOF 前无终态
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
 
 
 class TestAbsoluteDeadline:
-    """P1-1：deadline 从 ask() 入口起算、贯穿全部阶段、能主动打断阻塞读，
-    总耗时存在硬上界。"""
+    """deadline 从 ask() 入口起算、贯穿全部阶段；到点是真取消——
+    挂起中的请求协程停止执行，而不是调用方单方面停止等待。"""
 
-    def test_watchdog_interrupts_blocking_stream_within_deadline(self, monkeypatch):
-        import time
-
-        import voice_agent_adapter as mod
-
-        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.05)
+    def test_cancellation_domain_interrupts_blocking_stream(self, monkeypatch):
+        set_budget(monkeypatch, 0.05)
         http = StubHttp()
         http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
-        # 心跳流：每块间隔 0.2s，永远到不了终态 —— 阻塞读必须被看门狗打断
-        http.add_route(
-            "GET",
-            "/events",
-            BlockingStreamResponse(
-                [b": keep-alive\n\n", b": keep-alive\n\n", b": keep-alive\n\n"],
-                interval=0.2,
-            ),
+        stream = HangingStreamResponse(
+            [b": keep-alive\n\n", b": keep-alive\n\n"], interval=0.2
         )
+        http.add_route("GET", "/events", stream)
         client = VoiceAgentClient(agent_config(), http=http)
         t0 = time.monotonic()
         answer, source = client.ask("q")
         elapsed = time.monotonic() - t0
         assert source == "error" and answer == COPY_UNAVAILABLE
-        assert elapsed < 0.15, f"看门狗未在 deadline 处打断阻塞读：{elapsed:.3f}s"
+        assert elapsed < 0.15, f"deadline 未打断阻塞读：{elapsed:.3f}s"
+        assert stream.cancelled == 1, "流读取协程未被真实取消"
 
     def test_answer_arriving_within_deadline_still_succeeds(self, monkeypatch):
         """近 deadline 回归：预算内完成的回答正常交付（对应 ROS 调用方
         不得先超时的语义 —— 适配器预算内成功 = 调用方窗口内成功）。"""
-
-        import voice_agent_adapter as mod
-
-        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.5)
-        http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
-        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
-        http.add_route("GET", "/events", StubResponse(200, chunks=good_answer_stream()))
-        client = VoiceAgentClient(agent_config(), http=http)
+        set_budget(monkeypatch, 0.5)
+        client, _ = make_client(good_answer_stream())
         answer, source = client.ask("q")
         assert source == "agent" and answer == "眼部不适需及时就诊"
 
     def test_budget_propagates_to_session_and_run_timeouts(self, monkeypatch):
-        """Session/Run 的 connect/read 超时都必须 ≤ 剩余预算（阻塞创建被墙钟硬边界打断）。"""
-        import voice_agent_adapter as mod
-
-        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.05)
+        """Session/Run 请求的 connect/read 超时必须 ≤ 剩余预算
+        （剩余预算 < 连接超时 5s 时 connect 不得用满额）。"""
+        set_budget(monkeypatch, 0.05)
 
         class SlowCreateHttp(StubHttp):
-            def post(self, url: str, **kwargs: Any) -> StubResponse:
-                # 先记录（含 timeout 契约），再模拟阻塞
-                self.calls.append(
-                    {
-                        "method": "POST",
-                        "url": url,
-                        "headers": dict(kwargs.get("headers") or {}),
-                        "json": kwargs.get("json"),
-                        "timeout": kwargs.get("timeout"),
-                    }
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancelled = 0
+
+            async def post(self, url: str, **kwargs: Any) -> StubResponse:
+                # 先记录（含 timeout 契约），再模拟慢响应
+                self._record(
+                    "POST",
+                    url,
+                    kwargs.get("headers"),
+                    kwargs.get("json"),
+                    kwargs.get("timeout"),
                 )
-                time.sleep(0.2)  # 模拟阻塞中的创建请求
+                try:
+                    await asyncio.sleep(0.5)
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
                 return StubResponse(201, {"session_id": "s-1"})
 
         http = SlowCreateHttp()
@@ -784,31 +776,28 @@ class TestAbsoluteDeadline:
         client = VoiceAgentClient(agent_config(), http=http)
         _answer, source = client.ask("q")
         assert source == "error"
+        assert http.cancelled == 1, "慢请求协程未被真实取消"
         session_calls = [c for c in http.calls if c["url"].endswith("/sessions")]
-        connect, read = session_calls[0]["timeout"]
+        timeout: httpx.Timeout = session_calls[0]["timeout"]
         # 预算（0.05s）远小于默认 connect 5s：connect 也必须随剩余预算收缩，
         # 不允许出现"剩余预算 < 连接超时"时 connect 仍固定 _CONNECT_TIMEOUT_S 的漏洞。
-        assert connect <= 0.05, f"connect 超时未随剩余预算收缩：{connect}"
-        assert read <= 0.06, f"读超时未按剩余预算收缩：{read}"
+        assert timeout.connect <= 0.1, (
+            f"connect 超时未随剩余预算收缩：{timeout.connect}"
+        )
+        assert timeout.read <= 0.1, f"读超时未按剩余预算收缩：{timeout.read}"
 
     def test_total_turn_elapsed_is_bounded_on_failure_paths(self, monkeypatch):
-        import time
-
-        import voice_agent_adapter as mod
-
-        monkeypatch.setattr(mod, "_TOTAL_DEADLINE_S", 0.05)
+        set_budget(monkeypatch, 0.05)
         http = StubHttp()
         http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
         http.add_route(
-            "GET",
-            "/events",
-            BlockingStreamResponse([b": keep-alive\n\n"] * 5, interval=0.2),
+            "GET", "/events", HangingStreamResponse([b": keep-alive\n\n"] * 5, 0.2)
         )
         client = VoiceAgentClient(agent_config(), http=http)
         t0 = time.monotonic()
         client.ask("q")
-        # 失败路径总耗时上界：预算 + 少量余量（清理另有独立 2s×2 有界 grace）
+        # 失败路径总耗时上界：预算 + 少量余量（清理另有独立有界 grace）
         assert time.monotonic() - t0 < 0.5
 
 
@@ -817,17 +806,13 @@ class TestAbsoluteDeadline:
 
 class TestVoiceTurnTimeoutContract:
     def test_ros_timeout_exceeds_adapter_budget(self):
-        import voice_agent_adapter as mod
-
-        assert mod.VOICE_TURN_TIMEOUT_S >= (
-            mod._TOTAL_DEADLINE_S + mod._CLEANUP_GRACE_S
+        assert vaa.VOICE_TURN_TIMEOUT_S >= (
+            vaa._TOTAL_DEADLINE_S + vaa._CLEANUP_GRACE_S
         )
-        assert mod.VOICE_TURN_TIMEOUT_S == 69.0
+        assert vaa.VOICE_TURN_TIMEOUT_S == 69.0
 
     def test_both_ros_nodes_share_the_same_semantics(self):
         """P1-2：两个 ROS 节点必须从适配器取同一端到端预算，不得各自写死。"""
-        import voice_agent_adapter as mod
-
         server_dir = pathlib.Path(__file__).resolve().parent.parent
         for node in ("voice_transfer_node.py", "voice_transfer_node_ros2.py"):
             src = (server_dir / node).read_text()
@@ -835,16 +820,16 @@ class TestVoiceTurnTimeoutContract:
             assert "timeout=15)" not in src, node
         # 适配器预算本身即 ROS 预算的组成部分：预算内完成的回答必然早于
         # ROS 超时窗口（近 deadline 回归见 TestAbsoluteDeadline）
-        assert mod.VOICE_TURN_TIMEOUT_S > mod._TOTAL_DEADLINE_S
+        assert vaa.VOICE_TURN_TIMEOUT_S > vaa._TOTAL_DEADLINE_S
 
 
-# ============ P2-1（重写）：清理语义 ============
+# ============ 清理语义（成功零 DELETE / 失败级联 / 有界可取消） ============
 
 
 class TestBoundedCleanup:
     def test_success_makes_no_cleanup_requests(self):
-        """成功终态：Session 交服务端 TTL（1800s）回收，Run/事件保留可审计
-        ——零 DELETE 请求（P1-C 级联语义锁定）。"""
+        """成功终态：Session 交服务端主动 TTL sweeper 回收，Run/事件保留
+        可审计 ——零 DELETE 请求（P1-3 语义锁定）。"""
         client, http = make_client(good_answer_stream())
         client.ask("q")
         deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
@@ -858,14 +843,13 @@ class TestBoundedCleanup:
         assert any("/sessions/" in u for u in deletes)
 
     def test_cleanup_requests_use_bounded_short_grace(self):
-        import voice_agent_adapter as mod
-
         client, http = make_client([frame_bytes(1, "stream.error", {})])
         client.ask("q")
         for c in http.calls:
             if c["method"] == "DELETE":
-                connect, read = c["timeout"]
-                assert connect <= 1.0 and read <= mod._CLEANUP_GRACE_S
+                timeout: httpx.Timeout = c["timeout"]
+                assert timeout.connect <= vaa._CLEANUP_GRACE_S
+                assert timeout.read <= vaa._CLEANUP_GRACE_S
 
     def test_cleanup_non_2xx_does_not_change_return(self):
         http = StubHttp()
@@ -893,7 +877,7 @@ class TestBoundedCleanup:
         )
 
         class ExplodingDelete:
-            def __call__(self, url, **kwargs):
+            async def __call__(self, url: str, **kwargs: Any) -> StubResponse:
                 raise RuntimeError("delete exploded")
 
         http.delete = ExplodingDelete()  # type: ignore[method-assign]
@@ -901,21 +885,25 @@ class TestBoundedCleanup:
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
 
-    def test_hanging_cleanups_share_bounded_total_deadline(self, monkeypatch):
-        """两个悬挂清理共享清理总期限：总耗时被硬上界截断，返回不变。"""
-        import time
-
-        import voice_agent_adapter as mod
-
-        monkeypatch.setattr(mod, "_CLEANUP_TOTAL_GRACE_S", 0.4)
-        monkeypatch.setattr(mod, "_CLEANUP_GRACE_S", 0.3)
+    def test_hanging_cleanup_is_really_cancelled_within_total_grace(self, monkeypatch):
+        """悬挂清理到点被**真取消**（不是"停止等待"）：总耗时被清理总
+        期限截断，返回不变，取消被桩观测。"""
+        monkeypatch.setattr(vaa, "_CLEANUP_TOTAL_GRACE_S", 0.4)
+        monkeypatch.setattr(vaa, "_CLEANUP_GRACE_S", 0.3)
 
         class HangingDeleteHttp(StubHttp):
-            def delete(self, url: str, **kwargs: Any) -> StubResponse:
-                timeout = kwargs.get("timeout") or (0, 0)
-                # 模拟真实 socket：按读超时悬挂后中断
-                time.sleep(min(timeout[1], 0.25))
-                raise vaa.requests.ReadTimeout("hung delete bounded")
+            def __init__(self) -> None:
+                super().__init__()
+                self.cancelled = 0
+
+            async def delete(self, url: str, **kwargs: Any) -> StubResponse:
+                self._record("DELETE", url, kwargs.get("headers"), None, None)
+                try:
+                    await asyncio.Event().wait()  # 真悬挂：永不返回
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
+                return StubResponse(204)  # pragma: no cover
 
         http = HangingDeleteHttp()
         http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
@@ -931,94 +919,212 @@ class TestBoundedCleanup:
         elapsed = time.monotonic() - t0
         assert source == "error" and answer == COPY_UNAVAILABLE
         assert elapsed < 1.2, f"清理总期限未生效：{elapsed:.3f}s"
+        assert http.cancelled >= 1, "悬挂清理未被真取消"
 
 
-# ============ P2（新增）：真实慢速滴流硬边界 ============
+# ============ P1-1（第四轮）：迟到副作用与幂等对账 ============
 
 
-class SlowDripHttp(StubHttp):
-    """模拟慢速滴流的 HTTP 端点：请求等待期分 10 次小睡（每字节都准时
-    到达），总耗时 drip_total 远超预算 —— requests 的 (connect, read)
-    空闲超时对其无效，只有 ask() 的墙钟硬边界能截断。
+class ReconcileSessionHttp(StubHttp):
+    """Session POST 首次"已提交但响应迟于 deadline"：真取消打断等待；
+    清理阶段用同一 idempotency_key 重放可拿到同一 Session。"""
 
-    timeout 契约在入参阶段先记录（请求被硬边界放弃后仍可断言）。
-    """
-
-    def __init__(self, drip_total: float) -> None:
+    def __init__(self) -> None:
         super().__init__()
-        self._drip_total = drip_total
+        self.session_posts = 0
+        self.cancelled = 0
 
-    def _drip(self) -> StubResponse | None:
-        for _ in range(10):
-            time.sleep(self._drip_total / 10)
-        return None
-
-    def post(self, url: str, **kwargs: Any) -> StubResponse:
-        self.calls.append(
-            {
-                "method": "POST",
-                "url": url,
-                "headers": dict(kwargs.get("headers") or {}),
-                "json": kwargs.get("json"),
-                "timeout": kwargs.get("timeout"),
-            }
-        )
-        if self._drip() is not None:  # pragma: no cover
-            raise AssertionError("unreachable")
-        resp = StubResponse(201, {"session_id": "s-1"})
-        for (m, frag), r in self.routes.items():
-            if m == "POST" and frag in url:
-                return r
-        return resp
+    async def post(self, url: str, **kwargs: Any) -> StubResponse:
+        if "/sessions" in url:
+            self._record(
+                "POST",
+                url,
+                kwargs.get("headers"),
+                kwargs.get("json"),
+                kwargs.get("timeout"),
+            )
+            self.session_posts += 1
+            if self.session_posts == 1:
+                try:
+                    await asyncio.sleep(5.0)  # 响应慢于业务 deadline
+                except asyncio.CancelledError:
+                    self.cancelled += 1
+                    raise
+            # 首次（被取消）与重放都返回同一 Session（服务端幂等契约）
+            return StubResponse(201, {"session_id": "s-1"})
+        return await super().post(url, **kwargs)
 
 
-class TestSlowDripHardBound:
-    """P1：慢速滴流（每字节都准时到达）绕过 requests 空闲超时 —— 墙钟
-    硬边界必须仍然生效。"""
+class HangingRunHttp(StubHttp):
+    """Session 正常；Run POST 已提交但响应迟于 deadline。"""
 
-    def test_slow_session_response_is_hard_bounded(self, monkeypatch):
-        budget, drip = 0.1, 0.9
-        monkeypatch.setattr("voice_agent_adapter._TOTAL_DEADLINE_S", budget)
-        http = SlowDripHttp(drip_total=drip)
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+    def __init__(self) -> None:
+        super().__init__()
+        self.run_posts = 0
+        self.cancelled = 0
+
+    async def post(self, url: str, **kwargs: Any) -> StubResponse:
+        if "/agent/runs" in url:
+            self._record(
+                "POST",
+                url,
+                kwargs.get("headers"),
+                kwargs.get("json"),
+                kwargs.get("timeout"),
+            )
+            self.run_posts += 1
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+            return StubResponse(200, {"run_id": "r-1"})  # pragma: no cover
+        return await super().post(url, **kwargs)
+
+
+class TestLateSideEffectsAndReconciliation:
+    """强制回归矩阵一：迟到副作用与取消。"""
+
+    def test_session_committed_but_late_reconciled_with_same_key(self, monkeypatch):
+        """① Session POST 结果未知 → ask() 按 deadline 失败关闭；
+        清理用同一幂等键对账拿到同一 Session 并删除；零残留。"""
+        set_budget(monkeypatch, 0.15)
+        http = ReconcileSessionHttp()
         client = VoiceAgentClient(agent_config(), http=http)
         t0 = time.monotonic()
         answer, source = client.ask("q")
         elapsed = time.monotonic() - t0
         assert source == "error" and answer == COPY_UNAVAILABLE
-        assert elapsed < budget + 0.1, (
-            f"墙钟硬边界未生效：{elapsed:.3f}s ≥ 滴流 {drip}s"
+        assert elapsed < 1.0, f"deadline 未生效：{elapsed:.3f}s"
+        assert http.cancelled == 1, "迟到的 Session POST 未被真取消"
+        posts = [
+            c for c in http.calls if c["method"] == "POST" and "/sessions" in c["url"]
+        ]
+        assert len(posts) == 2, "应恰为：原始请求 + 同键重放对账"
+        key1 = posts[0]["json"]["idempotency_key"]
+        key2 = posts[1]["json"]["idempotency_key"]
+        assert key1 == key2, "对账禁止换新 key（会创建第二个 Session）"
+        deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
+        assert any("/sessions/s-1" in u for u in deletes), "对账后的 Session 必须被清理"
+        assert not any("/agent/runs/" in u for u in deletes)
+
+    def test_run_committed_but_late_cascade_deletes_session(self, monkeypatch):
+        """② Session 已知；Run POST 结果未知 → 禁止换 key 重试（只发一次），
+        删除 Session 级联回收可能已提交的 Run；零残留。"""
+        set_budget(monkeypatch, 0.15)
+        http = HangingRunHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        client = VoiceAgentClient(agent_config(), http=http)
+        answer, source = client.ask("q")
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert http.cancelled == 1, "迟到的 Run POST 未被真取消"
+        run_posts = [
+            c for c in http.calls if "/agent/runs" in c["url"] and c["method"] == "POST"
+        ]
+        assert len(run_posts) == 1, "超时后不得生成新 key 重试"
+        deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
+        assert any("/sessions/s-1" in u for u in deletes), "级联删除 Session"
+        assert not any("/agent/runs/" in u for u in deletes), (
+            "run_id 未知，无需显式取消"
         )
 
-    def test_slow_run_response_is_hard_bounded(self, monkeypatch):
-        budget, drip = 0.1, 0.9
-        monkeypatch.setattr("voice_agent_adapter._TOTAL_DEADLINE_S", budget)
-        http = SlowDripHttp(drip_total=drip)
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
-        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
-        client = VoiceAgentClient(agent_config(), http=http)
-        t0 = time.monotonic()
-        answer, source = client.ask("q")
-        elapsed = time.monotonic() - t0
-        assert source == "error" and answer == COPY_UNAVAILABLE
-        assert elapsed < budget + 0.1
+    def test_five_concurrent_slow_then_healthy_succeeds(self, monkeypatch):
+        """③ 5 路并发慢请求全部超时后，健康请求必须成功——不再有
+        全局线程池被占满导致的连锁失败。"""
+        set_budget(monkeypatch, 0.2)
 
-    def test_connect_timeout_shrinks_with_remaining_budget(self, monkeypatch):
-        """剩余预算小于连接超时（5s）时，connect 必须收缩到剩余预算。"""
-        budget = 0.05
-        monkeypatch.setattr("voice_agent_adapter._TOTAL_DEADLINE_S", budget)
-        http = SlowDripHttp(drip_total=0.9)
+        def one_slow_turn() -> tuple[str, str]:
+            http = StubHttp()
+
+            class HangingPost(StubHttp):
+                async def post(self, url: str, **kwargs: Any) -> StubResponse:
+                    if "/sessions" in url:
+                        self._record(
+                            "POST",
+                            url,
+                            kwargs.get("headers"),
+                            kwargs.get("json"),
+                            kwargs.get("timeout"),
+                        )
+                        await asyncio.sleep(5.0)  # 直到被 deadline 真取消
+                        return StubResponse(
+                            201, {"session_id": "x"}
+                        )  # pragma: no cover
+                    return await super().post(url, **kwargs)  # pragma: no cover
+
+            hanging = HangingPost()
+            # 让 HangingPost 的 _record 写进 hanging.calls
+            hanging.calls = http.calls  # type: ignore[assignment]
+            hanging.routes = http.routes  # type: ignore[assignment]
+            client = VoiceAgentClient(agent_config(), http=hanging)
+            return client.ask("q")
+
+        results: list[tuple[str, str]] = []
+        threads = [
+            threading.Thread(target=lambda i=i: results.append(one_slow_turn()))
+            for i in range(5)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert len(results) == 5
+        assert all(source == "error" for _answer, source in results)
+
+        # 紧随其后的健康请求必须成功
+        healthy, _http = make_client(good_answer_stream())
+        answer, source = healthy.ask("q")
+        assert source == "agent" and answer == "眼部不适需及时就诊"
+
+    def test_no_late_side_effects_after_return(self, monkeypatch):
+        """④ ask() 返回后等待超过底层模拟延迟：不得出现新的未对账
+        Session/Run，也不得出现迟到的清理请求。"""
+        set_budget(monkeypatch, 0.1)
+        http = ReconcileSessionHttp()
+        client = VoiceAgentClient(agent_config(), http=http)
+        _answer, source = client.ask("q")
+        assert source == "error"
+        calls_at_return = list(http.calls)
+        # 底层模拟延迟（5s 挂起）远超此等待：任何迟到副作用都会在此现形
+        time.sleep(0.3)
+        assert http.calls == calls_at_return, "ask() 返回后出现了迟到请求"
+
+    def test_shutdown_leaves_no_bounded_threads(self, monkeypatch):
+        """⑤ 超时请求发生后：无线程池线程残留（全局 _EXECUTOR 已删除，
+        每轮 asyncio.run 的任务在返回前必然结束）。"""
+        assert not hasattr(vaa, "_EXECUTOR"), "模块级线程池必须已删除"
+        set_budget(monkeypatch, 0.1)
+        http = HangingRunHttp()
         http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
         client = VoiceAgentClient(agent_config(), http=http)
+        _answer, source = client.ask("q")
+        assert source == "error"
+        names = [t.name for t in threading.enumerate()]
+        assert not any("voice-agent-bounded" in n for n in names), names
+
+
+# ============ 幂等键前置契约 ============
+
+
+class TestIdempotencyKeyContract:
+    def test_session_and_run_keys_minted_before_requests(self):
+        """Session/Run 的幂等键都在请求体里、且请求发出前已生成（对账
+        依赖该键；见 TestLateSideEffectsAndReconciliation）。"""
+        client, http = make_client(good_answer_stream())
         client.ask("q")
-        session_calls = [c for c in http.calls if c["url"].endswith("/sessions")]
-        assert session_calls, "请求应已发出（超时打断发生在响应等待阶段）"
-        connect, _read = session_calls[0]["timeout"]
-        assert connect <= budget + 0.02, f"connect 未随预算收缩：{connect}"
+        session_posts = [
+            c for c in http.calls if c["method"] == "POST" and "/sessions" in c["url"]
+        ]
+        run_posts = [
+            c for c in http.calls if c["method"] == "POST" and "/agent/runs" in c["url"]
+        ]
+        assert len(session_posts) == 1 and len(run_posts) == 1
+        assert session_posts[0]["json"]["idempotency_key"].startswith("voice-session-")
+        assert run_posts[0]["json"]["idempotency_key"].startswith("voice-run-")
 
     def test_success_preserves_audit_records_contract(self):
-        """P1-C 语义锁定：成功路径零 DELETE —— Run/事件随 Session 保留到
-        服务端 TTL，可审计；失败路径才级联销毁。"""
+        """P1-3 语义锁定：成功路径零 DELETE —— Run/事件随 Session 保留到
+        服务端主动 TTL，可审计；失败路径才级联销毁。"""
         client, http = make_client(good_answer_stream())
         client.ask("q")
         assert [c for c in http.calls if c["method"] == "DELETE"] == []

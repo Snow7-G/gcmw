@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -74,6 +75,9 @@ from app.storage.run_repository import (
 )
 
 router = APIRouter(prefix="/api/v1")
+
+#: fixed-category logger for the active TTL sweeper — safe identifiers only
+_expiry_logger = logging.getLogger("gcmw.session_expiry")
 
 DEFAULT_SESSION_TTL_S = 1800
 
@@ -212,6 +216,15 @@ class RunAdmissionService:
         self.runs: dict[str, RunRecord] = {}
         # (session_id, idempotency_key) -> (run_id, payload_hash)
         self.idempotency: dict[tuple[str, str], tuple[str, str]] = {}
+        # Session idempotency (P1-1B): (tenant_id, device_id, key) ->
+        # (session_id, payload_hash, response). A timed-out session POST has an
+        # UNKNOWN outcome — the server may already have committed. Replaying
+        # with the SAME key returns the ORIGINAL session instead of creating a
+        # second one. Scoped per principal, so the same key used by a different
+        # tenant/device never collides (isolation is real).
+        self.session_idempotency: dict[
+            tuple[str, str, str], tuple[str, str, SessionResponse]
+        ] = {}
 
     def now(self) -> datetime:
         return self._clock()
@@ -253,6 +266,13 @@ class RunAdmissionService:
             self._forget_run(run_id)
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
+        # the session-idempotency index MUST follow the session: entries pointing
+        # at a purged session (explicit delete or TTL sweep) are removed, so a
+        # key can be safely reused afterwards and the table cannot leak
+        for key in [
+            k for k, v in self.session_idempotency.items() if v[0] == session_id
+        ]:
+            del self.session_idempotency[key]
         # NOTE: the session guard is deliberately NOT touched here. Purging
         # always runs while HOLDING that guard, so a "delete it if idle" check
         # can never fire — the guard removes itself when its last holder or
@@ -267,6 +287,56 @@ class RunAdmissionService:
         session = self.sessions.get(session_id)
         if session is not None and self._session_expired(session):
             self._purge_session(session_id)
+
+    async def expire_due_sessions(self) -> int:
+        """ACTIVE expiry sweep (P1-2): reclaim every due session NOW.
+
+        ``_expire_if_needed`` only fires when a session is touched again — a
+        one-shot voice session that ended successfully is never touched again,
+        so its runs, snapshots and idempotency entries would survive until
+        process restart. This method sweeps the whole table proactively and is
+        driven by the lifespan background task.
+
+        Semantics, per session (stable snapshot taken BEFORE locking):
+
+        - lock via ``_session_guard`` and RE-CHECK expiry under the lock — a
+          session that vanished or was touched meanwhile costs zero writes;
+        - durable Run delete FIRST via the resumable ``_delete_runs_of``;
+          ``NOT_FOUND`` is treated as already reclaimed; a real fault
+          (``UNAVAILABLE`` …) keeps the session for the next sweep — a storage
+          outage is never mistaken for a successful reclaim;
+        - only after storage confirmed are the in-memory tables cleared
+          (sessions / runs / idempotency / session idempotency), always through
+          ``_purge_session`` so executor tasks are interrupted at the choke
+          point and the session-idempotency index follows the session.
+
+        Returns the number of sessions actually reclaimed. Logging is FIXED
+        category + safe identifiers only — no exception text, no question
+        text, no credentials.
+        """
+        reclaimed = 0
+        due = [
+            session_id
+            for session_id, session in list(self.sessions.items())
+            if self._session_expired(session)
+        ]
+        for session_id in due:
+            async with self._session_guard(session_id):
+                session = self.sessions.get(session_id)
+                if session is None or not self._session_expired(session):
+                    continue  # gone, or touched/expired-check raced: zero writes
+                try:
+                    await self._delete_runs_of(session_id)
+                except AppError:
+                    _expiry_logger.warning(
+                        "session_expiry_fault stage=durable_delete "
+                        "session_id=%s outcome=retry_next_sweep",
+                        session_id,
+                    )
+                    continue  # keep the session: state and storage stay consistent
+                self._purge_session(session_id)
+                reclaimed += 1
+        return reclaimed
 
     # -- sessions --------------------------------------------------------------
 
@@ -286,7 +356,34 @@ class RunAdmissionService:
         Deliberately synchronous: it is a single dict insertion of a fresh uuid
         with no check-then-act window, so no admission lock (and no await) is
         needed; the run lifecycle — which does span awaits — is locked.
+
+        With ``req.idempotency_key`` the operation is IDEMPOTENT per principal:
+        same key + same (channel, locale) replays the ORIGINAL response (same
+        session_id / created_at, still 201); same key + a different payload is
+        a structured ``E_CONFLICT_IDEMPOTENCY`` conflict with ZERO writes.
+        The key is scoped by (tenant, device), so identical keys from different
+        principals are fully independent.
         """
+        if req.idempotency_key is not None:
+            index_key = (
+                principal.tenant_id,
+                principal.device_id,
+                req.idempotency_key,
+            )
+            existing = self.session_idempotency.get(index_key)
+            if existing is not None:
+                session_id, stored_hash, response = existing
+                original = self.sessions.get(session_id)
+                if original is None or self._session_expired(original):
+                    # the indexed session is gone or TTL-expired: clear the
+                    # stale entry and create a FRESH session under the same
+                    # key (the index must never outlive its session)
+                    self.session_idempotency.pop(index_key, None)
+                elif stored_hash != self._session_payload_hash(req):
+                    raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+                else:
+                    return response  # replay: same session, same created_at, 201
+
         record = SessionRecord(
             session_id=uuid.uuid4().hex,
             tenant_id=principal.tenant_id,
@@ -305,7 +402,23 @@ class RunAdmissionService:
             ttl_s=record.ttl_s,
         )
         self.sessions[record.session_id] = record
+        if req.idempotency_key is not None:
+            self.session_idempotency[index_key] = (
+                record.session_id,
+                self._session_payload_hash(req),
+                response,
+            )
         return response
+
+    @staticmethod
+    def _session_payload_hash(req: CreateSessionRequest) -> str:
+        """Collision-proof payload identity for session idempotency."""
+        canonical = json.dumps(
+            {"channel": req.channel.value, "locale": req.locale},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     async def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
         async with self._session_guard(session_id):
@@ -712,6 +825,7 @@ async def _stream_with_lease(
         ErrorCode.AUTH_MISSING_CREDENTIALS,
         ErrorCode.AUTH_INVALID_CREDENTIALS,
         ErrorCode.AUTH_DEVICE_NOT_REGISTERED,
+        ErrorCode.CONFLICT_IDEMPOTENCY,
         ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,

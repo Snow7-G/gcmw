@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -133,6 +134,7 @@ def create_app(
     repository_factory: Callable[[Settings], object] | None = None,
     reconnect_grace_s: float = DEFAULT_RECONNECT_GRACE_S,
     agent_executor: bool = False,
+    session_sweep_interval_s: float = 5.0,
 ) -> FastAPI:
     """Compose the application.
 
@@ -145,6 +147,11 @@ def create_app(
     knowledge + MockProvider + Manager/RAG/Verifier). It is OFF by default so
     admission-only tests keep their contract, and the assembly itself refuses
     to build anything outside development / test.
+
+    ``session_sweep_interval_s`` is the fixed cadence of the ACTIVE session-TTL
+    sweeper (P1-2): expiry must not depend on a session being touched again —
+    a one-shot voice session never is. Tests may shrink the interval or drive
+    ``RunAdmissionService.expire_due_sessions()`` directly.
     """
     settings = settings or Settings.from_env()
     factory = repository_factory or build_run_repository
@@ -189,9 +196,37 @@ def create_app(
         app.state.readiness = report
         app.state.stream_leases = leases
         app.state.run_executor = executor
+
+        async def _session_sweeper() -> None:
+            """Active TTL sweeper loop (P1-2). Faults are logged as a FIXED
+            category with safe identifiers and NEVER kill the loop — a failed
+            sweep simply retries at the next tick. No question text, no
+            credentials, no raw exception text is ever logged."""
+            while True:
+                await asyncio.sleep(session_sweep_interval_s)
+                try:
+                    await service.expire_due_sessions()
+                except Exception:  # noqa: BLE001 — the loop must survive
+                    logging.getLogger("gcmw.session_expiry").warning(
+                        "session_expiry_fault stage=sweeper_loop outcome=retry_next_sweep"
+                    )
+
+        sweeper_task = asyncio.create_task(
+            _session_sweeper(), name="session-ttl-sweeper"
+        )
+        app.state.session_sweeper = sweeper_task
         try:
             yield
         finally:
+            # ORDER MATTERS: stop the sweeper FIRST (cancel + await, so it can
+            # never race the executor/lease teardown or touch state after
+            # shutdown), then the existing teardown sequence.
+            sweeper_task.cancel()
+            try:
+                await sweeper_task
+            except asyncio.CancelledError:
+                pass  # the expected way a healthy sweeper stops
+            app.state.session_sweeper = None
             if executor is not None:
                 await executor.shutdown()  # stop in-flight run tasks first
                 if executor.tool_gateway is not None:

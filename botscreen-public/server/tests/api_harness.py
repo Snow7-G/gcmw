@@ -131,6 +131,7 @@ def running_app(
     settings_kwargs: dict | None = None,
     default_credential: str | None = PRIMARY_TOKEN,
     agent_executor: bool = False,
+    app_kwargs: dict[str, Any] | None = None,
 ) -> Iterator[Harness]:
     """Run the application under test.
 
@@ -139,6 +140,9 @@ def running_app(
     harness identities by default, ``default_credential=None`` for anonymous
     tests) and ``credentials`` seeds the store from the environment exactly as
     an operator would.
+
+    ``app_kwargs`` is forwarded to :func:`app.main.create_app` (e.g. the
+    session-TTL sweeper interval for P1-2 tests).
     """
     repository = repository if repository is not None else MemoryRunRepository()
     settings = Settings(environment=environment, **(settings_kwargs or {}))
@@ -151,6 +155,7 @@ def running_app(
             settings=settings,
             repository_factory=lambda _settings: repository,
             agent_executor=agent_executor,
+            **(app_kwargs or {}),
         )
         clock = FakeClock()
         headers = (

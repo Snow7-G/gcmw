@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 
 import pytest
 from api_harness import (
     OTHER_DEVICE_TOKEN,
+    OTHER_TENANT_TOKEN,
     PRINCIPAL,
     FakeClock,
     ForcedStateRepository,
@@ -937,3 +939,223 @@ class TestServiceScope:
 
         assert not hasattr(agent_api, "SERVICE")
         assert not hasattr(agent_api.RunAdmissionService, "_locks")
+
+
+# ---------------------------------------------------------------------------
+# P1-1B（第四轮）：Session 幂等契约
+# ---------------------------------------------------------------------------
+
+
+class TestSessionIdempotency:
+    def post_session(self, harness, key=None, channel="text", locale="zh-CN"):
+        body = {"channel": channel, "locale": locale}
+        if key is not None:
+            body["idempotency_key"] = key
+        return harness.client.post("/api/v1/sessions", json=body)
+
+    def test_same_key_same_payload_replays_original_session(self, harness):
+        first = self.post_session(harness, key="voice-session-abc")
+        assert first.status_code == 201
+        second = self.post_session(harness, key="voice-session-abc")
+        assert second.status_code == 201  # replay keeps the 201 contract
+        assert second.json()["session_id"] == first.json()["session_id"]
+        assert second.json()["created_at"] == first.json()["created_at"]
+        assert len(harness.service.sessions) == 1  # no second session created
+        assert len(harness.service.session_idempotency) == 1
+
+    def test_same_key_different_payload_is_structured_conflict(self, harness):
+        first = self.post_session(harness, key="voice-session-abc")
+        assert first.status_code == 201
+        res = self.post_session(harness, key="voice-session-abc", locale="en-US")
+        assert res.status_code == 409
+        assert harness.env(res).code == "E_CONFLICT_IDEMPOTENCY"
+        assert len(harness.service.sessions) == 1  # zero extra writes
+
+    def test_same_key_across_tenants_is_independent(self, harness):
+        first = self.post_session(harness, key="shared-key")
+        with harness.as_token(OTHER_TENANT_TOKEN):
+            second = self.post_session(harness, key="shared-key")
+        assert first.status_code == 201 and second.status_code == 201
+        assert second.json()["session_id"] != first.json()["session_id"]
+        assert second.json()["tenant_id"] == "t2" != first.json()["tenant_id"]
+
+    def test_same_key_across_devices_is_independent(self, harness):
+        first = self.post_session(harness, key="shared-key")
+        with harness.as_token(OTHER_DEVICE_TOKEN):
+            second = self.post_session(harness, key="shared-key")
+        assert first.status_code == 201 and second.status_code == 201
+        assert second.json()["device_id"] == "OTHER" != first.json()["device_id"]
+
+    def test_absent_key_keeps_old_behaviour(self, harness):
+        first = self.post_session(harness)
+        second = self.post_session(harness)
+        assert first.status_code == 201 and second.status_code == 201
+        assert (
+            second.json()["session_id"] != first.json()["session_id"]
+        )  # two distinct sessions, no idempotency
+
+    def test_key_length_bounds_enforced(self, harness):
+        res = self.post_session(harness, key="x" * 129)
+        assert res.status_code == 400
+        assert harness.env(res).code == "E_VALIDATION_INVALID_INPUT"
+
+    def test_key_never_accepts_identity_fields(self, harness):
+        """tenant/device/session 身份字段一律拒绝（extra=forbid）。"""
+        res = harness.client.post(
+            "/api/v1/sessions",
+            json={"idempotency_key": "k", "tenant_id": "t2", "device_id": "d2"},
+        )
+        assert res.status_code == 400
+
+
+class TestSessionIdempotencyLifecycle:
+    def test_explicit_delete_clears_the_index_and_key_is_reusable(self, harness):
+        first = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        session_id = first.json()["session_id"]
+        res = harness.client.delete(f"/api/v1/sessions/{session_id}")
+        assert res.status_code == 204
+        assert harness.service.session_idempotency == {}  # index follows session
+        # 同一 key 之后可以安全复用：创建的是全新 Session
+        again = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        assert again.status_code == 201
+        assert again.json()["session_id"] != session_id
+
+    def test_ttl_expiry_clears_the_index_and_key_is_reusable(self, harness):
+        first = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        session_id = first.json()["session_id"]
+        harness.clock.advance(harness.service.sessions[session_id].ttl_s + 1)
+        # 触发路径无关紧要：同 key 重放同样会先走过期检查
+        res = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        assert res.status_code == 201
+        assert res.json()["session_id"] != session_id
+        # 旧索引已随过期失效：key 现在绑定的是全新 Session（不允许旧条目残留）
+        entry = harness.service.session_idempotency[("t1", "d1", "voice-session-abc")]
+        assert entry[0] == res.json()["session_id"]
+        assert all(
+            sid != session_id
+            for sid, _h, _r in harness.service.session_idempotency.values()
+        )
+
+
+# ---------------------------------------------------------------------------
+# P1-2（第四轮）：主动 TTL sweeper
+# ---------------------------------------------------------------------------
+
+
+class UnavailableOnceRepository(MemoryRunRepository):
+    """delete 第一次抛真实故障（UNAVAILABLE），之后恢复。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_first_delete = True
+        self.delete_attempts = 0
+
+    async def delete(self, identity):
+        self.delete_attempts += 1
+        if self.fail_first_delete:
+            self.fail_first_delete = False
+            raise RunRepositoryError(
+                RunRepositoryFault.UNAVAILABLE, "storage temporarily down"
+            )
+        return await super().delete(identity)
+
+
+class TestActiveSweeper:
+    def test_sweep_reclaims_expired_session_without_any_client_access(self, harness):
+        """③①：无人访问目标 Session/Run，只跑 sweeper——四张表全部归零，
+        仓储里的 Run 不可再读。"""
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"], text="随过期消失", key="k")
+        harness.clock.advance(harness.service.sessions[session["session_id"]].ttl_s + 1)
+
+        reclaimed = asyncio.run(harness.service.expire_due_sessions())
+
+        assert reclaimed == 1
+        assert harness.service.sessions == {}
+        assert harness.service.runs == {}
+        assert harness.service.idempotency == {}
+        assert harness.service.session_idempotency == {}
+        identity = RunIdentity(
+            run_id=run["run_id"],
+            tenant_id="t1",
+            device_id="d1",
+            session_id=session["session_id"],
+        )
+        with pytest.raises(RunRepositoryError) as exc:
+            asyncio.run(harness.repository.state(identity))
+        assert exc.value.fault is RunRepositoryFault.NOT_FOUND
+
+    def test_sweep_touches_unexpired_sessions_with_zero_writes(self, harness):
+        """⑪：未过期 Session 零写入，Run/事件保持完整。"""
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"])
+        before_runs = dict(harness.service.runs)
+        before_sessions = dict(harness.service.sessions)
+
+        reclaimed = asyncio.run(harness.service.expire_due_sessions())
+
+        assert reclaimed == 0
+        assert harness.service.runs == before_runs
+        assert harness.service.sessions == before_sessions
+        state = asyncio.run(
+            harness.repository.state(
+                RunIdentity(
+                    run_id=run["run_id"],
+                    tenant_id="t1",
+                    device_id="d1",
+                    session_id=session["session_id"],
+                )
+            )
+        )
+        assert state is not None
+
+    def test_real_storage_fault_keeps_session_for_next_sweep(self, harness):
+        """⑫：仓储删除暂时故障 → 不丢内存索引、不假装成功；故障恢复后
+        下一轮 sweep 完成，状态与仓储始终一致。"""
+        repository = UnavailableOnceRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            new_run(h, session["session_id"], text="敏感快照", key="k")
+            h.clock.advance(h.service.sessions[session["session_id"]].ttl_s + 1)
+
+            # 第一轮：真实故障 → Session 保留（可重试）
+            reclaimed = asyncio.run(h.service.expire_due_sessions())
+            assert reclaimed == 0
+            assert len(h.service.sessions) == 1  # 内存索引未丢
+            assert len(h.service.runs) == 1
+
+            # 第二轮：故障已恢复 → 完成回收，状态与仓储一致
+            reclaimed = asyncio.run(h.service.expire_due_sessions())
+            assert reclaimed == 1
+            assert h.service.sessions == {}
+            assert h.service.runs == {}
+            assert h.service.session_idempotency == {}
+
+    def test_lifespan_sweeper_runs_and_shutdown_cancels_it(self):
+        """⑬③：真实 lifespan 里 sweeper 周期运行并主动回收；应用关闭时
+        cancel + await，shutdown 后不再修改状态。"""
+        repository = MemoryRunRepository()
+        with running_app(
+            repository=repository, app_kwargs={"session_sweep_interval_s": 0.02}
+        ) as h:
+            sweeper = h.app.state.session_sweeper
+            assert sweeper is not None and not sweeper.done()
+            session = new_session(h)
+            h.clock.advance(h.service.sessions[session["session_id"]].ttl_s + 1)
+            deadline = time.monotonic() + 5
+            while h.service.sessions and time.monotonic() < deadline:
+                time.sleep(0.02)  # 等真实后台 sweeper 到下一个 tick
+            assert h.service.sessions == {}, "后台 sweeper 未主动回收"
+            svc = h.service
+        # shutdown 之后：任务已取消结束，状态不再变化
+        assert sweeper.done()
+        assert sweeper.cancelled()
+        assert svc.sessions == {}
