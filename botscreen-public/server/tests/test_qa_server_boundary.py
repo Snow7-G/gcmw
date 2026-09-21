@@ -116,6 +116,37 @@ class TestCorsAllowlist:
         assert preflight(client, "null", headers="x-custom").status_code == 400
 
 
+class TestActualResponsesCarryTheCorsDecision:
+    """预检只是"问一次"；真正决定浏览器能否读响应的，是**实际响应**上的头。
+
+    打包页面读 /sse、/health、/suggestions 走的是简单请求（EventSource 与不带
+    自定义头的 fetch），浏览器**不会**先发预检——所以只测预检等于漏测了这条路径。
+    """
+
+    @pytest.mark.parametrize("origin", ALLOWED_ORIGINS)
+    def test_allowed_origin_is_echoed_on_the_actual_response(self, client, origin):
+        res = client.get("/health", headers={"Origin": origin})
+        assert res.status_code == 200
+        assert res.headers["access-control-allow-origin"] == origin
+
+    @pytest.mark.parametrize(
+        "origin",
+        ["http://evil.example", "http://127.0.0.1:5000", "http://localhost:3000"],
+    )
+    def test_unknown_origin_has_no_allow_header_on_the_actual_response(
+        self, client, origin
+    ):
+        res = client.get("/health", headers={"Origin": origin})
+        assert res.status_code == 200  # 请求本身照常处理
+        assert "access-control-allow-origin" not in res.headers  # 但浏览器读不到
+
+    def test_mic_status_actual_response_also_follows_the_allowlist(self, client):
+        allowed = client.get("/mic/status", headers={"Origin": "null"})
+        assert allowed.headers["access-control-allow-origin"] == "null"
+        blocked = client.get("/mic/status", headers={"Origin": "http://evil.example"})
+        assert "access-control-allow-origin" not in blocked.headers
+
+
 class TestNonBrowserCallersUnaffected:
     """ROS1/ROS2 节点与语音桥不带 Origin：CORS 不参与，流程照常。"""
 

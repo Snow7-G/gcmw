@@ -28,7 +28,9 @@ Design contract (do not weaken):
   at 1 and advances by exactly one. A foreign run/session/device/tenant, an
   outer/inner event mismatch, a duplicate, a rewind, a gap or a malformed
   ``id`` therefore all fail closed — no partial answer is delivered, the fixed
-  safe copy is returned and the bounded cleanup path runs;
+  safe copy is returned and the bounded cleanup path runs. The "starts at 1"
+  half rests on an explicit assumption about the server side — see
+  ``_FIRST_SEQ`` for what it is and what happens if it ever stops holding;
 * the credential lives ONLY in the ``Authorization: Bearer`` header — never in
   URLs, logs, exception texts, or anything this module returns.
 
@@ -123,7 +125,15 @@ _SSE_ID_RE = re.compile(r"^[0-9]+$")
 #: SSEEvent 解析的帧，但同样必须失败关闭。
 _STREAM_ERROR_EVENT = "stream.error"
 
-#: 新订阅（不带 Last-Event-ID / after_seq）的流必须从 seq=1 开始且逐一递增
+#: 新订阅的流必须从 seq=1 开始且逐一递增。
+#:
+#: 这里有一半是**前提假设**，写清楚以免日后误判：适配器从不发送
+#: ``Last-Event-ID`` 或 ``after_seq``（见 ``_collect`` 的请求），也就是说它
+#: 假定「新建 Run 后立刻订阅，服务端会给出该 run 从 seq=1 起的**完整**事件流」。
+#: 该假定成立时它只是把「重复/倒退/空洞」一并挡掉；一旦服务端某天对事件做保留
+#: 裁剪（首次订阅就返回 seq>1 的中段），本判定会**失败关闭**——这是安全侧的行为
+#: （宁可拒答也不交付无法对齐的流），但现场表现会是"这条问句答不出来"，
+#: 而不是报错。若要支持裁剪，需要改成携带游标并按服务端返回的起点对齐。
 _FIRST_SEQ = 1
 
 #: 固定文案 —— 绝不携带服务端异常原文或凭据

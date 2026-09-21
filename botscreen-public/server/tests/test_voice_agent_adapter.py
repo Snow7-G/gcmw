@@ -765,6 +765,18 @@ class TestStreamBinding:
         # stream.error 是 ErrorEnvelope、刻意没有 id：仍然只能失败关闭
         self.fails_closed([stream_error_bytes()])
 
+    def test_binding_violation_still_runs_the_bounded_cleanup(self):
+        """绑定违规不只返回固定文案——它必须走进既有的有界取消与级联清理。
+
+        上面每条反例都只断言了返回值，于是「失败关闭 == 也做了清理」这条契约
+        其实没有任何测试钉住；而清理正是失败轮次不留痕的唯一保证。
+        """
+        http = self.fails_closed(stream_with(run_id="other-run"))
+        deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
+        # 已知 Run → 显式取消；已知 Session → 级联回收一切可能已提交的 Run 与事件
+        assert any(f"/agent/runs/{RUN_ID}" in url for url in deletes), deletes
+        assert any(f"/sessions/{SESSION_ID}" in url for url in deletes), deletes
+
 
 class TestCredentialHygiene:
     def test_credential_only_in_authorization_header(self):
