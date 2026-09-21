@@ -19,13 +19,14 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+bundle="${here%/bin}"
 
 root="/opt/gcmw"
 user="$(id -un)"
 home="${HOME}"
 server_dir=""
 release_dir=""
-deploy_dir="${here%/bin}"
+deploy_dir="${bundle}"
 config_dir=""
 venv_python=""
 rcpath=""
@@ -55,19 +56,25 @@ done
 : "${venv_python:=${root}/venv/bin/python}"
 : "${rcpath:=${root}/src}"
 
-mkdir -p "$out"
-cp -R "${here%/bin}/systemd" "${here%/bin}/bin" "${here%/bin}/config" "$out/"
+# Copy FILES only, and only the three asset directories: a build artefact that
+# happens to sit in bin/ (a __pycache__ from importing the entry point, say) is
+# not part of the bundle and must not be rendered, scanned or installed.
+mkdir -p "$out/systemd" "$out/config" "$out/bin"
+cp "$bundle/systemd/"*.service "$out/systemd/"
+cp "$bundle/config/"*.example "$out/config/"
+for source in "$bundle/bin/"*; do
+  [ -f "$source" ] || continue
+  cp "$source" "$out/bin/"
+done
 
-substitute() {
-  local file="$1"
-  python3 - "$file" "$user" "$home" "$server_dir" "$release_dir" \
-    "$deploy_dir" "$config_dir" "$venv_python" "$rcpath" <<'PYEOF'
+echo "== 1) substitute placeholders =="
+python3 - "$out" "$user" "$home" "$server_dir" "$release_dir" \
+  "$deploy_dir" "$config_dir" "$venv_python" "$rcpath" <<'PYEOF'
 import pathlib
 import sys
 
-# Names are composed rather than written out in full so that this renderer itself
-# never contains a complete placeholder token — otherwise the "no placeholder
-# may survive" check below would trip over the tool that does the substituting.
+# Names are composed rather than written out in full so this renderer never
+# contains a complete placeholder token itself.
 NAMES = (
     "USER",
     "HOME",
@@ -78,26 +85,57 @@ NAMES = (
     "VENV_PYTHON",
     "RCPATH",
 )
-path = pathlib.Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
-for name, value in zip(NAMES, sys.argv[2:]):
-    text = text.replace("@@GCMW_" + name + "@@", value)
-path.write_text(text, encoding="utf-8")
-PYEOF
-}
 
-echo "== 1) substitute placeholders =="
-while IFS= read -r file; do
-  substitute "$file"
-  echo "  rendered ${file#"$out"/}"
-done < <(grep -rlE '@@GCMW_[A-Z_]+@@' "$out" || true)
+root = pathlib.Path(sys.argv[1])
+values = dict(zip(NAMES, sys.argv[2:]))
+
+rendered: list[str] = []
+skipped: list[str] = []
+for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        skipped.append(str(path.relative_to(root)))  # not a template; leave alone
+        continue
+    replaced = text
+    for name, value in values.items():
+        replaced = replaced.replace("@@GCMW_" + name + "@@", value)
+    # A placeholder that is not in NAMES stays in place on purpose: step 2 below
+    # reports it as a template bug instead of silently substituting nothing.
+    if replaced != text:
+        path.write_text(replaced, encoding="utf-8")
+        rendered.append(str(path.relative_to(root)))
+
+for name in rendered:
+    print(f"  rendered {name}")
+for name in skipped:
+    print(f"  skipped (not a text template): {name}")
+print(f"  {len(rendered)} rendered, {len(skipped)} skipped")
+PYEOF
 
 echo "== 2) no placeholder may survive =="
-if grep -rnE '@@GCMW_[A-Z_]+@@' "$out"; then
-  echo "ERROR: unresolved placeholders above" >&2
-  exit 1
-fi
-echo "  none left"
+python3 - "$out" <<'PYEOF'
+import pathlib
+import re
+import sys
+
+COMPLETE = re.compile(r"@@GCMW_[A-Z_]+@@")
+root = pathlib.Path(sys.argv[1])
+offenders: list[str] = []
+for path in sorted(p for p in root.rglob("*") if p.is_file()):
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        continue
+    for number, line in enumerate(text.splitlines(), 1):
+        if COMPLETE.search(line):
+            offenders.append(f"{path.relative_to(root)}:{number}: {line.strip()}")
+if offenders:
+    print("\n".join(f"  {entry}" for entry in offenders))
+    print("ERROR: unresolved placeholders above", file=sys.stderr)
+    raise SystemExit(1)
+print("  none left")
+PYEOF
 
 echo "== 3) syntax check =="
 for file in "$out"/bin/*; do
@@ -113,6 +151,8 @@ chmod 0755 "$out"/bin/*
 echo "== 4) systemd verify (best effort, needs systemd-analyze) =="
 if command -v systemd-analyze >/dev/null 2>&1; then
   for unit in "$out"/systemd/*.service; do
+    # Messages here are advisory: an unknown user or an interpreter path that
+    # does not exist yet on this machine is expected before installation.
     systemd-analyze verify "$unit" 2>&1 | sed "s|^|  |" || true
   done
 else

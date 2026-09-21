@@ -20,6 +20,7 @@ import importlib.util
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,18 @@ def _directive(unit_text: str, key: str) -> list[str]:
 
 
 def _load_agent_entry():
+    # Import WITHOUT writing bytecode: a stray __pycache__ next to the tracked
+    # entry point is exactly what used to break the renderer on a platform whose
+    # Python caches file-loaded modules (Linux/3.11; macOS/3.14 does not).
+    previous = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        return _load_agent_entry_uncached()
+    finally:
+        sys.dont_write_bytecode = previous
+
+
+def _load_agent_entry_uncached():
     spec = importlib.util.spec_from_file_location(
         "deploy_run_demo_agent_api", BIN_DIR / "run-demo-agent-api.py"
     )
@@ -275,12 +288,12 @@ class TestEnvironmentExamples:
     reason="render-assets.sh needs bash + python3",
 )
 class TestRenderScript:
-    def _render(self, tmp_path: Path) -> Path:
+    def _render(self, tmp_path: Path, bundle: Path | None = None) -> Path:
         out = tmp_path / "rendered"
         completed = subprocess.run(
             [  # check=False on purpose: the helper's output IS the diagnosis
                 "bash",
-                str(BIN_DIR / "render-assets.sh"),
+                str((bundle or DEPLOY_DIR) / "bin" / "render-assets.sh"),
                 "--out",
                 str(out),
                 "--root",
@@ -303,6 +316,7 @@ class TestRenderScript:
                 f"render-assets.sh exited {completed.returncode}\n"
                 f"--- stdout ---\n{completed.stdout}\n--- stderr ---\n{completed.stderr}"
             )
+        self.helper_stdout = completed.stdout
         return out
 
     def test_leaves_no_placeholder_behind(self, tmp_path):
@@ -340,6 +354,37 @@ class TestRenderScript:
         assert "Restart=on-failure" in unit
         bridge = _read(out / "systemd" / "qa-server.service")
         assert "--host 127.0.0.1 --port 8000" in bridge
+
+    def test_renders_exactly_the_three_files_of_bin(self, tmp_path):
+        out = self._render(tmp_path)
+        assert sorted(path.name for path in (out / "bin").iterdir()) == [
+            "render-assets.sh",
+            "run-demo-agent-api.py",
+            "start-botscreen-ui",
+        ]
+
+    def test_stray_bytecode_cache_does_not_break_rendering(self, tmp_path):
+        """Regression for a real CI-only failure.
+
+        Importing the entry point makes CPython cache it beside its source
+        (`bin/__pycache__/*.pyc`, observed on 3.11) and that blob CONTAINS the
+        placeholder strings, so a renderer that walks the directory and decodes
+        everything as UTF-8 dies with UnicodeDecodeError. Non-templates must be
+        skipped, and never copied into the output.
+        """
+        bundle = tmp_path / "bundle"
+        shutil.copytree(DEPLOY_DIR, bundle)
+        cache = bundle / "bin" / "__pycache__"
+        cache.mkdir()
+        (cache / "run-demo-agent-api.cpython-311.pyc").write_bytes(
+            b"\xa7\x0d\x00@@GCMW_SERVER_DIR@@\x00binary"
+        )
+
+        out = self._render(tmp_path, bundle=bundle)
+
+        assert not (out / "bin" / "__pycache__").exists()
+        assert "skipped" in self.helper_stdout
+        assert "none left" in self.helper_stdout
 
 
 class TestReadmeCoversTheOperationalContract:
