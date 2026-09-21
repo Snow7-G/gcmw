@@ -30,6 +30,13 @@ class CreateSessionRequest(BaseModel):
 
     channel: Channel = Channel.TEXT
     locale: str = Field("zh-CN", min_length=2, max_length=16)
+    # Optional client idempotency key (voice adapter): a distributed POST that
+    # times out has an UNKNOWN outcome — the server may already have committed.
+    # Retrying with the SAME key replays the original session instead of
+    # creating a second one. Absent → behaviour unchanged. Identity fields
+    # (tenant/device/session) are NEVER accepted here: they derive from the
+    # authenticated DevicePrincipal.
+    idempotency_key: str | None = Field(None, min_length=1, max_length=128)
 
 
 class SessionResponse(BaseModel):

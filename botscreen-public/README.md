@@ -2,7 +2,7 @@
 
 天津市眼科医院视光中心的互动展示与问答桌面应用。项目使用 Electron 承载 Vue 3 页面，提供视光科普内容展示、人员与特色技术介绍，以及面向儿童的语音/点击问答界面。
 
-问答服务是一个独立的 FastAPI 进程：问题优先从本地知识库匹配，未命中时才请求 DeepSeek。Electron 前端通过 HTTP 和 Server-Sent Events（SSE）接收回答与麦克风状态。
+问答服务是一个独立的 FastAPI 进程，**回答引擎有两种模式**（由 `GCMW_VOICE_ANSWER_BACKEND` 选择）：默认 `legacy` 为「问题优先从本地知识库匹配，未命中时才请求 DeepSeek」；`agent` 则只走新版 Agent 后端（端口 8001，已审核资料 + 引用门槛，任何故障失败关闭、不回退旧通道）。两种模式下 `/chat` 的请求与响应结构完全一致。Electron 前端通过 HTTP 和 Server-Sent Events（SSE）接收回答与麦克风状态。语音服务只监听回环地址 `127.0.0.1:8000`。
 
 ## 功能概览
 
@@ -81,7 +81,7 @@ python -m pip install -r requirements.txt
 python qa_server.py
 ~~~
 
-服务默认监听 0.0.0.0:8000。前端当前将问答服务地址固定为 http://127.0.0.1:8000，因此开发时请保持 8000 端口，或同步修改 src/renderer/src/pages/qa/index.vue。
+服务只监听回环地址 127.0.0.1:8000（`qa_server.py` 的默认值，部署 unit 亦显式指定）。前端将问答服务地址固定为 http://127.0.0.1:8000，因此开发时请保持 8000 端口，或同步修改 src/renderer/src/pages/qa/index.vue。CORS 为精确白名单：打包后的 Electron 渲染进程（`Origin: null`）与 Vite 开发前端（http://localhost:5173 、http://127.0.0.1:5173），不使用通配符；ROS/ROS2 节点直连不带 Origin，不受 CORS 影响。
 
 ### 3. 启动 Electron 开发环境
 
@@ -110,7 +110,7 @@ export DEEPSEEK_API_KEY=YOUR_DEEPSEEK_API_KEY
 python server/qa_server.py
 ~~~
 
-问答服务的处理顺序如下：
+以下为 `GCMW_VOICE_ANSWER_BACKEND=legacy`（默认）时的处理顺序；`agent` 模式不读本地 KB 也不调 DeepSeek，而是把问题交给 8001 的 Agent（已审核资料检索 + 引用校验），任何故障都由适配器失败关闭为固定安全文案：
 
 1. 启动时从 KB_DOCX_PATH 解析段落和问答对。
 2. 使用 jieba 分词、关键词和中文字符二元组计算匹配分数。
@@ -196,7 +196,7 @@ Electron 主进程通过 rc:// 协议读取外部内容。设置 RCPATH 后，�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | /chat | 提交问题；返回 user_question、robot_answer 和 source。请求体至少包含 question，可选 session_id。 |
+| POST | /chat | 提交问题；返回 user_question、robot_answer 和 source。请求体至少包含 question，可选 session_id。回答引擎由 `GCMW_VOICE_ANSWER_BACKEND` 决定：`legacy` 时 source 为 `kb`/`deepseek`/`error`；`agent` 时 source 为 `agent`/`error`，且 answer 必定带引用编号或为固定安全文案。 |
 | GET | /suggestions | 返回知识库前 6 个推荐问题。 |
 | POST | /mic/wakeup | 前端手动唤醒麦克风。 |
 | POST | /mic/hw_wakeup | ROS/ROS2 硬件语音唤醒回调。 |
@@ -340,7 +340,7 @@ cage -s -- \
 
 - 这是公开仓库，禁止提交 API Key、SSH 私钥、Cookie、患者信息或未授权的人员图片/视频。
 - DeepSeek 请求可能包含用户问题；接入真实场景前请完成数据脱敏、告知和合规评估。
-- qa_server.py 监听 0.0.0.0，且当前 CORS 允许任意来源；仅在受控网络中使用。对外部署前应限制监听地址、CORS、访问控制和防火墙规则。
+- qa_server.py 只监听回环地址 127.0.0.1，CORS 为精确白名单（`Origin: null` 与两个本机开发地址），不允许凭据；对外提供服务前仍需确认访问控制与防火墙规则。
 - 本地知识库和生成式回答都不能替代医生诊断。对外展示前请由专业人员审核内容，并保留 AI 生成结果的提示语。
 - 仓库当前未提供 LICENSE 文件。二次分发或商业使用前，请先补充并确认合适的开源许可和第三方素材授权。
 
@@ -359,3 +359,27 @@ cage -s -- \
 - 当前版本：1.0.0
 - 默认后端地址：http://127.0.0.1:8000
 - 默认分支：main
+
+## 语音回答后端：legacy / agent 双模式（#58 语音快速切片）
+
+机器人语音链路（M260C + 讯飞 AIUI → ROS → `/mic/*` → `/chat` → `/sse` → 页面 TTS 播报）保持不变，仅 `/chat` 的**回答引擎**可通过环境变量切换：
+
+| 变量 | 说明 |
+|---|---|
+| `GCMW_VOICE_ANSWER_BACKEND` | `legacy`（默认，KB → DeepSeek，行为不变）或 `agent`（走新 Agent：Manager → RAG → Verifier） |
+| `GCMW_VOICE_AGENT_API_BASE` | agent 模式的后端地址，当前固定为 `http://127.0.0.1:8001/api/v1` |
+| `GCMW_VOICE_AGENT_CREDENTIAL` | Agent 设备凭据（只进入 `Authorization` 头，缺失/占位符时拒绝启动） |
+
+双服务启动顺序（agent 模式）：
+
+1. **8001 新 Agent**：`PYTHONPATH=. python3 scripts/demo_showcase.py --serve --port 8001 --cors-for-dev-frontends`
+2. **8000 兼容服务**：设好上面三个变量后 `python qa_server.py`
+
+要点：
+
+- agent 模式下任何故障（8001 不可达 / 超时 / 证据不足）都返回**固定安全文案**，**不会回退**到 DeepSeek；
+- 未通过 Verifier 核验的医疗内容不会显示或播报（引用三元组门槛）；
+- **超时模型（第四轮整改）**：整轮问答有 60 秒业务 deadline，作为客户端等待的硬上界，经 `asyncio.timeout_at` 取消域执行——到点时在途请求协程被**真实取消**并关闭连接（不是"停止等待"）。分布式 POST 超时属于**结果未知**（服务端可能已提交，客户端取消不能证明"没有写入"）：Session POST 携带每轮 `idempotency_key`，清理阶段用同一键重放对账，拿到 Session 后按失败路径级联删除；禁止换新键重试（会创建第二个 Session）；
+- 清理为有界可取消 best-effort（共享 4s 清理总期限，到点真取消）：**成功终态零 DELETE**——Session/Run/事件保留可审计，由 8001 的**主动 TTL sweeper**（每 5s 扫描，`session_expiry_fault` 固定类别日志）到期回收；失败轮次才删除 Session（级联删 Run 与事件），不留痕；
+- 8001 侧 Session 创建支持可选 `idempotency_key`（1–128 字符）：同键同载荷重放返回原 Session（仍 201），同键异载荷返回 409 `E_CONFLICT_IDEMPOTENCY` 零写入，键按 tenant/device 隔离；Session 删除与 TTL 回收同步清理幂等索引；
+- 语音回答为「一次性问答」：每个问题一个临时 Agent 会话，当前**不含**多轮语音记忆、流式 ASR/TTS、打断播报、真实硬件验收与生产持久化审计。

@@ -7,48 +7,115 @@
 启动: python qa_server.py
 端口: 8000
 """
+
 from __future__ import annotations
+
 import asyncio
 import json
 import os
 import re
 import threading
 import time
-import zipfile
 import xml.etree.ElementTree as ET
-from pathlib import Path
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-import uvicorn
-import requests
+import zipfile
 
 # ========== jieba 分词 ==========
 import jieba
 import jieba.analyse as jieba_analyse
+import requests
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+# ========== 语音回答后端（legacy | agent 兼容桥，#58 快速切片） ==========
+import voice_agent_adapter
 
 # ========== 全局配置 ==========
 KB_MATCH_THRESHOLD = 0.22  # 知识库匹配阈值（0~1，低于此分数走 LLM）
 
-STOP_WORDS = set([
-    "的", "了", "是", "吗", "呢", "啊", "吧", "呀", "哦", "么", "嘛",
-    "我", "你", "他", "她", "它", "这", "那", "什么", "怎么", "怎样",
-    "一个", "一下", "一些", "一点", "不", "很", "都", "就", "也", "还",
-    "要", "会", "能", "可以", "应该", "在", "有", "和", "与", "或",
-    "对", "把", "被", "让", "给", "从", "到", "向", "跟", "用",
-])
+STOP_WORDS = {
+    "的",
+    "了",
+    "是",
+    "吗",
+    "呢",
+    "啊",
+    "吧",
+    "呀",
+    "哦",
+    "么",
+    "嘛",
+    "我",
+    "你",
+    "他",
+    "她",
+    "它",
+    "这",
+    "那",
+    "什么",
+    "怎么",
+    "怎样",
+    "一个",
+    "一下",
+    "一些",
+    "一点",
+    "不",
+    "很",
+    "都",
+    "就",
+    "也",
+    "还",
+    "要",
+    "会",
+    "能",
+    "可以",
+    "应该",
+    "在",
+    "有",
+    "和",
+    "与",
+    "或",
+    "对",
+    "把",
+    "被",
+    "让",
+    "给",
+    "从",
+    "到",
+    "向",
+    "跟",
+    "用",
+}
 
 # ========== FastAPI 初始化 ==========
+
+#: 只监听回环地址。语音桥（ROS/ROS2 节点）、打包后的 Electron 页面与麦克风
+#: 轮询全部发生在这台机器上，没有任何一条链路需要 LAN 可达——把 8000 暴露到
+#: 局域网只会平白放大攻击面（这条服务带固定低熵演示凭据）。
+HOST = "127.0.0.1"
+PORT = 8000
+
+#: 精确 CORS 白名单：打包后的 Electron 渲染进程发 ``Origin: null``，开发前端
+#: 走 Vite 的两个本机地址。**不使用通配**，也不允许凭据——页面与本服务的交互
+#: 只有 GET/POST 加 ``Content-Type``（ROS/ROS2 直连不带 Origin，不受 CORS 约束）。
+ALLOWED_ORIGINS = [
+    "null",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+]
+ALLOWED_METHODS = ["GET", "POST"]
+ALLOWED_HEADERS = ["Content-Type"]
+
 app = FastAPI(title="互动问答后端", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=False,
+    allow_methods=ALLOWED_METHODS,
+    allow_headers=ALLOWED_HEADERS,
 )
 
 # ================================================
@@ -77,7 +144,7 @@ def extract_paragraphs(docx_path: str) -> list[str]:
                     paragraphs.append(line)
     except FileNotFoundError:
         print(f"[WARN]  文档不存在: {docx_path}，使用内置知识库")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 — 历史容错：解析失败回退内置知识库
         print(f"[WARN]  文档解析失败: {e}，使用内置知识库")
     return paragraphs
 
@@ -94,23 +161,25 @@ def parse_qa_pairs(paragraphs: list[str]) -> list[dict]:
     qa_list: list[dict] = []
 
     # ── 尝试新格式：问 / 答 配对 ──
-    qa_pattern = re.compile(r"问[：:]\s*(.+?)\s*\n\s*答[：:]\s*(.+?)(?=\n(?:问[：:]|\Z))", re.DOTALL)
+    qa_pattern = re.compile(
+        r"问[：:]\s*(.+?)\s*\n\s*答[：:]\s*(.+?)(?=\n(?:问[：:]|\Z))", re.DOTALL
+    )
     matches = qa_pattern.findall(full_text)
     if matches:
         for i, (q, a) in enumerate(matches):
-            qa_list.append({
-                "id": f"qa_{i}",
-                "question": q.strip(),
-                "answer": a.strip(),
-            })
+            qa_list.append(
+                {
+                    "id": f"qa_{i}",
+                    "question": q.strip(),
+                    "answer": a.strip(),
+                }
+            )
         if qa_list:
             print(f"   [OK] 解析到 {len(qa_list)} 组 Q&A（新格式）")
             return qa_list
 
     # ── 旧格式：从对话脚本中提取知识点 ──
     # 匹配「机器人：xxx」作为答案
-    robot_lines = re.findall(r"机器人[：:]\s*(.+?)(?=\n|$)", full_text)
-
     # 匹配标题/主题行
     topics: list[dict] = [
         {
@@ -214,7 +283,9 @@ def parse_qa_pairs(paragraphs: list[str]) -> list[dict]:
             ),
         },
     ]
-    print(f"   [OK] 使用内置知识库（{len(topics)} 条），如需自定义请更新 docx 为 Q&A 格式")
+    print(
+        f"   [OK] 使用内置知识库（{len(topics)} 条），如需自定义请更新 docx 为 Q&A 格式"
+    )
     return topics
 
 
@@ -233,15 +304,22 @@ class KBSearcher:
         for entry in qa_list:
             q_words = set(jieba.cut_for_search(entry["question"])) - STOP_WORDS
             # 也从答案中提取关键词增加匹配面
-            a_keywords = set(jieba_analyse.extract_tags(
-                entry["answer"], topK=10, withWeight=False
-            )) - STOP_WORDS
-            self.entries.append({
-                **entry,
-                "q_words": q_words,
-                "a_keywords": set(a_keywords),
-                "_all_words": q_words | set(a_keywords),
-            })
+            a_keywords = (
+                set(
+                    jieba_analyse.extract_tags(
+                        entry["answer"], topK=10, withWeight=False
+                    )
+                )
+                - STOP_WORDS
+            )
+            self.entries.append(
+                {
+                    **entry,
+                    "q_words": q_words,
+                    "a_keywords": set(a_keywords),
+                    "_all_words": q_words | set(a_keywords),
+                }
+            )
         print(f"   [IDX] 索引已构建：{len(self.entries)} 条")
 
     def search(self, question: str) -> tuple[dict | None, float]:
@@ -265,9 +343,9 @@ class KBSearcher:
         q_chars = question.strip()
         char_grams = set()
         for i in range(len(q_chars) - 1):
-            bigram = q_chars[i:i + 2]
+            bigram = q_chars[i : i + 2]
             # 只保留纯中文 bigram
-            if all('一' <= c <= '鿿' for c in bigram):
+            if all("一" <= c <= "鿿" for c in bigram):
                 char_grams.add(bigram)
 
         best_entry = None
@@ -289,8 +367,8 @@ class KBSearcher:
                 # 把 KB 问题也转成 2-gram
                 kb_char_grams = set()
                 for i in range(len(kb_q) - 1):
-                    bg = kb_q[i:i + 2]
-                    if all('一' <= c <= '鿿' for c in bg):
+                    bg = kb_q[i : i + 2]
+                    if all("一" <= c <= "鿿" for c in bg):
                         kb_char_grams.add(bg)
                 hit2 = len(char_grams & kb_char_grams)
                 score2 = hit2 / len(char_grams) if char_grams else 0.0
@@ -315,8 +393,8 @@ class KBSearcher:
 # 第三部分：Session 会话管理
 # ================================================
 
-SESSION_MAX_MESSAGES = 10   # 每个 session 最多保留多少轮对话
-SESSION_TTL = 1800          # 30 分钟无活动则清理
+SESSION_MAX_MESSAGES = 10  # 每个 session 最多保留多少轮对话
+SESSION_TTL = 1800  # 30 分钟无活动则清理
 
 
 class SessionManager:
@@ -347,10 +425,7 @@ class SessionManager:
     def _cleanup(self):
         """清理过期 session"""
         now = time.time()
-        expired = [
-            sid for sid, t in self._last_access.items()
-            if now - t > SESSION_TTL
-        ]
+        expired = [sid for sid, t in self._last_access.items() if now - t > SESSION_TTL]
         for sid in expired:
             del self._sessions[sid]
             del self._last_access[sid]
@@ -367,14 +442,14 @@ DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions"
 
 KID_SYSTEM_PROMPT = (
     '你是天津市眼科医院视光中心的智能导诊小伙伴"小视"，主要对话对象是小朋友。'
-    '你的回答：\n'
-    '1. 用小朋友能听懂的语言，像大哥哥大姐姐一样\n'
-    '2. 简短有趣，每段不超过2句话\n'
-    '3. 多用可爱的emoji和拟声词\n'
-    '4. 把眼健康知识变成有趣的小故事\n'
+    "你的回答：\n"
+    "1. 用小朋友能听懂的语言，像大哥哥大姐姐一样\n"
+    "2. 简短有趣，每段不超过2句话\n"
+    "3. 多用可爱的emoji和拟声词\n"
+    "4. 把眼健康知识变成有趣的小故事\n"
     '5. 医疗建议要温柔提醒"问医生叔叔阿姨"\n'
-    '6. 多夸奖小朋友\n'
-    '7. 控制在150字以内'
+    "6. 多夸奖小朋友\n"
+    "7. 控制在150字以内"
 )
 
 
@@ -396,7 +471,9 @@ def call_deepseek(question: str, history: list[dict] | None = None) -> tuple[str
         "max_tokens": 400,
     }
     try:
-        resp = requests.post(DEEPSEEK_API_URL, json=payload, headers=headers, timeout=15)
+        resp = requests.post(
+            DEEPSEEK_API_URL, json=payload, headers=headers, timeout=15
+        )
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"], "deepseek"
@@ -407,8 +484,8 @@ def call_deepseek(question: str, history: list[dict] | None = None) -> tuple[str
         if status in (401, 403):
             return f"DeepSeek API Key 认证失败 (HTTP {status})，请检查 Key。", "error"
         return f"DeepSeek 返回错误 (HTTP {status})，请稍后再试。", "error"
-    except Exception as e:
-        return f"服务异常：{str(e)}", "error"
+    except Exception as e:  # noqa: BLE001 — 历史容错：DeepSeek 任意故障转 error
+        return f"服务异常：{e!s}", "error"
 
 
 # ================================================
@@ -427,10 +504,20 @@ print(f"  匹配阈值: {KB_MATCH_THRESHOLD}")
 print(f"  DeepSeek: {'[OK]' if len(DEEPSEEK_API_KEY) > 20 else '❌'}")
 print("=" * 50)
 
+# ── 语音回答后端开关：解析失败（非法 mode / 非契约 URL / 缺凭据）显式退出，
+#    绝不静默回退 legacy —— 配置错误必须被人看见 ──
+try:
+    VOICE_AGENT_CONFIG = voice_agent_adapter.resolve_voice_agent_config()
+except voice_agent_adapter.VoiceAgentConfigError as _exc:
+    print(f"[FATAL] 语音回答后端配置错误: {_exc}")
+    raise SystemExit(1)
+print(f"  语音回答后端: {VOICE_AGENT_CONFIG.mode}")
+
 
 # ================================================
 # 第六部分：API 模型
 # ================================================
+
 
 class ChatRequest(BaseModel):
     question: str
@@ -440,7 +527,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     user_question: str
     robot_answer: str
-    source: str          # "kb" | "deepseek" | "error"
+    source: str  # "kb" | "deepseek" | "error" | "agent"
 
 
 class SuggestionsResponse(BaseModel):
@@ -466,12 +553,14 @@ def _push_mic_event(event_type: str, text: str = ""):
     global _mic_event_id
     with _mic_event_lock:
         _mic_event_id += 1
-        _mic_events.append({
-            "id": _mic_event_id,
-            "event": event_type,
-            "text": text,
-            "timestamp": time.time(),
-        })
+        _mic_events.append(
+            {
+                "id": _mic_event_id,
+                "event": event_type,
+                "text": text,
+                "timestamp": time.time(),
+            }
+        )
         # 最多保留 20 个未消费事件
         if len(_mic_events) > 20:
             _mic_events.pop(0)
@@ -481,16 +570,44 @@ def _push_mic_event(event_type: str, text: str = ""):
 # 第八部分：API 端点
 # ================================================
 
-@app.post("/chat", response_model=ChatResponse)
+
+@app.post(
+    "/chat",
+    response_model=ChatResponse,
+    summary="提交问题并获取回答（回答引擎双模式）",
+    description=(
+        "请求/响应结构与旧版逐字一致，只有**回答来自哪里**由 "
+        "`GCMW_VOICE_ANSWER_BACKEND` 决定：\n\n"
+        "- `legacy`（默认）：先检索本地 docx 知识库，未命中该库时调用 DeepSeek；\n"
+        "- `agent`：只走新 Agent（Manager → RAG → Verifier，端口 8001），"
+        "回答必须原句引用已审核资料并带引用编号；任何故障（不可达/超时/"
+        "证据不足/协议违规）都失败关闭为固定安全文案，**绝不回退** KB 或 DeepSeek。\n\n"
+        "配置非法时服务拒绝启动，不会静默回退 legacy。"
+    ),
+)
 def chat_api(req: ChatRequest):
     global _latest_answer, _answer_id
     q = req.question.strip()
     if not q:
         return ChatResponse(
-            user_question="", robot_answer="跟我说说话吧～你想问什么呢？😊", source="error"
+            user_question="",
+            robot_answer="跟我说说话吧～你想问什么呢？😊",
+            source="error",
         )
 
-    # ── 第一步：搜知识库 ──
+    if VOICE_AGENT_CONFIG.mode == "agent":
+        # ── Agent 模式：只走新 Agent（Manager → RAG → Verifier），任何故障
+        #    都由适配器失败关闭为固定安全文案，严禁回退 KB/DeepSeek ──
+        answer, source = voice_agent_adapter.ask(q, VOICE_AGENT_CONFIG)
+        print(f"   [AGENT] source={source}")
+        result = ChatResponse(user_question=q, robot_answer=answer, source=source)
+        with _answer_lock:
+            _answer_id += 1
+            _latest_answer = result.model_dump()
+            _latest_answer["id"] = _answer_id
+        return result
+
+    # ── legacy 模式：行为逐字不变 ──
     best_entry, score = kb_searcher.search(q)
 
     if best_entry is not None and score >= KB_MATCH_THRESHOLD:
@@ -533,7 +650,7 @@ _mic_state = {
     "triggered": False,
     "start_time": 0.0,
     "last_asr_text": "",
-    "hw_triggered": False,   # 是否由硬件唤醒触发（喊"小微小微"）
+    "hw_triggered": False,  # 是否由硬件唤醒触发（喊"小微小微"）
 }
 
 
@@ -643,8 +760,11 @@ def health_check():
         "kb_entries": len(qa_list),
         "docx_path": DOCX_PATH,
         "match_threshold": KB_MATCH_THRESHOLD,
+        "answer_backend": VOICE_AGENT_CONFIG.mode,
     }
 
 
 if __name__ == "__main__":
-    uvicorn.run("qa_server:app", host="0.0.0.0", port=8000, reload=False)
+    # 默认只绑回环（见 HOST）：部署侧的 systemd unit 也显式写 --host 127.0.0.1，
+    # 代码层与部署层双保险，任何一层漏了都不会把服务摊到局域网。
+    uvicorn.run("qa_server:app", host=HOST, port=PORT, reload=False)

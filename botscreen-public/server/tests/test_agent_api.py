@@ -11,10 +11,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 
 import pytest
 from api_harness import (
     OTHER_DEVICE_TOKEN,
+    OTHER_TENANT_TOKEN,
     PRINCIPAL,
     FakeClock,
     ForcedStateRepository,
@@ -937,3 +939,470 @@ class TestServiceScope:
 
         assert not hasattr(agent_api, "SERVICE")
         assert not hasattr(agent_api.RunAdmissionService, "_locks")
+
+
+# ---------------------------------------------------------------------------
+# P1-1B（第四轮）：Session 幂等契约
+# ---------------------------------------------------------------------------
+
+
+class TestSessionIdempotency:
+    def post_session(self, harness, key=None, channel="text", locale="zh-CN"):
+        body = {"channel": channel, "locale": locale}
+        if key is not None:
+            body["idempotency_key"] = key
+        return harness.client.post("/api/v1/sessions", json=body)
+
+    def test_same_key_same_payload_replays_original_session(self, harness):
+        first = self.post_session(harness, key="voice-session-abc")
+        assert first.status_code == 201
+        second = self.post_session(harness, key="voice-session-abc")
+        assert second.status_code == 201  # replay keeps the 201 contract
+        assert second.json()["session_id"] == first.json()["session_id"]
+        assert second.json()["created_at"] == first.json()["created_at"]
+        assert len(harness.service.sessions) == 1  # no second session created
+        assert len(harness.service.session_idempotency) == 1
+
+    def test_same_key_different_payload_is_structured_conflict(self, harness):
+        first = self.post_session(harness, key="voice-session-abc")
+        assert first.status_code == 201
+        res = self.post_session(harness, key="voice-session-abc", locale="en-US")
+        assert res.status_code == 409
+        assert harness.env(res).code == "E_CONFLICT_IDEMPOTENCY"
+        assert len(harness.service.sessions) == 1  # zero extra writes
+
+    def test_same_key_across_tenants_is_independent(self, harness):
+        first = self.post_session(harness, key="shared-key")
+        with harness.as_token(OTHER_TENANT_TOKEN):
+            second = self.post_session(harness, key="shared-key")
+        assert first.status_code == 201 and second.status_code == 201
+        assert second.json()["session_id"] != first.json()["session_id"]
+        assert second.json()["tenant_id"] == "t2" != first.json()["tenant_id"]
+
+    def test_same_key_across_devices_is_independent(self, harness):
+        first = self.post_session(harness, key="shared-key")
+        with harness.as_token(OTHER_DEVICE_TOKEN):
+            second = self.post_session(harness, key="shared-key")
+        assert first.status_code == 201 and second.status_code == 201
+        assert second.json()["device_id"] == "OTHER" != first.json()["device_id"]
+
+    def test_absent_key_keeps_old_behaviour(self, harness):
+        first = self.post_session(harness)
+        second = self.post_session(harness)
+        assert first.status_code == 201 and second.status_code == 201
+        assert (
+            second.json()["session_id"] != first.json()["session_id"]
+        )  # two distinct sessions, no idempotency
+
+    def test_key_length_bounds_enforced(self, harness):
+        res = self.post_session(harness, key="x" * 129)
+        assert res.status_code == 400
+        assert harness.env(res).code == "E_VALIDATION_INVALID_INPUT"
+
+    def test_key_never_accepts_identity_fields(self, harness):
+        """tenant/device/session 身份字段一律拒绝（extra=forbid）。"""
+        res = harness.client.post(
+            "/api/v1/sessions",
+            json={"idempotency_key": "k", "tenant_id": "t2", "device_id": "d2"},
+        )
+        assert res.status_code == 400
+
+
+class TestSessionIdempotencyLifecycle:
+    def test_explicit_delete_clears_the_index_and_key_is_reusable(self, harness):
+        first = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        session_id = first.json()["session_id"]
+        res = harness.client.delete(f"/api/v1/sessions/{session_id}")
+        assert res.status_code == 204
+        assert harness.service.session_idempotency == {}  # index follows session
+        # 同一 key 之后可以安全复用：创建的是全新 Session
+        again = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        assert again.status_code == 201
+        assert again.json()["session_id"] != session_id
+
+    def test_ttl_expiry_clears_the_index_and_key_is_reusable(self, harness):
+        first = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        session_id = first.json()["session_id"]
+        harness.clock.advance(harness.service.sessions[session_id].ttl_s + 1)
+        # 触发路径无关紧要：同 key 重放同样会先走过期检查
+        res = harness.client.post(
+            "/api/v1/sessions", json={"idempotency_key": "voice-session-abc"}
+        )
+        assert res.status_code == 201
+        assert res.json()["session_id"] != session_id
+        # 旧索引已随过期失效：key 现在绑定的是全新 Session（不允许旧条目残留）
+        entry = harness.service.session_idempotency[("t1", "d1", "voice-session-abc")]
+        assert entry[0] == res.json()["session_id"]
+        assert all(
+            sid != session_id
+            for sid, _h, _r in harness.service.session_idempotency.values()
+        )
+
+
+# ---------------------------------------------------------------------------
+# P1-2（第四轮）：主动 TTL sweeper
+# ---------------------------------------------------------------------------
+
+
+class UnavailableOnceRepository(MemoryRunRepository):
+    """delete 第一次抛真实故障（UNAVAILABLE），之后恢复。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_first_delete = True
+        self.delete_attempts = 0
+
+    async def delete(self, identity):
+        self.delete_attempts += 1
+        if self.fail_first_delete:
+            self.fail_first_delete = False
+            raise RunRepositoryError(
+                RunRepositoryFault.UNAVAILABLE, "storage temporarily down"
+            )
+        return await super().delete(identity)
+
+
+class TestActiveSweeper:
+    def test_sweep_reclaims_expired_session_without_any_client_access(self, harness):
+        """③①：无人访问目标 Session/Run，只跑 sweeper——四张表全部归零，
+        仓储里的 Run 不可再读。"""
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"], text="随过期消失", key="k")
+        harness.clock.advance(harness.service.sessions[session["session_id"]].ttl_s + 1)
+
+        reclaimed = asyncio.run(harness.service.expire_due_sessions())
+
+        assert reclaimed == 1
+        assert harness.service.sessions == {}
+        assert harness.service.runs == {}
+        assert harness.service.idempotency == {}
+        assert harness.service.session_idempotency == {}
+        identity = RunIdentity(
+            run_id=run["run_id"],
+            tenant_id="t1",
+            device_id="d1",
+            session_id=session["session_id"],
+        )
+        with pytest.raises(RunRepositoryError) as exc:
+            asyncio.run(harness.repository.state(identity))
+        assert exc.value.fault is RunRepositoryFault.NOT_FOUND
+
+    def test_sweep_touches_unexpired_sessions_with_zero_writes(self, harness):
+        """⑪：未过期 Session 零写入，Run/事件保持完整。"""
+        session = new_session(harness)
+        run = new_run(harness, session["session_id"])
+        before_runs = dict(harness.service.runs)
+        before_sessions = dict(harness.service.sessions)
+
+        reclaimed = asyncio.run(harness.service.expire_due_sessions())
+
+        assert reclaimed == 0
+        assert harness.service.runs == before_runs
+        assert harness.service.sessions == before_sessions
+        state = asyncio.run(
+            harness.repository.state(
+                RunIdentity(
+                    run_id=run["run_id"],
+                    tenant_id="t1",
+                    device_id="d1",
+                    session_id=session["session_id"],
+                )
+            )
+        )
+        assert state is not None
+
+    def test_real_storage_fault_keeps_session_for_next_sweep(self, harness):
+        """⑫：仓储删除暂时故障 → 不丢内存索引、不假装成功；故障恢复后
+        下一轮 sweep 完成，状态与仓储始终一致。"""
+        repository = UnavailableOnceRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            new_run(h, session["session_id"], text="敏感快照", key="k")
+            h.clock.advance(h.service.sessions[session["session_id"]].ttl_s + 1)
+
+            # 第一轮：真实故障 → Session 保留（可重试）
+            reclaimed = asyncio.run(h.service.expire_due_sessions())
+            assert reclaimed == 0
+            assert len(h.service.sessions) == 1  # 内存索引未丢
+            assert len(h.service.runs) == 1
+
+            # 第二轮：故障已恢复 → 完成回收，状态与仓储一致
+            reclaimed = asyncio.run(h.service.expire_due_sessions())
+            assert reclaimed == 1
+            assert h.service.sessions == {}
+            assert h.service.runs == {}
+            assert h.service.session_idempotency == {}
+
+    def test_lifespan_sweeper_runs_and_shutdown_cancels_it(self):
+        """⑬③：真实 lifespan 里 sweeper 周期运行并主动回收；应用关闭时
+        cancel + await，shutdown 后不再修改状态。"""
+        repository = MemoryRunRepository()
+        with running_app(
+            repository=repository, app_kwargs={"session_sweep_interval_s": 0.02}
+        ) as h:
+            sweeper = h.app.state.session_sweeper
+            assert sweeper is not None and not sweeper.done()
+            session = new_session(h)
+            h.clock.advance(h.service.sessions[session["session_id"]].ttl_s + 1)
+            deadline = time.monotonic() + 5
+            while h.service.sessions and time.monotonic() < deadline:
+                time.sleep(0.02)  # 等真实后台 sweeper 到下一个 tick
+            assert h.service.sessions == {}, "后台 sweeper 未主动回收"
+            svc = h.service
+        # shutdown 之后：任务已取消结束，状态不再变化
+        assert sweeper.done()
+        assert sweeper.cancelled()
+        assert svc.sessions == {}
+
+
+# ---------------------------------------------------------------------------
+# 第六轮 P1：过期回收必须「先删仓储、再清内存」，且所有入口共用同一条流程
+# ---------------------------------------------------------------------------
+
+
+class TestExpiryReclaimIsSharedAndOrdered:
+    """审查复现的缺口：请求路径先把内存索引清掉，sweeper 便再也找不到那些 Run，
+    持久记录成了孤儿（"重启才消失"不算回收）。
+
+    矩阵：过期后「先 GET Run / 先 POST Run / 先 DELETE Session / 只跑 sweeper」
+    四条入口，每一条都必须把持久记录清干净；再叠加「存储故障保留重试」与
+    「多 Run 部分失败后可续跑」两条异常路径。
+    """
+
+    @staticmethod
+    def _expire(h: Harness, session: dict) -> None:
+        h.clock.advance(h.service.sessions[session["session_id"]].ttl_s + 1)
+
+    @staticmethod
+    def _identity(session: dict, run: dict) -> RunIdentity:
+        return RunIdentity(
+            run_id=run["run_id"],
+            tenant_id="t1",
+            device_id="d1",
+            session_id=session["session_id"],
+        )
+
+    def _assert_durable_gone(self, repository, session: dict, run: dict) -> None:
+        with pytest.raises(RunRepositoryError) as exc:
+            asyncio.run(repository.state(self._identity(session, run)))
+        assert exc.value.fault is RunRepositoryFault.NOT_FOUND
+
+    def _assert_durable_present(self, repository, session: dict, run: dict) -> None:
+        assert isinstance(
+            asyncio.run(repository.state(self._identity(session, run))), RunState
+        )
+
+    def _assert_memory_empty(self, h: Harness) -> None:
+        assert h.service.sessions == {}
+        assert h.service.runs == {}
+        assert h.service.idempotency == {}
+        assert h.service.session_idempotency == {}
+
+    def _assert_memory_intact(self, h: Harness) -> None:
+        assert len(h.service.sessions) == 1
+        assert len(h.service.runs) == 1
+
+    @pytest.mark.parametrize(
+        "first_move", ["get_run", "post_run", "delete_session", "sweeper"]
+    )
+    def test_every_entry_point_fully_reclaims(self, first_move):
+        repository = MemoryRunRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="k")
+            self._expire(h, session)
+
+            status = self._first_move(h, first_move, session, run)
+            if status is not None:
+                assert status == 404, first_move
+
+            # 第一条入口之后持久记录就必须没了 —— 不是"等 sweeper 再说"
+            self._assert_durable_gone(repository, session, run)
+            self._assert_memory_empty(h)
+            # 再跑 sweeper 无事可做：证明清理没有被推迟
+            assert asyncio.run(h.service.expire_due_sessions()) == 0
+
+    def _first_move(self, h: Harness, move: str, session: dict, run: dict):
+        """执行"过期后的第一个动作"，返回 HTTP 状态码（sweeper 返回 None）。"""
+        if move == "get_run":
+            return h.client.get(f"/api/v1/agent/runs/{run['run_id']}").status_code
+        if move == "post_run":
+            return h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "再问一次"},
+                    "idempotency_key": "k2",
+                },
+            ).status_code
+        if move == "delete_session":
+            return h.client.delete(
+                f"/api/v1/sessions/{session['session_id']}"
+            ).status_code
+        assert move == "sweeper"
+        assert asyncio.run(h.service.expire_due_sessions()) == 1
+        return None
+
+    @pytest.mark.parametrize(
+        "first_move", ["get_run", "post_run", "delete_session", "sweeper"]
+    )
+    def test_storage_fault_keeps_records_and_next_sweep_finishes(self, first_move):
+        """真实存储故障：请求被拒、内存索引与持久记录**都留下**，
+        故障恢复后 sweeper 清完。这里同时钉住"故障时绝不假装回收成功"。"""
+        repository = UnavailableOnceRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="k")
+            self._expire(h, session)
+
+            if first_move == "sweeper":
+                # 故障让这一轮 sweep 一个都收不回来（绝不假装成功）
+                assert asyncio.run(h.service.expire_due_sessions()) == 0
+            else:
+                status = self._first_move(h, first_move, session, run)
+                assert status == 404, first_move
+            assert repository.delete_attempts == 1
+
+            # 内存索引完整保留：这就是重试入口，不能提前丢
+            self._assert_memory_intact(h)
+            self._assert_durable_present(repository, session, run)
+
+            # 故障恢复 → sweeper 清完
+            assert asyncio.run(h.service.expire_due_sessions()) == 1
+            self._assert_memory_empty(h)
+            self._assert_durable_gone(repository, session, run)
+
+    def test_partial_failure_resumes_and_cancels_each_task_once(self):
+        """两个 Run、第二个删除失败：已删的不再被声称存在、未删的仍是唯一重试
+        线索、会话保留；恢复后继续跑完。后台任务在唯一 choke point 被中断，
+        且**每个任务恰好一次**（不重复、不泄漏）。"""
+
+        class FlakySecondDelete(MemoryRunRepository):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_for: set[str] = set()
+                self.attempts: list[str] = []
+
+            async def delete(self, identity) -> None:
+                self.attempts.append(identity.run_id)
+                if identity.run_id in self.fail_for:
+                    raise RunRepositoryError(
+                        RunRepositoryFault.UNAVAILABLE, "storage down"
+                    )
+                return await super().delete(identity)
+
+        class CancelRecorder:
+            def __init__(self) -> None:
+                self.cancelled: list[str] = []
+
+            def cancel(self, run_id: str) -> None:
+                self.cancelled.append(run_id)
+
+        repository = FlakySecondDelete()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            first = new_run(h, session["session_id"], key="first")
+            # Terminal-out the first run through the REPOSITORY (simulating an
+            # external writer), not through the cancel route: the route would
+            # cancel the executor task itself, and then "each task is interrupted
+            # exactly once by the reclaim" would no longer be what we measure.
+            asyncio.run(
+                repository.commit_transition(
+                    self._identity(session, first),
+                    expected_state=RunState.ACCEPTED,
+                    next_state=RunState.CANCELLED,
+                )
+            )
+            second = new_run(h, session["session_id"], key="second")
+            recorder = CancelRecorder()
+            h.service.executor = recorder
+            repository.fail_for.add(second["run_id"])
+            self._expire(h, session)
+
+            assert asyncio.run(h.service.expire_due_sessions()) == 0  # 会话保留
+
+            # 已删的：内存与仓储都不再声称它存在；任务已中断
+            assert first["run_id"] not in h.service.runs
+            self._assert_durable_gone(repository, session, first)
+            # 未删的：仍在内存里，是唯一的重试线索
+            assert second["run_id"] in h.service.runs
+            self._assert_durable_present(repository, session, second)
+            assert session["session_id"] in h.service.sessions
+
+            repository.fail_for.clear()
+            assert asyncio.run(h.service.expire_due_sessions()) == 1
+            self._assert_memory_empty(h)
+            self._assert_durable_gone(repository, session, second)
+
+        assert sorted(recorder.cancelled) == sorted(
+            [first["run_id"], second["run_id"]]
+        ), "每个 Run 的后台任务必须恰好被中断一次"
+
+    def test_idempotent_replay_after_expiry_keeps_the_old_session_reclaimable(self):
+        """幂等重放：同 key 拿到新会话，但**旧会话不能被丢掉** —— 它是旧
+        持久 Run 的清理索引，之后由 sweeper 正常清完。"""
+        repository = MemoryRunRepository()
+        with running_app(repository=repository) as h:
+            key = "voice-session-abc"
+            original = h.client.post(
+                "/api/v1/sessions", json={"idempotency_key": key}
+            ).json()
+            run = new_run(h, original["session_id"], key="k")
+            self._expire(h, original)
+
+            replay = h.client.post("/api/v1/sessions", json={"idempotency_key": key})
+            assert replay.status_code == 201
+            assert replay.json()["session_id"] != original["session_id"]
+
+            # 旧会话与它的 Run 仍在内存里（清理索引没被提前丢弃）
+            assert original["session_id"] in h.service.sessions
+            assert run["run_id"] in h.service.runs
+            self._assert_durable_present(repository, original, run)
+
+            # 于是 sweeper 仍能把它清干净
+            assert asyncio.run(h.service.expire_due_sessions()) == 1
+            self._assert_durable_gone(repository, original, run)
+            assert h.service.sessions.keys() == {replay.json()["session_id"]}
+
+    def test_expired_session_is_never_served_on_any_path(self):
+        """正常过期（未注入故障）：会话已过期，三条读/写入口一律 404，且都被
+        彻底回收 —— 内存与仓储一致。
+
+        本用例刻意关闭故障注入，证明的是「过期即拒绝服务」；存储故障下
+        「记录与内存索引都保留、恢复后再清完」由参数化用例
+        ``test_storage_fault_keeps_records_and_next_sweep_finishes`` 覆盖。
+        """
+        repository = UnavailableOnceRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="k")
+            repository.fail_first_delete = False  # 本次不注入故障
+            self._expire(h, session)
+
+            assert (
+                h.client.get(f"/api/v1/agent/runs/{run['run_id']}").status_code == 404
+            )
+            assert (
+                h.client.post(
+                    "/api/v1/agent/runs",
+                    json={
+                        "session_id": session["session_id"],
+                        "input": {"type": "text", "text": "再问一次"},
+                        "idempotency_key": "k2",
+                    },
+                ).status_code
+                == 404
+            )
+            assert (
+                h.client.delete(f"/api/v1/sessions/{session['session_id']}").status_code
+                == 404
+            )
+            # 三条路径都把该会话彻底回收了：内存与仓储一致
+            self._assert_memory_empty(h)
+            self._assert_durable_gone(repository, session, run)

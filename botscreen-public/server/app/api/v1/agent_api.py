@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -74,6 +75,9 @@ from app.storage.run_repository import (
 )
 
 router = APIRouter(prefix="/api/v1")
+
+#: fixed-category logger for the active TTL sweeper — safe identifiers only
+_expiry_logger = logging.getLogger("gcmw.session_expiry")
 
 DEFAULT_SESSION_TTL_S = 1800
 
@@ -212,6 +216,15 @@ class RunAdmissionService:
         self.runs: dict[str, RunRecord] = {}
         # (session_id, idempotency_key) -> (run_id, payload_hash)
         self.idempotency: dict[tuple[str, str], tuple[str, str]] = {}
+        # Session idempotency (P1-1B): (tenant_id, device_id, key) ->
+        # (session_id, payload_hash, response). A timed-out session POST has an
+        # UNKNOWN outcome — the server may already have committed. Replaying
+        # with the SAME key returns the ORIGINAL session instead of creating a
+        # second one. Scoped per principal, so the same key used by a different
+        # tenant/device never collides (isolation is real).
+        self.session_idempotency: dict[
+            tuple[str, str, str], tuple[str, str, SessionResponse]
+        ] = {}
 
     def now(self) -> datetime:
         return self._clock()
@@ -253,6 +266,13 @@ class RunAdmissionService:
             self._forget_run(run_id)
         for key in [k for k in list(self.idempotency) if k[0] == session_id]:
             del self.idempotency[key]
+        # the session-idempotency index MUST follow the session: entries pointing
+        # at a purged session (explicit delete or TTL sweep) are removed, so a
+        # key can be safely reused afterwards and the table cannot leak
+        for key in [
+            k for k, v in self.session_idempotency.items() if v[0] == session_id
+        ]:
+            del self.session_idempotency[key]
         # NOTE: the session guard is deliberately NOT touched here. Purging
         # always runs while HOLDING that guard, so a "delete it if idle" check
         # can never fire — the guard removes itself when its last holder or
@@ -261,12 +281,84 @@ class RunAdmissionService:
     def _session_expired(self, session: SessionRecord) -> bool:
         return self.now() >= session.expires_at
 
-    def _expire_if_needed(self, session_id: str) -> None:
-        """Called under the session lock. Expired sessions vanish entirely —
-        session, runs, idempotency and the raw text snapshots included."""
+    async def _reclaim_if_expired(self, session_id: str) -> bool:
+        """THE expiry reclaim. MUST be called while holding the session guard.
+
+        Order is not negotiable — durable records first, memory only after
+        storage confirmed:
+
+        1. ``_delete_runs_of`` (resumable: already-gone runs are skipped, a real
+           fault stops immediately and leaves everything past it untouched);
+        2. only then ``_purge_session`` — session, runs, both idempotency tables
+           and the executor tasks of this session's runs.
+
+        On a real storage fault the ``AppError`` PROPAGATES and the cleanup is
+        left HALF DONE — never falsely complete: each run whose durable delete
+        already succeeded is dropped from memory too, while the runs from the
+        failing one onward and the session itself (with both idempotency tables)
+        stay put. The session therefore keeps acting as the cleanup index and the
+        next attempt — the very next request that touches this session, or the
+        sweeper — resumes at the first run still durable. What must never happen
+        is purging memory FIRST: the sweeper iterates the in-memory sessions, so
+        a cache-only purge would make the durable runs unreachable forever.
+
+        Returns True when the session is gone (reclaimed, or never here).
+        """
         session = self.sessions.get(session_id)
-        if session is not None and self._session_expired(session):
-            self._purge_session(session_id)
+        if session is None or not self._session_expired(session):
+            return True  # nothing to do / not due
+        try:
+            await self._delete_runs_of(session_id)
+        except AppError:
+            _expiry_logger.warning(
+                "session_expiry_fault stage=durable_delete session_id=%s "
+                "outcome=records_kept_for_retry",
+                session_id,
+            )
+            raise
+        self._purge_session(session_id)
+        return True
+
+    async def expire_due_sessions(self) -> int:
+        """ACTIVE expiry sweep (P1-2): reclaim every due session NOW.
+
+        ``_reclaim_if_expired`` only fires when a session is touched again — a
+        one-shot voice session that ended successfully is never touched again,
+        so its runs, snapshots and idempotency entries would survive until
+        process restart. This method sweeps the whole table proactively and is
+        driven by the lifespan background task.
+
+        Semantics, per session (stable snapshot taken BEFORE locking):
+
+        - lock via ``_session_guard`` and RE-CHECK expiry under the lock — a
+          session that vanished or was touched meanwhile costs zero writes;
+        - then delegate to :meth:`_reclaim_if_expired`: the SAME ordered cleanup
+          the request path uses (durable delete FIRST, memory purge only after
+          storage confirmed), so the two paths can never drift apart. A real
+          fault keeps the session — index and all — for the next sweep, and a
+          storage outage is never mistaken for a successful reclaim.
+
+        Returns the number of sessions actually reclaimed. Logging is FIXED
+        category + safe identifiers only — no exception text, no question
+        text, no credentials.
+        """
+        reclaimed = 0
+        due = [
+            session_id
+            for session_id, session in list(self.sessions.items())
+            if self._session_expired(session)
+        ]
+        for session_id in due:
+            async with self._session_guard(session_id):
+                session = self.sessions.get(session_id)
+                if session is None or not self._session_expired(session):
+                    continue  # gone, or touched/expired-check raced: zero writes
+                try:
+                    await self._reclaim_if_expired(session_id)
+                except AppError:
+                    continue  # kept for the next sweep: cleanup index intact
+                reclaimed += 1
+        return reclaimed
 
     # -- sessions --------------------------------------------------------------
 
@@ -286,7 +378,39 @@ class RunAdmissionService:
         Deliberately synchronous: it is a single dict insertion of a fresh uuid
         with no check-then-act window, so no admission lock (and no await) is
         needed; the run lifecycle — which does span awaits — is locked.
+
+        With ``req.idempotency_key`` the operation is IDEMPOTENT per principal:
+        same key + same (channel, locale) replays the ORIGINAL response (same
+        session_id / created_at, still 201); same key + a different payload is
+        a structured ``E_CONFLICT_IDEMPOTENCY`` conflict with ZERO writes.
+        The key is scoped by (tenant, device), so identical keys from different
+        principals are fully independent.
         """
+        if req.idempotency_key is not None:
+            index_key = (
+                principal.tenant_id,
+                principal.device_id,
+                req.idempotency_key,
+            )
+            existing = self.session_idempotency.get(index_key)
+            if existing is not None:
+                session_id, stored_hash, response = existing
+                original = self.sessions.get(session_id)
+                if original is None or self._session_expired(original):
+                    # The entry may not outlive its session — but only the REPLAY
+                    # index is dropped here. When the session still exists
+                    # (expired, still awaiting reclaim) it is left COMPLETELY
+                    # alone: it is the cleanup index for its durable runs, and
+                    # the shared reclaim (or the sweep) deletes those before
+                    # anything leaves memory. The key simply points at the fresh
+                    # session created below; the expired one is reclaimed by the
+                    # next request that touches it, or by the sweep.
+                    self.session_idempotency.pop(index_key, None)
+                elif stored_hash != self._session_payload_hash(req):
+                    raise AppError(ErrorCode.CONFLICT_IDEMPOTENCY)
+                else:
+                    return response  # replay: same session, same created_at, 201
+
         record = SessionRecord(
             session_id=uuid.uuid4().hex,
             tenant_id=principal.tenant_id,
@@ -305,7 +429,23 @@ class RunAdmissionService:
             ttl_s=record.ttl_s,
         )
         self.sessions[record.session_id] = record
+        if req.idempotency_key is not None:
+            self.session_idempotency[index_key] = (
+                record.session_id,
+                self._session_payload_hash(req),
+                response,
+            )
         return response
+
+    @staticmethod
+    def _session_payload_hash(req: CreateSessionRequest) -> str:
+        """Collision-proof payload identity for session idempotency."""
+        canonical = json.dumps(
+            {"channel": req.channel.value, "locale": req.locale},
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
     async def delete_session(self, principal: DevicePrincipal, session_id: str) -> None:
         async with self._session_guard(session_id):
@@ -313,7 +453,14 @@ class RunAdmissionService:
             if session is None:
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
             if self._session_expired(session):
-                self._purge_session(session_id)
+                # Same ordered reclaim as everywhere else: the durable runs go
+                # first, so a fault leaves the session (and its index) behind for
+                # a retry instead of orphaning the records. Either way the caller
+                # is told the session is gone — see the (404) contract above.
+                try:
+                    await self._reclaim_if_expired(session_id)
+                except AppError:
+                    pass
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
             self._require_session_owner(session, principal)
             await self._delete_runs_of(session_id)
@@ -422,14 +569,24 @@ class RunAdmissionService:
             raise AppError(ErrorCode.NOT_FOUND_RUN)
         return record.session_id
 
-    def _owned_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
-        """Owned-run lookup; must be called under the session lock."""
+    async def _owned_run(self, principal: DevicePrincipal, run_id: str) -> RunRecord:
+        """Owned-run lookup; must be called under the session lock.
+
+        An expired session is reclaimed through the shared flow, and the run is
+        refused either way — both when the reclaim succeeded (records gone) and
+        when a storage fault kept them (the session stays behind for a later
+        retry, but it is still expired, so serving it would be wrong).
+        """
         record = self.runs.get(run_id)
         if record is None:
             raise AppError(ErrorCode.NOT_FOUND_RUN)
-        self._expire_if_needed(record.session_id)
+        try:
+            await self._reclaim_if_expired(record.session_id)
+        except AppError:
+            pass  # records kept for retry; the checks below still refuse
         record = self.runs.get(run_id)
-        if record is None:  # expired while we looked
+        session = self.sessions.get(record.session_id) if record is not None else None
+        if record is None or session is None or self._session_expired(session):
             raise AppError(ErrorCode.NOT_FOUND_RUN)
         snapshot = record.snapshot
         require_owner(
@@ -445,9 +602,15 @@ class RunAdmissionService:
         trace_id: str,
     ) -> RunStatusSnapshot:
         async with self._session_guard(req.session_id):
-            self._expire_if_needed(req.session_id)
+            try:
+                await self._reclaim_if_expired(req.session_id)
+            except AppError as exc:
+                # Storage fault while reclaiming an expired session: its records
+                # (and the cleanup index) stay for a retry, but the session is
+                # still expired — the client is refused, not served.
+                raise AppError(ErrorCode.NOT_FOUND_SESSION) from exc
             session = self.sessions.get(req.session_id)
-            if session is None:
+            if session is None or self._session_expired(session):
                 raise AppError(ErrorCode.NOT_FOUND_SESSION)
             self._require_session_owner(session, principal)
 
@@ -524,7 +687,7 @@ class RunAdmissionService:
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
         async with self._session_guard(self._session_of(run_id)):
-            record = self._owned_run(principal, run_id)
+            record = await self._owned_run(principal, run_id)
             return self._snapshot(record, await self._read_durable_state(record))
 
     async def _cancel_record(self, record: RunRecord) -> RunState:
@@ -557,7 +720,7 @@ class RunAdmissionService:
         self, principal: DevicePrincipal, run_id: str
     ) -> RunStatusSnapshot:
         async with self._session_guard(self._session_of(run_id)):
-            record = self._owned_run(principal, run_id)
+            record = await self._owned_run(principal, run_id)
             state = await self._cancel_record(record)
             if self.executor is not None:
                 # #55A: the terminal state is committed by the CAS above; this
@@ -603,7 +766,7 @@ class RunAdmissionService:
         with a half-open stream.
         """
         async with self._session_guard(self._session_of(run_id)):
-            record = self._owned_run(principal, run_id)
+            record = await self._owned_run(principal, run_id)
             state = await self._read_durable_state(record)
             return record.identity, state
 
@@ -712,6 +875,7 @@ async def _stream_with_lease(
         ErrorCode.AUTH_MISSING_CREDENTIALS,
         ErrorCode.AUTH_INVALID_CREDENTIALS,
         ErrorCode.AUTH_DEVICE_NOT_REGISTERED,
+        ErrorCode.CONFLICT_IDEMPOTENCY,
         ErrorCode.UNAVAILABLE_OVERLOADED,
         ErrorCode.INTERNAL_UNKNOWN,
         ErrorCode.RATE_LIMIT_EXCEEDED,
