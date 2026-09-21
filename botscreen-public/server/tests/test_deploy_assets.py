@@ -547,7 +547,12 @@ class TestRenderScript:
 
     def test_rendered_shell_files_stay_valid(self, tmp_path):
         out = self._render(tmp_path)
-        for name in ("start-botscreen-ui", "render-assets.sh"):
+        for name in (
+            "start-botscreen-ui",
+            "render-assets.sh",
+            "backup-assets.sh",
+            "rollback-assets.sh",
+        ):
             subprocess.run(
                 ["bash", "-n", str(out / "bin" / name)], check=True, capture_output=True
             )
@@ -560,10 +565,12 @@ class TestRenderScript:
         bridge = _read(out / "systemd" / "qa-server.service")
         assert "--host 127.0.0.1 --port 8000" in bridge
 
-    def test_renders_exactly_the_three_files_of_bin(self, tmp_path):
+    def test_renders_exactly_the_files_of_bin(self, tmp_path):
         out = self._render(tmp_path)
         assert sorted(path.name for path in (out / "bin").iterdir()) == [
+            "backup-assets.sh",
             "render-assets.sh",
+            "rollback-assets.sh",
             "run-demo-agent-api.py",
             "start-botscreen-ui",
         ]
@@ -590,6 +597,172 @@ class TestRenderScript:
         assert not (out / "bin" / "__pycache__").exists()
         assert "skipped" in self.helper_stdout
         assert "none left" in self.helper_stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="the bundle scripts are bash")
+class TestBackupAndRollbackRestoreTheFiles:
+    """The install -> backup -> overwrite -> rollback loop.
+
+    File operations only: every directory is an argument to the scripts, which is
+    what makes this runnable in a temp dir — no service is touched and nothing
+    needs sudo.
+
+    Why this exists: the previous procedure timestamped per file, backed up only
+    qa-server.service, and then overwrote botscreen.service and the user unit with
+    no copy at all. A rollback that references a file nobody saved is not a
+    rollback, and prose in a README could not catch that — this can.
+    """
+
+    STAMP = "20260921-120000"
+
+    @staticmethod
+    def _layout(tmp_path: Path) -> dict[str, Path]:
+        return {
+            "backup_dir": tmp_path / "var" / "backups" / "gcmw",
+            "system_unit_dir": tmp_path / "etc" / "systemd" / "system",
+            "user_unit_dir": tmp_path
+            / "home"
+            / "operator"
+            / ".config"
+            / "systemd"
+            / "user",
+            "deploy_dir": tmp_path / "opt" / "gcmw" / "deploy" / "current",
+        }
+
+    def _script(
+        self, layout: dict[str, Path], name: str, *extra: str
+    ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [
+                "bash",
+                str(BIN_DIR / name),
+                "--backup-dir",
+                str(layout["backup_dir"]),
+                "--system-unit-dir",
+                str(layout["system_unit_dir"]),
+                "--user-unit-dir",
+                str(layout["user_unit_dir"]),
+                "--deploy-dir",
+                str(layout["deploy_dir"]),
+                *extra,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    @staticmethod
+    def _write(path: Path, content: str, mode: int = 0o644) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        path.chmod(mode)
+
+    def _old_state(self, layout: dict[str, Path]) -> None:
+        """Before the install: three files, and no user unit / Agent entry point."""
+        self._write(layout["system_unit_dir"] / "qa-server.service", "OLD qa\n")
+        self._write(layout["system_unit_dir"] / "botscreen.service", "OLD ui\n")
+        self._write(
+            layout["deploy_dir"] / "bin" / "start-botscreen-ui", "OLD launcher\n", 0o700
+        )
+
+    def _new_state(self, layout: dict[str, Path]) -> None:
+        self._write(layout["system_unit_dir"] / "qa-server.service", "NEW qa\n")
+        self._write(layout["system_unit_dir"] / "botscreen.service", "NEW ui\n")
+        self._write(
+            layout["user_unit_dir"] / "gcmw-agent-demo.service", "NEW user unit\n"
+        )
+        self._write(
+            layout["deploy_dir"] / "bin" / "start-botscreen-ui", "NEW launcher\n", 0o755
+        )
+        self._write(
+            layout["deploy_dir"] / "bin" / "run-demo-agent-api.py", "NEW entry\n", 0o755
+        )
+
+    def test_backup_then_rollback_restores_content_and_mode(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+
+        backup = self._script(layout, "backup-assets.sh", "--stamp", self.STAMP)
+        assert backup.returncode == 0, backup.stderr
+
+        # the overwrite really happened ...
+        self._new_state(layout)
+        launcher = layout["deploy_dir"] / "bin" / "start-botscreen-ui"
+        assert _read(launcher) == "NEW launcher\n"
+
+        # ... and the rollback puts the OLD bytes back, at the OLD mode
+        rollback = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert rollback.returncode == 0, rollback.stderr
+
+        assert _read(layout["system_unit_dir"] / "qa-server.service") == "OLD qa\n"
+        assert _read(layout["system_unit_dir"] / "botscreen.service") == "OLD ui\n"
+        assert _read(launcher) == "OLD launcher\n"
+        assert launcher.stat().st_mode & 0o777 == 0o700, (
+            "the recorded mode must be restored, not the install's 0755"
+        )
+
+    def test_entries_absent_before_the_install_are_removed(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        user_unit = layout["user_unit_dir"] / "gcmw-agent-demo.service"
+        agent_entry = layout["deploy_dir"] / "bin" / "run-demo-agent-api.py"
+        assert user_unit.is_file() and agent_entry.is_file()
+
+        rollback = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert rollback.returncode == 0, rollback.stderr
+
+        assert not user_unit.exists(), "restoring a first-time install must remove it"
+        assert not agent_entry.exists()
+        assert "removed" in rollback.stdout
+
+    def test_dry_run_reports_without_touching_anything(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+        self._new_state(layout)
+
+        plan = self._script(
+            layout, "rollback-assets.sh", "--stamp", self.STAMP, "--dry-run"
+        )
+        assert plan.returncode == 0, plan.stderr
+        assert "would:" in plan.stdout
+
+        assert _read(layout["system_unit_dir"] / "qa-server.service") == "NEW qa\n"
+        assert (layout["user_unit_dir"] / "gcmw-agent-demo.service").is_file()
+
+    def test_one_stamp_lists_every_managed_file(self, tmp_path):
+        """All five files must be recorded — present or not — under one stamp."""
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        snapshot = layout["backup_dir"] / self.STAMP
+        manifest = _read(snapshot / "MANIFEST.tsv").splitlines()
+        assert manifest[0] == "status\tmode\toriginal\tstored"
+        assert [line.split("\t")[0] for line in manifest[1:]] == [
+            "COPIED",
+            "COPIED",
+            "ABSENT",
+            "COPIED",
+            "ABSENT",
+        ]
+
+        version = _read(snapshot / "VERSION")
+        assert f"stamp={self.STAMP}" in version
+        assert "current=" in version
+        assert "server_head=" in version
 
 
 class TestReadmeCoversTheOperationalContract:

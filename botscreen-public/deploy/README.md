@@ -31,6 +31,8 @@ deploy/
 ├── README.md                      ← this file
 ├── bin/
 │   ├── render-assets.sh           substitute @@PLACEHOLDER@@ + verify
+│   ├── backup-assets.sh           snapshot what an install overwrites (one stamp)
+│   ├── rollback-assets.sh         restore a snapshot (file operations only)
 │   ├── run-demo-agent-api.py      Agent API entry (loopback, packaged-renderer CORS)
 │   └── start-botscreen-ui         X-display resolver + window launcher
 ├── config/
@@ -83,6 +85,8 @@ prevents.
 | Rendered | Goes to | Mode | Owner |
 |---|---|---|---|
 | `bin/render-assets.sh` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
+| `bin/backup-assets.sh` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
+| `bin/rollback-assets.sh` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
 | `bin/start-botscreen-ui` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
 | `bin/run-demo-agent-api.py` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
 | `systemd/qa-server.service` | `/etc/systemd/system/` | `0644` | `root:root` |
@@ -96,23 +100,35 @@ This README is copied straight from the bundle, not rendered — its placeholder
 table documents the token **names**, so substituting them would destroy it.
 
 ```bash
+# 0) back up EVERY file this install overwrites, under ONE stamp.
+#    A per-file timestamp is how the old procedure backed up qa-server.service and
+#    then overwrote botscreen.service and the user unit with no copy at all.
+STAMP="$(date -u +%Y%m%d-%H%M%S)"
+sudo install -d -m 0755 /var/backups/gcmw
+sudo bin/backup-assets.sh --stamp "${STAMP}" --backup-dir /var/backups/gcmw \
+  --user-unit-dir /home/<operator>/.config/systemd/user   # explicit: this runs as root
+#    Anything that does not exist yet is recorded ABSENT, so rolling back a
+#    first-time install removes it again instead of leaving it behind.
+
+# 1) rendered sources
 sudo install -d -m 0755 /opt/gcmw/deploy/current/bin /opt/gcmw/config
 sudo install -m 0755 <rendered>/bin/start-botscreen-ui     /opt/gcmw/deploy/current/bin/
 sudo install -m 0755 <rendered>/bin/run-demo-agent-api.py  /opt/gcmw/deploy/current/bin/
+sudo install -m 0755 <rendered>/bin/backup-assets.sh       /opt/gcmw/deploy/current/bin/
+sudo install -m 0755 <rendered>/bin/rollback-assets.sh     /opt/gcmw/deploy/current/bin/
 sudo install -m 0755 <rendered>/bin/render-assets.sh       /opt/gcmw/deploy/current/bin/
 sudo install -m 0644 <bundle>/README.md                    /opt/gcmw/deploy/current/README.md
 
-# back up the units BEFORE overwriting them
-sudo install -d -m 0755 /var/backups/gcmw
-sudo cp -a /etc/systemd/system/qa-server.service \
-  /var/backups/gcmw/qa-server.service.$(date +%Y%m%d-%H%M%S)
+# 2) system units
 sudo install -m 0644 <rendered>/systemd/qa-server.service /etc/systemd/system/
 sudo install -m 0644 <rendered>/systemd/botscreen.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
-# the Agent API unit belongs to the OPERATOR's session: install it as that user
+# 3) the Agent API unit belongs to the OPERATOR's session: install it as that user
 install -m 0644 <rendered>/systemd/gcmw-agent-demo.service ~/.config/systemd/user/
 systemctl --user daemon-reload
+
+# 4) start in startup order — 8001, health, 8000, UI (see below)
 ```
 
 Two permission traps worth stating out loud:
@@ -192,19 +208,47 @@ readlink -f /opt/gcmw/current          # confirm before restarting anything
 
 ### 3. Deployment assets and units
 
-The units exec `<root>/deploy/current/bin/…`, so the **rendered** launcher and
-entry point must be restored as well — restoring the symlink alone is not enough.
+Everything the install overwrote comes back from the snapshot taken in the
+`## Install` step — the three units, the rendered launcher, the Agent entry point.
+Restoring the symlink alone is not enough, because the units exec
+`<root>/deploy/current/bin/…`.
 
 ```bash
-sudo install -d -m 0755 /opt/gcmw/deploy/current/bin
-sudo install -m 0755 <rendered>/bin/start-botscreen-ui     /opt/gcmw/deploy/current/bin/
-sudo install -m 0755 <rendered>/bin/run-demo-agent-api.py  /opt/gcmw/deploy/current/bin/
-sudo install -m 0644 <bundle>/README.md                    /opt/gcmw/deploy/current/README.md
+# what snapshots exist, and exactly what this one would do
+sudo bin/rollback-assets.sh --list
+sudo bin/rollback-assets.sh --stamp <STAMP> --dry-run \
+  --user-unit-dir /home/<operator>/.config/systemd/user
 
-# prefer the timestamped copies taken during install
-sudo install -m 0644 /var/backups/gcmw/qa-server.service.<STAMP>  /etc/systemd/system/qa-server.service
-sudo install -m 0644 /var/backups/gcmw/botscreen.service.<STAMP>  /etc/systemd/system/botscreen.service
-sudo systemctl daemon-reload
+# then apply it: every file at its recorded mode
+sudo bin/rollback-assets.sh --stamp <STAMP> \
+  --user-unit-dir /home/<operator>/.config/systemd/user
+
+sudo systemctl daemon-reload          # system scope
+systemctl --user daemon-reload        # user scope — the Agent unit is the operator's
+```
+
+`MANIFEST.tsv` records one of two things per file, and both are handled:
+
+| Entry | Meaning | Rollback does |
+|---|---|---|
+| `COPIED` | the file existed before that install | puts the old content back, at the recorded mode |
+| `ABSENT` | the file did not exist before that install | **removes** it — restoring the previous state for a first-time install means removing it |
+
+`--dry-run` prints every removal before it happens. The snapshot's `VERSION` file
+(`current` symlink target, server `HEAD`, timestamp) is how you tell **which**
+revision the backed-up assets belonged to.
+
+One thing the snapshot deliberately does *not* store: the release tree itself.
+`<rendered-PREVIOUS>` below means the render output from the **older** revision —
+re-rendering the current (broken) revision and installing that would undo the
+rollback:
+
+```bash
+# only needed if the rendered entry points themselves changed
+sudo install -d -m 0755 /opt/gcmw/deploy/current/bin
+sudo install -m 0755 <rendered-PREVIOUS>/bin/start-botscreen-ui     /opt/gcmw/deploy/current/bin/
+sudo install -m 0755 <rendered-PREVIOUS>/bin/run-demo-agent-api.py  /opt/gcmw/deploy/current/bin/
+sudo install -m 0644 <bundle>/README.md                             /opt/gcmw/deploy/current/README.md
 ```
 
 ### 4. Bring the stack back — startup order, matching scope
@@ -227,8 +271,9 @@ Scopes are not interchangeable: `sudo systemctl` cannot manage the user unit, an
 scope fails (or applies to nothing), which is how a "rolled back" host ends up
 still serving the old code.
 
-Always back up the unit files **before** installing new ones
-(`install -d -m 0755 /var/backups/gcmw && cp -a <unit> /var/backups/gcmw/<unit>.<timestamp>`).
+A rollback is only possible if `bin/backup-assets.sh` ran **before** the install —
+that is step 0 above, and it is the only step whose absence cannot be repaired
+afterwards.
 
 ## The framed-window requirement
 
@@ -279,6 +324,10 @@ be signed off on the target host:
 2. window has a title bar / close button, and closing it does not respawn it;
 3. the new QA page loads;
 4. **a real spoken utterance through the physical microphone** — an API smoke
-   test cannot stand in for this;
+   test cannot stand in for this. *Partially observed* on the host: the physical
+   device produced a ROS ASR line (`麦克风识别: …`), which covers **capture +
+   recognition**. This item stays open: a full voice acceptance needs one round to
+   show recognition → `/chat` → an Agent answer → **actual playback**, and the ASR
+   line alone does not close that loop;
 5. active TTL reclaim (short-TTL environment) and the idempotent-reconcile path
    after an uncertain Session create.
