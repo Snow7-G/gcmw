@@ -277,8 +277,8 @@ class TestEnvironmentExamples:
 class TestRenderScript:
     def _render(self, tmp_path: Path) -> Path:
         out = tmp_path / "rendered"
-        subprocess.run(
-            [
+        completed = subprocess.run(
+            [  # check=False on purpose: the helper's output IS the diagnosis
                 "bash",
                 str(BIN_DIR / "render-assets.sh"),
                 "--out",
@@ -292,10 +292,17 @@ class TestRenderScript:
                 "--deploy-dir",
                 "/opt/gcmw/deploy/current",
             ],
-            check=True,
+            check=False,
             capture_output=True,
             text=True,
         )
+        if completed.returncode != 0:
+            # Surface the helper's own output: a bare CalledProcessError hides
+            # WHICH step failed, which is exactly what differs between platforms.
+            pytest.fail(
+                f"render-assets.sh exited {completed.returncode}\n"
+                f"--- stdout ---\n{completed.stdout}\n--- stderr ---\n{completed.stderr}"
+            )
         return out
 
     def test_leaves_no_placeholder_behind(self, tmp_path):
