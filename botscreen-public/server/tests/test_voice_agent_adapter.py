@@ -22,6 +22,10 @@ import pytest
 
 import voice_agent_adapter as vaa
 from voice_agent_adapter import (
+    COPY_CANCELLED,
+    COPY_ESCALATED,
+    COPY_REFUSED,
+    COPY_TIMEOUT,
     COPY_UNAVAILABLE,
     DEMO_CONTRACT_BASE_URL,
     PLACEHOLDER_CREDENTIAL,
@@ -230,7 +234,7 @@ def good_answer_stream() -> list[bytes]:
             "answer.completed",
             {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
         ),
-        frame_bytes(4, "run.completed", {"status": "COMPLETED", "result": "answered"}),
+        frame_bytes(4, "run.completed", {"status": "completed", "result": "answered"}),
     ]
 
 
@@ -406,7 +410,9 @@ class TestClientDeliveryGate:
                     "answer.completed",
                     {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
                 ),
-                frame_bytes(3, "run.completed", {"result": "answered"}),
+                frame_bytes(
+                    3, "run.completed", {"status": "completed", "result": "answered"}
+                ),
             ]
         )
         cut = stream.index("眼".encode()) + 1  # 眼 的首字节后切断
@@ -423,7 +429,9 @@ class TestClientDeliveryGate:
                 "answer.completed",
                 {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
             ),
-            frame_bytes(4, "run.completed", {"result": "answered"}),
+            frame_bytes(
+                4, "run.completed", {"status": "completed", "result": "answered"}
+            ),
         ]
         client, _ = make_client(chunks)
         answer, source = client.ask("q")
@@ -437,7 +445,9 @@ class TestClientDeliveryGate:
                 "answer.completed",
                 {"citations": [], "content_origin": "approved_faq"},
             ),
-            frame_bytes(3, "run.completed", {"result": "answered"}),
+            frame_bytes(
+                3, "run.completed", {"status": "completed", "result": "answered"}
+            ),
         ]
         client, _ = make_client(chunks)
         answer, source = client.ask("q")
@@ -456,7 +466,9 @@ class TestClientDeliveryGate:
                 "answer.completed",
                 {"citations": [bad], "content_origin": "approved_faq"},
             ),
-            frame_bytes(3, "run.completed", {"result": "answered"}),
+            frame_bytes(
+                3, "run.completed", {"status": "completed", "result": "answered"}
+            ),
         ]
         client, _ = make_client(chunks)
         _answer, source = client.ask("q")
@@ -475,7 +487,9 @@ class TestClientDeliveryGate:
                 "answer.completed",
                 {"citations": [bad], "content_origin": "approved_faq"},
             ),
-            frame_bytes(2, "run.completed", {"result": "answered"}),
+            frame_bytes(
+                2, "run.completed", {"status": "completed", "result": "answered"}
+            ),
         ]
         client, _ = make_client(chunks)
         _answer, source = client.ask("q")
@@ -483,7 +497,13 @@ class TestClientDeliveryGate:
 
     def test_refused_no_answer_mapping(self):
         client, _ = make_client(
-            [frame_bytes(1, "run.completed", {"result": "refused_no_answer"})]
+            [
+                frame_bytes(
+                    1,
+                    "run.completed",
+                    {"status": "failed", "result": "refused_no_answer"},
+                )
+            ]
         )
         answer, source = client.ask("q")
         assert source == "agent"
@@ -491,21 +511,33 @@ class TestClientDeliveryGate:
 
     def test_escalated_mapping(self):
         client, _ = make_client(
-            [frame_bytes(1, "run.completed", {"result": "escalated_to_human"})]
+            [
+                frame_bytes(
+                    1,
+                    "run.completed",
+                    {"status": "handoff", "result": "escalated_to_human"},
+                )
+            ]
         )
         answer, source = client.ask("q")
         assert source == "agent" and answer == vaa.COPY_ESCALATED
 
     def test_cancelled_mapping(self):
         client, _ = make_client(
-            [frame_bytes(1, "run.completed", {"result": "cancelled"})]
+            [frame_bytes(1, "run.completed", {"status": "cancelled"})]
         )
         answer, source = client.ask("q")
         assert source == "agent" and answer == vaa.COPY_CANCELLED
 
     def test_deadline_exceeded_mapping(self):
         client, _ = make_client(
-            [frame_bytes(1, "run.completed", {"result": "deadline_exceeded"})]
+            [
+                frame_bytes(
+                    1,
+                    "run.completed",
+                    {"status": "failed", "result": "deadline_exceeded"},
+                )
+            ]
         )
         answer, source = client.ask("q")
         assert source == "agent" and answer == vaa.COPY_TIMEOUT
@@ -532,7 +564,9 @@ class TestClientDeliveryGate:
 
     def test_late_delta_in_same_chunk_as_terminal_not_delivered(self):
         chunks = [
-            frame_bytes(1, "run.completed", {"result": "refused_no_answer"}),
+            frame_bytes(
+                1, "run.completed", {"status": "failed", "result": "refused_no_answer"}
+            ),
             frame_bytes(2, "answer.delta", {"delta": "迟到内容"}),
             frame_bytes(
                 3,
@@ -566,7 +600,9 @@ class TestClientDeliveryGate:
                     "answer.completed",
                     {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
                 ),
-                frame_bytes(3, "run.completed", {"result": "answered"}),
+                frame_bytes(
+                    3, "run.completed", {"status": "completed", "result": "answered"}
+                ),
             ]
         )
         client, _ = make_client([raw])
@@ -590,7 +626,9 @@ class TestClientDeliveryGate:
                     "answer.completed",
                     {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
                 ),
-                frame_bytes(3, "run.completed", {"result": "answered"}),
+                frame_bytes(
+                    3, "run.completed", {"status": "completed", "result": "answered"}
+                ),
             ]
         )
         client, _ = make_client([raw])
@@ -638,7 +676,7 @@ def _good_payloads() -> list[tuple[int, str, dict[str, Any]]]:
             "answer.completed",
             {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
         ),
-        (4, "run.completed", {"result": "answered"}),
+        (4, "run.completed", {"status": "completed", "result": "answered"}),
     ]
 
 
@@ -1435,3 +1473,276 @@ class TestIdempotencyKeyContract:
         client, http = make_client(good_answer_stream())
         client.ask("q")
         assert [c for c in http.calls if c["method"] == "DELETE"] == []
+
+
+# ============ 第六轮 P2：答案封口 + 终态一致性 + 拒答映射 ============
+
+
+class TestAnswerSealAndTerminalConsistency:
+    """客户端补的最小交付状态约束。
+
+    服务端有两道**原子**约束（见 run_repository / executor）：
+    ``answer.completed`` 之后不得再有任何 answer 事件；``run.completed`` 的
+    ``status`` 由已提交状态派生、调用方只能提供 ``result``。
+
+    这两条在客户端此前都没有对应约束：封口之后的内容仍会被追加交付，
+    而 ``status`` 压根没被读过。这里把它们补上——不是重复服务端的活，而是让
+    "对端说谎或服务端回归" 也无法让客户端交付被撤回的内容。
+    """
+
+    def _sealed_then(self, *tail: bytes) -> tuple[str, str]:
+        """封口一次，再喂 ``tail``，返回 (source, answer)。"""
+        chunks = [
+            frame_bytes(1, "answer.delta", {"delta": "封口前"}),
+            frame_bytes(
+                2,
+                "answer.completed",
+                {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+            ),
+            *tail,
+        ]
+        client, _ = make_client(chunks)
+        return client.ask("q")
+
+    def test_delta_after_seal_fails_closed_without_delivering_cached_text(self):
+        answer, source = self._sealed_then(
+            frame_bytes(3, "answer.delta", {"delta": "封口后"}),
+            frame_bytes(
+                4, "run.completed", {"status": "completed", "result": "answered"}
+            ),
+        )
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert "封口前" not in answer, "已缓存的文本绝不能被交付"
+        assert "封口后" not in answer
+
+    def test_second_seal_is_also_a_protocol_anomaly(self):
+        answer, source = self._sealed_then(
+            frame_bytes(
+                3,
+                "answer.completed",
+                {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+            ),
+            frame_bytes(
+                4, "run.completed", {"status": "completed", "result": "answered"}
+            ),
+        )
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert "封口前" not in answer
+
+    def test_control_seal_alone_still_delivers(self):
+        # 正对照：不越界时封口语义不影响交付
+        answer, source = self._sealed_then(
+            frame_bytes(
+                3, "run.completed", {"status": "completed", "result": "answered"}
+            )
+        )
+        assert source == "agent" and answer == "封口前"
+
+    @pytest.mark.parametrize(
+        "status",
+        [None, "COMPLETED", "Failed", "handoff", "cancelled", "", 1],
+        ids=[
+            "missing",
+            "uppercase",
+            "mixed-case",
+            "wrong-state",
+            "cancelled",
+            "empty",
+            "non-string",
+        ],
+    )
+    def test_answered_requires_the_real_completed_status(self, status):
+        """``answered`` 只接受 ``status="completed"``（真实服务端的派生值）。"""
+        business = {"result": "answered"}
+        if status is not None:
+            business["status"] = status
+        chunks = [
+            frame_bytes(1, "answer.delta", {"delta": "有依据的答案"}),
+            frame_bytes(
+                2,
+                "answer.completed",
+                {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+            ),
+            frame_bytes(3, "run.completed", business),
+        ]
+        client, _ = make_client(chunks)
+        answer, source = client.ask("q")
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert "有依据的答案" not in answer
+
+    @pytest.mark.parametrize(
+        ("status", "result"),
+        [
+            ("failed", "answered"),
+            ("completed", "refused_no_answer"),
+            ("handoff", "answered"),
+            ("failed", "escalated_to_human"),
+            ("cancelled", "answered"),
+            ("completed", "deadline_exceeded"),
+        ],
+    )
+    def test_contradictory_terminal_pairs_are_rejected(self, status, result):
+        """status 与 result 自相矛盾 = 服务端不可能产生的组合。"""
+        chunks = [
+            frame_bytes(1, "answer.delta", {"delta": "有依据的答案"}),
+            frame_bytes(
+                2,
+                "answer.completed",
+                {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+            ),
+            frame_bytes(3, "run.completed", {"status": status, "result": result}),
+        ]
+        client, _ = make_client(chunks)
+        answer, source = client.ask("q")
+        assert source == "error" and answer == COPY_UNAVAILABLE
+
+    def test_unknown_result_never_falls_back_to_a_legacy_answer(self):
+        chunks = [
+            frame_bytes(
+                1, "run.completed", {"status": "completed", "result": "brand_new"}
+            ),
+        ]
+        client, _ = make_client(chunks)
+        answer, source = client.ask("q")
+        # 失败关闭、不猜测、不回退 legacy：既不是拒答文案也不是任何服务端正文
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        assert COPY_REFUSED not in answer
+
+    @pytest.mark.parametrize(
+        ("business", "expected"),
+        [
+            ({"status": "completed", "result": "answered"}, None),
+            ({"status": "handoff", "result": "escalated_to_human"}, COPY_ESCALATED),
+            ({"status": "failed", "result": "refused_no_answer"}, COPY_REFUSED),
+            ({"status": "failed", "result": "refused_blocked"}, COPY_REFUSED),
+            ({"status": "failed", "result": "refused_revised"}, COPY_REFUSED),
+            ({"status": "failed", "result": "deadline_exceeded"}, COPY_TIMEOUT),
+            ({"status": "cancelled"}, COPY_CANCELLED),
+        ],
+        ids=[
+            "answered",
+            "escalated",
+            "no_answer",
+            "blocked",
+            "revised",
+            "deadline",
+            "cancelled_without_result",
+        ],
+    )
+    def test_every_real_terminal_payload_maps_to_a_fixed_copy(self, business, expected):
+        """真实服务端的终态载荷逐一映射。
+
+        取值来自 executor 的固定标记与 run_repository 的派生 status：``answered``
+        带引用必须交付答案，其余都落到固定文案。``cancelled`` 是唯一**不带
+        result** 的终态（``_cancel_record`` 不带 data 提交 CANCELLED）。
+        """
+        chunks = [frame_bytes(1, "run.completed", business)]
+        client, _ = make_client(chunks)
+        answer, source = client.ask("q")
+        if expected is None:  # answered without an answer body must fail closed
+            assert source == "error" and answer == COPY_UNAVAILABLE
+            return
+        assert source == "agent" and answer == expected
+
+    @pytest.mark.parametrize(
+        "business",
+        [
+            {"status": "handoff"},
+            {"status": "failed"},
+            {"status": "completed"},
+            {},
+            {"result": "escalated_to_human"},
+        ],
+        ids=["bare_handoff", "bare_failed", "bare_completed", "empty", "result_only"],
+    )
+    def test_incomplete_terminal_payload_is_rejected(self, business):
+        """缺 result（或全空）的终态不是服务端会发的东西：一律拒绝，
+        唯一的例外是 ``{"status": "cancelled"}``（见上一个用例）。"""
+        chunks = [frame_bytes(1, "run.completed", business)]
+        client, _ = make_client(chunks)
+        answer, source = client.ask("q")
+        assert source == "error" and answer == COPY_UNAVAILABLE
+
+    def test_refusal_markers_discard_any_cached_answer(self):
+        """拒答终态即使之前已经流了内容，也不交付缓存文本。"""
+        for marker in ("refused_blocked", "refused_revised", "refused_no_answer"):
+            chunks = [
+                frame_bytes(1, "answer.delta", {"delta": "半截答案"}),
+                frame_bytes(
+                    2,
+                    "answer.completed",
+                    {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+                ),
+                frame_bytes(3, "run.completed", {"status": "failed", "result": marker}),
+            ]
+            client, _ = make_client(chunks)
+            answer, source = client.ask("q")
+            assert source == "agent", marker
+            assert answer == COPY_REFUSED
+            assert "半截答案" not in answer
+
+
+class TestChatRouteTerminalMapping:
+    """/chat 路由回归：拒绝与协议异常都要以固定文案落地，绝不夹带服务端正文。"""
+
+    def _chat(self, qa_server_module, monkeypatch, chunks):
+        from fastapi.testclient import TestClient
+
+        import qa_server
+
+        monkeypatch.setattr(qa_server, "VOICE_AGENT_CONFIG", agent_config())
+        stub_client, _http = make_client(chunks)
+        monkeypatch.setattr(
+            qa_server.voice_agent_adapter,
+            "ask",
+            lambda question, cfg: stub_client.ask(question),
+        )
+        return (
+            TestClient(qa_server.app)
+            .post("/chat", json={"question": "眼部不适怎么办", "session_id": "s"})
+            .json()
+        )
+
+    @pytest.mark.parametrize(
+        ("marker", "expected"),
+        [
+            ("refused_blocked", COPY_REFUSED),
+            ("refused_revised", COPY_REFUSED),
+            ("refused_no_answer", COPY_REFUSED),
+            ("escalated_to_human", COPY_ESCALATED),
+        ],
+    )
+    def test_refusals_surface_as_fixed_copy(
+        self, qa_server_module, monkeypatch, marker, expected
+    ):
+        status = "handoff" if marker == "escalated_to_human" else "failed"
+        body = self._chat(
+            qa_server_module,
+            monkeypatch,
+            [frame_bytes(1, "run.completed", {"status": status, "result": marker})],
+        )
+        assert body["source"] == "agent"
+        assert body["robot_answer"] == expected
+
+    def test_seal_violation_reports_failure_without_leaking_text(
+        self, qa_server_module, monkeypatch
+    ):
+        body = self._chat(
+            qa_server_module,
+            monkeypatch,
+            [
+                frame_bytes(1, "answer.delta", {"delta": "封口前"}),
+                frame_bytes(
+                    2,
+                    "answer.completed",
+                    {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+                ),
+                frame_bytes(3, "answer.delta", {"delta": "封口后"}),
+                frame_bytes(
+                    4, "run.completed", {"status": "completed", "result": "answered"}
+                ),
+            ],
+        )
+        assert body["source"] == "error"
+        assert body["robot_answer"] == COPY_UNAVAILABLE
+        assert "封口" not in json.dumps(body, ensure_ascii=False)

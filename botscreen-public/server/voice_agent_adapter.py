@@ -14,8 +14,20 @@ Design contract (do not weaken):
 * an answer is only delivered when the full delivery gate passes: non-empty
   accumulated deltas + a legal ``answer.completed`` (non-empty citations, each
   with source_id / knowledge_version / 64-hex lowercase content_hash) +
-  ``run.completed`` with ``result == "answered"``. Anything else discards the
-  partial answer;
+  ``run.completed`` carrying a pair the REAL server can produce. Anything else
+  discards the partial answer;
+* the answer is SEALED by ``answer.completed``: a later ``answer.delta`` or a
+  second seal is a protocol anomaly, so the turn fails closed **without
+  delivering the text it had already accumulated**. The server enforces the same
+  seal atomically (``_require_stateless_support`` refuses any answer event once
+  the newest event is ``answer.completed``); doing it here too means a peer that
+  lies — or a future server regression — cannot make the client emit content
+  that was retracted;
+* the terminal is validated as a PAIR, not as a bare ``result``: ``status`` is
+  derived from the committed run state server-side (``state_event_data``) and
+  ``result`` is the executor's fixed marker, so only the combinations in
+  ``_TERMINAL_PAIRS`` are accepted and a missing / illegal / self-contradictory
+  terminal fails closed. Unknown results never fall back to the legacy model;
 * every protocol frame is BOUND to this turn before it may advance the state
   machine. Apart from the transport-level ``stream.error``, a frame must be a
   complete #30 ``SSEEvent`` envelope validated by ``SSEEvent.model_validate``
@@ -145,10 +157,63 @@ COPY_UNAVAILABLE = "问答服务暂时不可用，请稍后再试。"
 
 _TERMINAL_COPY = {
     "refused_no_answer": COPY_REFUSED,
+    # 这两种拒答同样"没有可交付的答案"：服务端把它们终态化为 FAILED（见
+    # executor 的 RESULT_BLOCKED / RESULT_REVISED），语义上都是拒答，因此给
+    # 固定安全拒答文案。此前的漏洞是它们落进"未知终态"分支，用户看到的是
+    # "服务暂时不可用"——方向安全但语义错误（问题是被拒答，不是服务坏了）。
+    "refused_blocked": COPY_REFUSED,
+    "refused_revised": COPY_REFUSED,
     "escalated_to_human": COPY_ESCALATED,
     "cancelled": COPY_CANCELLED,
     "deadline_exceeded": COPY_TIMEOUT,
 }
+
+#: The terminal ``run.completed`` pairs the REAL server produces. ``status`` is
+#: derived server-side from the committed state (``state_event_data`` refuses a
+#: caller-supplied status) and ``result`` is the executor's fixed marker:
+#
+#     COMPLETED + answered            HANDOFF + escalated_to_human
+#     FAILED    + refused_no_answer   FAILED  + refused_blocked
+#     FAILED    + refused_revised     FAILED  + deadline_exceeded
+#
+# A ``status``/``result`` combination outside this table cannot come from the
+# server, so it is treated as a protocol anomaly and fails closed — including
+# the contradictory ``{"status": "failed", "result": "answered"}``.
+_TERMINAL_PAIRS: dict[str, str] = {
+    "answered": "completed",
+    "escalated_to_human": "handoff",
+    "refused_no_answer": "failed",
+    "refused_blocked": "failed",
+    "refused_revised": "failed",
+    "deadline_exceeded": "failed",
+}
+
+#: A CANCELLED run carries NO result on the wire: ``_cancel_record`` commits
+#: ``RunState.CANCELLED`` with no data, so the derived payload is exactly
+#: ``{"status": "cancelled"}``. Accepting precisely that pair keeps the cancel
+#: path honest instead of inventing a result the server never sends.
+_CANCELLED_WITHOUT_RESULT = "cancelled"
+
+
+def _terminal_result(business: dict[str, Any]) -> str | None:
+    """Map a real ``run.completed`` payload to the adapter's terminal key.
+
+    Returns ``None`` — meaning "fail closed" — for anything the server cannot
+    produce: a missing ``status``, an unknown ``result``, or a pair that
+    contradicts itself. Note it never *guesses*: an absent ``result`` is only
+    legal for the one status the server sends without one.
+    """
+    status = business.get("status")
+    result = business.get("result")
+    if result is None:
+        return (
+            _CANCELLED_WITHOUT_RESULT if status == _CANCELLED_WITHOUT_RESULT else None
+        )
+    if not isinstance(result, str) or not isinstance(status, str):
+        return None
+    if _TERMINAL_PAIRS.get(result) != status:
+        return None
+    return result
 
 
 class VoiceAgentConfigError(RuntimeError):
@@ -637,6 +702,7 @@ class _CollectState:
     """
 
     __slots__ = (
+        "_answer_sealed",
         "_expected",
         "_next_seq",
         "failed",
@@ -650,6 +716,9 @@ class _CollectState:
         self.parser = SseFrameParser()
         self.parts: list[str] = []
         self.verified = False
+        #: set by a legal ``answer.completed``: the answer is final, and any
+        #: further answer-layer frame is a protocol anomaly (see ``apply``).
+        self._answer_sealed = False
         self.terminal: str | None = None
         self.failed = False
         # 本轮期望身份：租户/设备/会话来自 Session 响应，run 来自 Run 响应。
@@ -698,17 +767,29 @@ class _CollectState:
 
         business = envelope.data
         if event == "answer.delta":
+            if self._answer_sealed:
+                # 封口之后又来内容：协议异常。失败关闭，**不交付已缓存的文本**
+                # （服务端在 answer.completed 之后会原子地拒绝任何 answer 事件，
+                # 所以这不是"正常服务端会发的东西"）。
+                self.failed = True
+                return
             delta = business.get("delta")
             if isinstance(delta, str) and delta:
                 self.parts.append(delta)
         elif event == "answer.completed":
+            if self._answer_sealed:
+                self.failed = True  # 重复封口：同样是协议异常
+                return
             self.verified = _citations_valid(business.get("citations"))
+            self._answer_sealed = True
         elif event == "run.completed":
-            result = business.get("result")
-            if isinstance(result, str) and result:
-                self.terminal = result
-            else:
+            # 终态必须与真实服务端契约一致（status 由状态派生 + result 固定标记）；
+            # 缺失/非法/自相矛盾一律失败关闭，绝不猜。
+            terminal = _terminal_result(business)
+            if terminal is None:
                 self.failed = True
+            else:
+                self.terminal = terminal
 
     def _bound_to_this_turn(self, envelope: Any, event: str, sse_id: str) -> bool:
         """帧与「本轮身份 + 序号」的绑定判定；任一不吻合返回 False。
