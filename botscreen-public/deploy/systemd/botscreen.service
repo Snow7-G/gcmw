@@ -1,0 +1,29 @@
+[Unit]
+Description=Botscreen packaged Electron UI — framed, closable window
+Documentation=file:@@GCMW_DEPLOY_DIR@@/README.md
+After=qa-server.service network.target
+
+[Service]
+Type=simple
+User=@@GCMW_USER@@
+Environment=HOME=@@GCMW_HOME@@
+Environment=RCPATH=@@GCMW_RCPATH@@
+# DEBUG=1 selects the DEVELOPER window (see src/main/windowMode.ts): framed,
+# closable, not pinned above other windows, no refocus-on-blur. Leaving DEBUG
+# unset selects the kiosk window (fullscreen, frameless, close swallowed).
+# The requirement here is a window the operator can close, so DEBUG is pinned.
+Environment=DEBUG=1
+WorkingDirectory=@@GCMW_RELEASE_DIR@@
+TimeoutStartSec=180
+# Wait for an X socket before exec'ing — the launcher then resolves WHICH display
+# belongs to this user instead of hardcoding one (see bin/start-botscreen-ui).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ls /tmp/.X11-unix/X* >/dev/null 2>&1 && break; sleep 1; done'
+ExecStart=@@GCMW_DEPLOY_DIR@@/bin/start-botscreen-ui
+# A user closing the window is a CLEAN exit (code 0). `on-failure` therefore
+# does NOT respawn it — `always` would pop the window back up, which is exactly
+# the behaviour this template must avoid.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target

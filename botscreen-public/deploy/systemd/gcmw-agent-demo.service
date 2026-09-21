@@ -1,0 +1,24 @@
+[Unit]
+Description=GCMW pinned local demo Agent API (loopback only)
+Documentation=file:@@GCMW_DEPLOY_DIR@@/README.md
+After=network.target
+
+[Service]
+Type=simple
+# Keep this a USER unit: the demo Agent API is part of the operator's session,
+# not a system-wide service, and it must not be startable as root.
+WorkingDirectory=@@GCMW_SERVER_DIR@@
+# Optional: with no file the API runs the offline MockProvider. Create the file
+# only to move to a real model (see config/demo-agent-api.env.example).
+EnvironmentFile=-@@GCMW_CONFIG_DIR@@/demo-agent-api.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@@GCMW_VENV_PYTHON@@ @@GCMW_DEPLOY_DIR@@/bin/run-demo-agent-api.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
