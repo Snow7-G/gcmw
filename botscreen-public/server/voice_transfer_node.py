@@ -15,7 +15,7 @@ import time
 
 import requests
 import rospy
-from std_msgs.msg import String, Int8
+from std_msgs.msg import Int8, String
 
 API_URL = "http://127.0.0.1:8000"
 
@@ -30,7 +30,7 @@ POLL_INTERVAL = 0.5  # 轮询间隔（秒）
 
 _last_triggered = False
 _wakeup_pub = None
-_hw_woken = False       # 是否已由硬件唤醒（防止重复通知）
+_hw_woken = False  # 是否已由硬件唤醒（防止重复通知）
 
 
 def poll_mic_status():
@@ -56,7 +56,7 @@ def poll_mic_status():
 
         except requests.exceptions.ConnectionError:
             rospy.logwarn_throttle(30, "[MIC] 无法连接后端，请确认 qa_server.py 已启动")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — 常驻轮询线程必须存活，异常只降级为告警
             rospy.logwarn_throttle(30, "[MIC] 轮询异常: %s", e)
 
         time.sleep(POLL_INTERVAL)
@@ -73,29 +73,33 @@ def voice_callback(msg: String) -> None:
 
     # 回传给后端（供前端轮询获取 ASR 文字 + SSE 推送 mic_status 事件）
     try:
-        requests.post(f"{API_URL}/mic/notify_asr",
-                      json={"text": text}, timeout=3)
-    except Exception:
+        requests.post(f"{API_URL}/mic/notify_asr", json={"text": text}, timeout=3)
+    except Exception:  # noqa: BLE001, S110 — 回传失败不影响问答主链，静默是设计
         pass
 
     # 发送给问答后端
     try:
-        res = requests.post(f"{API_URL}/chat",
-                            json={"question": text}, timeout=VOICE_CHAT_TIMEOUT_S)
+        res = requests.post(
+            f"{API_URL}/chat", json={"question": text}, timeout=VOICE_CHAT_TIMEOUT_S
+        )
         res.raise_for_status()
         data = res.json()
         answer = data.get("robot_answer", "")
         source = data.get("source", "unknown")
         label = (
-            "本地知识库" if source == "kb" else
-            ("DeepSeek" if source == "deepseek" else
-             ("安全Agent" if source == "agent" else "错误"))
+            "本地知识库"
+            if source == "kb"
+            else (
+                "DeepSeek"
+                if source == "deepseek"
+                else ("安全Agent" if source == "agent" else "错误")
+            )
         )
         rospy.loginfo("回复 [%s]: %s", label, answer)
         print(f"\n问题: {text}\n来源: {label}\n回答: {answer}\n")
     except requests.exceptions.ConnectionError:
         rospy.logerr("无法连接后端 (%s)，请确认 qa_server.py 已启动", API_URL)
-    except Exception as err:
+    except Exception as err:  # noqa: BLE001 — 语音回调不得因单次请求异常中断
         rospy.logerr("请求失败: %s", str(err))
 
     # 本轮结束，重置硬件唤醒标记
@@ -110,7 +114,7 @@ def awake_flag_callback(msg: Int8) -> None:
         rospy.loginfo("[MIC] 检测到硬件语音唤醒（小微小微）→ 通知前端显示聆听")
         try:
             requests.post(f"{API_URL}/mic/hw_wakeup", timeout=2)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110 — 通知前端失败无需惊动用户
             pass
 
 

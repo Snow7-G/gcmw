@@ -137,20 +137,87 @@ def agent_config() -> VoiceAgentConfig:
     )
 
 
-def make_client(
-    chunks: list[bytes], run_status: int = 200
-) -> tuple[VoiceAgentClient, StubHttp]:
-    http = StubHttp()
-    http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
-    http.add_route("POST", "/agent/runs", StubResponse(run_status, {"run_id": "r-1"}))
-    http.add_route("GET", "/events", StubResponse(200, chunks=chunks))
-    return VoiceAgentClient(agent_config(), http=http), http
+#: 本轮固定身份。测试桩 Session 响应授予它，真实信封必须与之一致才被接受。
+TENANT_ID = "t1"
+DEVICE_ID = "d1"
+SESSION_ID = "s-1"
+RUN_ID = "r-1"
+
+#: 事件 → 层级（与服务端 EVENT_LAYER_MAP 一致；信封校验会强制）
+LAYER_FOR_EVENT = {
+    "run.accepted": "process",
+    "process.status": "process",
+    "evidence.found": "process",
+    "reflection.result": "process",
+    "heartbeat": "process",
+    "run.completed": "process",
+    "mic_status": "process",
+    "answer.delta": "answer",
+    "answer.completed": "answer",
+}
 
 
-def frame_bytes(seq: int, event: str, business: dict[str, Any]) -> bytes:
+def session_payload(session_id: str = SESSION_ID) -> dict[str, Any]:
+    """真实 SessionResponse：身份三元组齐全（缺一项即视为畸形响应）。"""
+    return {
+        "session_id": session_id,
+        "tenant_id": TENANT_ID,
+        "device_id": DEVICE_ID,
+    }
+
+
+def envelope(
+    seq: int,
+    event: str,
+    data: dict[str, Any],
+    *,
+    tenant_id: str = TENANT_ID,
+    device_id: str = DEVICE_ID,
+    session_id: str = SESSION_ID,
+    run_id: str = RUN_ID,
+    layer: str | None = None,
+    protocol_version: str = "1.0",
+) -> dict[str, Any]:
+    """完整 #30 ``SSEEvent`` 信封（与服务端 ``frame()`` 输出同形）。
+
+    全部字段都可覆写，反例测试据此构造"别的 run / 外层内层不一致 / 错误版本"
+    这类真实协议违规——信封是完整真身，不再有 ``{"data": ...}`` 这种只喂内层的
+    假信封（那正是此前把绑定缺口藏起来的写法）。
+    """
+    return {
+        "protocol_version": protocol_version,
+        "seq": seq,
+        "tenant_id": tenant_id,
+        "device_id": device_id,
+        "session_id": session_id,
+        "run_id": run_id,
+        "layer": layer if layer is not None else LAYER_FOR_EVENT[event],
+        "event": event,
+        "data": data,
+        "timestamp": "2026-09-21T00:00:00+00:00",
+    }
+
+
+def frame_bytes(
+    seq: int,
+    event: str,
+    business: dict[str, Any],
+    *,
+    payload: dict[str, Any] | None = None,
+    sse_id: str | None = None,
+    outer_event: str | None = None,
+) -> bytes:
+    """真实 SSE 帧：``id: {seq}`` + 完整信封 + ``event:`` 外层名。
+
+    ``payload`` / ``sse_id`` / ``outer_event`` 仅用于构造反例（信封本身、SSE
+    ``id`` 与最外层事件名三者可以各自被"篡改"）。
+    """
+    body = payload if payload is not None else envelope(seq, event, business)
+    id_text = str(seq) if sse_id is None else sse_id
+    name = event if outer_event is None else outer_event
     return (
-        f"id: {seq}\nevent: {event}\n"
-        f"data: {json.dumps({'data': business}, ensure_ascii=False)}\n\n"
+        f"id: {id_text}\nevent: {name}\n"
+        f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
     ).encode()
 
 
@@ -158,9 +225,34 @@ def good_answer_stream() -> list[bytes]:
     return [
         frame_bytes(1, "run.accepted", {}),
         frame_bytes(2, "answer.delta", {"delta": "眼部不适需及时就诊"}),
-        frame_bytes(3, "answer.completed", {"citations": [_VALID_CITATION]}),
+        frame_bytes(
+            3,
+            "answer.completed",
+            {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+        ),
         frame_bytes(4, "run.completed", {"status": "COMPLETED", "result": "answered"}),
     ]
+
+
+def stream_error_bytes(code: str = "E_INTERNAL_UNKNOWN") -> bytes:
+    """真实传输层故障帧：``ErrorEnvelope`` 且**没有** ``id``。
+
+    服务端 ``stream_error_frame()`` 刻意不给它 ``id``（失败不得看起来像进度），
+    所以它绝不能走 ``frame_bytes``——那条路会伪造出一个带 id + SSEEvent 信封的
+    帧，既不是真实协议，也会把"缺 id 的故障帧必须失败关闭"这条覆盖掉。
+    """
+    body = {"code": code, "request_id": "req-1", "trace_id": "trace-1"}
+    return f"event: stream.error\ndata: {json.dumps(body, ensure_ascii=False)}\n\n".encode()
+
+
+def make_client(
+    chunks: list[bytes], run_status: int = 200
+) -> tuple[VoiceAgentClient, StubHttp]:
+    http = StubHttp()
+    http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
+    http.add_route("POST", "/agent/runs", StubResponse(run_status, {"run_id": RUN_ID}))
+    http.add_route("GET", "/events", StubResponse(200, chunks=chunks))
+    return VoiceAgentClient(agent_config(), http=http), http
 
 
 def set_budget(monkeypatch: pytest.MonkeyPatch, seconds: float) -> None:
@@ -306,16 +398,19 @@ class TestClientDeliveryGate:
         assert source == "agent" and answer == "眼部不适需及时就诊"
 
     def test_utf8_multibyte_split_across_chunks(self):
-        text = 'id: 1\nevent: answer.delta\ndata: {"data":{"delta": "眼睛"}}\n\n'
-        tail = (
-            'id: 2\nevent: answer.completed\ndata: {"data":{"citations":['
-            + json.dumps(_VALID_CITATION)
-            + "]}}\n\n"
-            'id: 3\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
+        stream = b"".join(
+            [
+                frame_bytes(1, "answer.delta", {"delta": "眼睛"}),
+                frame_bytes(
+                    2,
+                    "answer.completed",
+                    {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+                ),
+                frame_bytes(3, "run.completed", {"result": "answered"}),
+            ]
         )
-        raw = text.encode("utf-8")
-        cut = raw.index("眼".encode()) + 1  # 眼 的首字节后切断
-        client, _ = make_client([raw[:cut], raw[cut:] + tail.encode("utf-8")])
+        cut = stream.index("眼".encode()) + 1  # 眼 的首字节后切断
+        client, _ = make_client([stream[:cut], stream[cut:]])
         answer, source = client.ask("q")
         assert source == "agent" and answer == "眼睛"
 
@@ -323,7 +418,11 @@ class TestClientDeliveryGate:
         chunks = [
             frame_bytes(1, "answer.delta", {"delta": "先"}),
             frame_bytes(2, "answer.delta", {"delta": "后"}),
-            frame_bytes(3, "answer.completed", {"citations": [_VALID_CITATION]}),
+            frame_bytes(
+                3,
+                "answer.completed",
+                {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+            ),
             frame_bytes(4, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
@@ -333,7 +432,11 @@ class TestClientDeliveryGate:
     def test_answered_without_citations_rejected(self):
         chunks = [
             frame_bytes(1, "answer.delta", {"delta": "答案"}),
-            frame_bytes(2, "answer.completed", {"citations": []}),
+            frame_bytes(
+                2,
+                "answer.completed",
+                {"citations": [], "content_origin": "approved_faq"},
+            ),
             frame_bytes(3, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
@@ -348,7 +451,11 @@ class TestClientDeliveryGate:
         }
         chunks = [
             frame_bytes(1, "answer.delta", {"delta": "答案"}),
-            frame_bytes(2, "answer.completed", {"citations": [bad]}),
+            frame_bytes(
+                2,
+                "answer.completed",
+                {"citations": [bad], "content_origin": "approved_faq"},
+            ),
             frame_bytes(3, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
@@ -363,7 +470,11 @@ class TestClientDeliveryGate:
             "content_hash": hash_value,
         }
         chunks = [
-            frame_bytes(1, "answer.completed", {"citations": [bad]}),
+            frame_bytes(
+                1,
+                "answer.completed",
+                {"citations": [bad], "content_origin": "approved_faq"},
+            ),
             frame_bytes(2, "run.completed", {"result": "answered"}),
         ]
         client, _ = make_client(chunks)
@@ -400,7 +511,7 @@ class TestClientDeliveryGate:
         assert source == "agent" and answer == vaa.COPY_TIMEOUT
 
     def test_stream_error_fails_closed(self):
-        client, _ = make_client([frame_bytes(1, "stream.error", {})])
+        client, _ = make_client([stream_error_bytes()])
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
 
@@ -423,7 +534,11 @@ class TestClientDeliveryGate:
         chunks = [
             frame_bytes(1, "run.completed", {"result": "refused_no_answer"}),
             frame_bytes(2, "answer.delta", {"delta": "迟到内容"}),
-            frame_bytes(3, "answer.completed", {"citations": [_VALID_CITATION]}),
+            frame_bytes(
+                3,
+                "answer.completed",
+                {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+            ),
         ]
         client, _ = make_client(chunks)
         answer, source = client.ask("q")
@@ -432,42 +547,60 @@ class TestClientDeliveryGate:
     def test_partial_answer_discarded_on_failure(self):
         chunks = [
             frame_bytes(1, "answer.delta", {"delta": "半截"}),
-            frame_bytes(2, "stream.error", {}),
+            stream_error_bytes(),
         ]
         client, _ = make_client(chunks)
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
 
     def test_crlf_and_keepalive_handled(self):
-        raw = (
-            ": keep-alive\r\n\r\n"
-            'id: 1\r\nevent: answer.delta\r\ndata: {"data":{"delta": "你好"}}\r\n\r\n'
-            'id: 2\nevent: answer.completed\ndata: {"data":{"citations":['
-            + json.dumps(_VALID_CITATION)
-            + "]}}\n\n"
-            'id: 3\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
+        # 真实帧 + CRLF 折行 + keep-alive 注释帧：解析器在拼接后归一化 \r\n
+        raw = b"".join(
+            [
+                b": keep-alive\r\n\r\n",
+                frame_bytes(1, "answer.delta", {"delta": "你好"}).replace(
+                    b"\n", b"\r\n"
+                ),
+                frame_bytes(
+                    2,
+                    "answer.completed",
+                    {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+                ),
+                frame_bytes(3, "run.completed", {"result": "answered"}),
+            ]
         )
-        client, _ = make_client([raw.encode("utf-8")])
+        client, _ = make_client([raw])
         answer, source = client.ask("q")
         assert source == "agent" and answer == "你好"
 
     def test_multiline_data_concatenated(self):
-        raw = (
-            'id: 1\nevent: answer.delta\ndata: {"data":\n'
-            'data: {"delta": "拼接"}}\n\n'
-            'id: 2\nevent: answer.completed\ndata: {"data":{"citations":['
-            + json.dumps(_VALID_CITATION)
-            + "]}}\n\n"
-            'id: 3\nevent: run.completed\ndata: {"data":{"result":"answered"}}\n\n'
+        # 多行 data: 由解析器以 \n 拼接：在 JSON 词法安全处（"data": 之后）切开
+        body = json.dumps(
+            envelope(1, "answer.delta", {"delta": "拼接"}), ensure_ascii=False
         )
-        client, _ = make_client([raw.encode("utf-8")])
+        split_at = body.index('"data":') + len('"data":')
+        raw = b"".join(
+            [
+                (
+                    f"id: 1\nevent: answer.delta\n"
+                    f"data: {body[:split_at]}\ndata: {body[split_at:]}\n\n"
+                ).encode(),
+                frame_bytes(
+                    2,
+                    "answer.completed",
+                    {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+                ),
+                frame_bytes(3, "run.completed", {"result": "answered"}),
+            ]
+        )
+        client, _ = make_client([raw])
         answer, source = client.ask("q")
         assert source == "agent" and answer == "拼接"
 
     def test_network_failure_cancels_run(self):
         # sessions/runs 正常创建，events 阶段网络故障 → best-effort 取消 run
         http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
 
         class FlakyStream:
@@ -492,6 +625,147 @@ class TestClientDeliveryGate:
         assert source == "error" and answer == COPY_UNAVAILABLE
 
 
+# ============ P1（终审第五轮）：SSE 帧绑定本轮身份与序号 ============
+
+
+def _good_payloads() -> list[tuple[int, str, dict[str, Any]]]:
+    """一轮流内部的 (seq, event, data) 序列（终态为 answered）。"""
+    return [
+        (1, "run.accepted", {}),
+        (2, "answer.delta", {"delta": "答案"}),
+        (
+            3,
+            "answer.completed",
+            {"citations": [_VALID_CITATION], "content_origin": "approved_faq"},
+        ),
+        (4, "run.completed", {"result": "answered"}),
+    ]
+
+
+def stream_with(**over: Any) -> list[bytes]:
+    """把覆写注入每一帧的信封（用于构造身份/版本/层级类反例）。"""
+    out: list[bytes] = []
+    for seq, event, data in _good_payloads():
+        out.append(
+            frame_bytes(seq, event, data, payload=envelope(seq, event, data, **over))
+        )
+    return out
+
+
+class TestStreamBinding:
+    """每一帧都必须绑定「本轮身份 + 序号连续性」，任一不吻合立即失败关闭。
+
+    这是终审实测缺口的封堵：此前状态机只读外层 ``event`` 与内层 ``data``，
+    一个伪造成 ``other-run`` 的完整信封会被照单全收并交付 ``answered``。
+    """
+
+    def fails_closed(self, chunks: list[bytes]) -> StubHttp:
+        client, http = make_client(chunks)
+        answer, source = client.ask("q")
+        assert source == "error", "越权/畸形帧绝不能被交付"
+        assert answer == COPY_UNAVAILABLE
+        return http
+
+    def test_well_bound_stream_still_delivers(self):
+        # 正对照：身份与序号全部吻合时照常交付（严格化不能打死正常链路）
+        client, _ = make_client(stream_with())
+        answer, source = client.ask("q")
+        assert source == "agent" and answer == "答案"
+
+    @pytest.mark.parametrize(
+        "over",
+        [
+            {"run_id": "other-run"},
+            {"session_id": "other-session"},
+            {"device_id": "other-device"},
+            {"tenant_id": "other-tenant"},
+        ],
+    )
+    def test_foreign_identity_envelope_rejected(self, over):
+        self.fails_closed(stream_with(**over))
+
+    def test_foreign_run_injected_mid_stream_rejected(self):
+        # 中途混入别的 run 的帧：不得被当成本轮进度
+        chunks = [
+            frame_bytes(1, "answer.delta", {"delta": "自己的"}),
+            frame_bytes(
+                2,
+                "answer.delta",
+                {"delta": "别人的"},
+                payload=envelope(
+                    2, "answer.delta", {"delta": "别人的"}, run_id="other-run"
+                ),
+            ),
+        ]
+        self.fails_closed(chunks)
+
+    def test_outer_inner_event_mismatch_rejected(self):
+        self.fails_closed(
+            [frame_bytes(1, "run.accepted", {}, outer_event="answer.delta")]
+        )
+
+    @pytest.mark.parametrize("bad_id", ["3", "-1", "abc", "", "1.0", "+1"])
+    def test_id_must_be_positive_decimal_equal_to_seq(self, bad_id):
+        self.fails_closed([frame_bytes(1, "run.accepted", {}, sse_id=bad_id)])
+
+    def test_duplicate_seq_rejected(self):
+        self.fails_closed(
+            [
+                frame_bytes(1, "answer.delta", {"delta": "一"}),
+                frame_bytes(1, "answer.delta", {"delta": "二"}),
+            ]
+        )
+
+    def test_seq_rewind_rejected(self):
+        self.fails_closed(
+            [
+                frame_bytes(1, "answer.delta", {"delta": "一"}),
+                frame_bytes(2, "answer.delta", {"delta": "二"}),
+                frame_bytes(1, "answer.delta", {"delta": "三"}),
+            ]
+        )
+
+    def test_seq_gap_rejected(self):
+        self.fails_closed(
+            [
+                frame_bytes(1, "answer.delta", {"delta": "一"}),
+                frame_bytes(3, "answer.delta", {"delta": "三"}),
+            ]
+        )
+
+    def test_stream_must_start_at_seq_one(self):
+        self.fails_closed([frame_bytes(2, "run.accepted", {})])
+
+    def test_wrong_protocol_version_rejected(self):
+        self.fails_closed(stream_with(protocol_version="2.0"))
+
+    def test_wrong_layer_rejected(self):
+        # answer.completed 只能出现在 answer 层：层级错配由契约拦下
+        self.fails_closed(stream_with(layer="process"))
+
+    def test_envelope_missing_identity_fields_rejected(self):
+        payload = envelope(1, "answer.delta", {"delta": "答案"})
+        payload.pop("tenant_id")
+        self.fails_closed([frame_bytes(1, "answer.delta", {}, payload=payload)])
+
+    def test_session_response_without_identity_triple_rejected(self):
+        # 身份不全的 Session 响应必须在建 Run / 订阅流之前被拒绝
+        http = StubHttp()
+        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": RUN_ID}))
+        http.add_route("GET", "/events", StubResponse(200, chunks=stream_with()))
+        client = VoiceAgentClient(agent_config(), http=http)
+        answer, source = client.ask("q")
+        assert source == "error" and answer == COPY_UNAVAILABLE
+        # 没有建 Run、也没有订阅事件流（只有 Session 请求与失败清理）
+        assert not any("/agent/runs" in c["url"] for c in http.calls)
+        assert not any(c["method"] == "GET" for c in http.calls)
+
+    def test_transport_error_frame_without_id_fails_closed(self):
+        # stream.error 是 ErrorEnvelope、刻意没有 id：仍然只能失败关闭
+        self.fails_closed([stream_error_bytes()])
+
+
 class TestCredentialHygiene:
     def test_credential_only_in_authorization_header(self):
         client, http = make_client(good_answer_stream())
@@ -510,7 +784,7 @@ class TestCredentialHygiene:
         assert CRED not in answer
         # 强制各故障路径，断言返回文案不含凭据
         for chunks in (
-            [frame_bytes(1, "stream.error", {})],
+            [stream_error_bytes()],
             [b"event: run.completed\ndata: garbage\n\n"],
             good_answer_stream()[:1],
         ):
@@ -539,7 +813,7 @@ class TestSseFrameParser:
         partial = parser.feed(b"\n")  # \r\n 之后还差空行
         assert partial == []
         frames = parser.feed(b"\n")
-        assert frames == [{"event": "a", "data": '{"data":{}}'}]
+        assert frames == [{"event": "a", "id": "", "data": '{"data":{}}'}]
 
     def test_utf8_split_keeps_char_intact(self):
         parser = SseFrameParser()
@@ -552,7 +826,7 @@ class TestSseFrameParser:
         parser = SseFrameParser()
         assert parser.feed(b'event: run.completed\ndata: {"data":{}}\n\n') != []
         assert parser.feed(b'event: x\ndata: {"data":{}}') == []
-        assert parser.flush() == [{"event": "x", "data": '{"data":{}}'}]
+        assert parser.flush() == [{"event": "x", "id": "", "data": '{"data":{}}'}]
 
 
 # ============ /chat 路由接线 ============
@@ -723,7 +997,7 @@ class TestAbsoluteDeadline:
     def test_cancellation_domain_interrupts_blocking_stream(self, monkeypatch):
         set_budget(monkeypatch, 0.05)
         http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
         stream = HangingStreamResponse(
             [b": keep-alive\n\n", b": keep-alive\n\n"], interval=0.2
@@ -769,10 +1043,10 @@ class TestAbsoluteDeadline:
                 except asyncio.CancelledError:
                     self.cancelled += 1
                     raise
-                return StubResponse(201, {"session_id": "s-1"})
+                return StubResponse(201, session_payload())
 
         http = SlowCreateHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         client = VoiceAgentClient(agent_config(), http=http)
         _answer, source = client.ask("q")
         assert source == "error"
@@ -786,10 +1060,31 @@ class TestAbsoluteDeadline:
         )
         assert timeout.read <= 0.1, f"读超时未按剩余预算收缩：{timeout.read}"
 
+    def test_remaining_budget_uses_the_running_loop_clock(self, monkeypatch):
+        """剩余预算必须按**事件循环时钟**计算。
+
+        反例构造：deadline 由被整体平移的 loop 时钟铸出（非默认 loop 上
+        ``loop.time()`` 与 ``time.monotonic()`` 不必同纪元）。若实现用
+        ``time.monotonic()`` 去减，剩余量会被算成"平移量 + 预算"这一巨大值，
+        于是 connect/read 又回到满额 5s/30s —— 本用例正是钉住这个回归。
+        """
+
+        class ShiftedLoop:
+            """时间整体前移 10000s 的 loop 时钟。"""
+
+            def time(self) -> float:
+                return time.monotonic() + 10_000.0
+
+        shifted = ShiftedLoop()
+        monkeypatch.setattr(vaa.asyncio, "get_running_loop", lambda: shifted)
+        timeout = VoiceAgentClient._remaining_timeout(shifted.time() + 0.5)
+        assert timeout.connect <= 0.5, f"connect 未按 loop 时钟收缩：{timeout.connect}"
+        assert timeout.read <= 0.5, f"read 未按 loop 时钟收缩：{timeout.read}"
+
     def test_total_turn_elapsed_is_bounded_on_failure_paths(self, monkeypatch):
         set_budget(monkeypatch, 0.05)
         http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
         http.add_route(
             "GET", "/events", HangingStreamResponse([b": keep-alive\n\n"] * 5, 0.2)
@@ -836,14 +1131,14 @@ class TestBoundedCleanup:
         assert deletes == []
 
     def test_failure_cancels_run_and_deletes_session(self):
-        client, http = make_client([frame_bytes(1, "stream.error", {})])
+        client, http = make_client([stream_error_bytes()])
         client.ask("q")
         deletes = [c["url"] for c in http.calls if c["method"] == "DELETE"]
         assert any("/agent/runs/" in u for u in deletes)
         assert any("/sessions/" in u for u in deletes)
 
     def test_cleanup_requests_use_bounded_short_grace(self):
-        client, http = make_client([frame_bytes(1, "stream.error", {})])
+        client, http = make_client([stream_error_bytes()])
         client.ask("q")
         for c in http.calls:
             if c["method"] == "DELETE":
@@ -853,12 +1148,12 @@ class TestBoundedCleanup:
 
     def test_cleanup_non_2xx_does_not_change_return(self):
         http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
         http.add_route(
             "GET",
             "/events",
-            StubResponse(200, chunks=[frame_bytes(1, "stream.error", {})]),
+            StubResponse(200, chunks=[stream_error_bytes()]),
         )
         http.add_route("DELETE", "/sessions", StubResponse(500))
         http.add_route("DELETE", "/agent/runs", StubResponse(500))
@@ -868,12 +1163,12 @@ class TestBoundedCleanup:
 
     def test_cleanup_exception_does_not_change_return(self):
         http = StubHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
         http.add_route(
             "GET",
             "/events",
-            StubResponse(200, chunks=[frame_bytes(1, "stream.error", {})]),
+            StubResponse(200, chunks=[stream_error_bytes()]),
         )
 
         class ExplodingDelete:
@@ -906,12 +1201,12 @@ class TestBoundedCleanup:
                 return StubResponse(204)  # pragma: no cover
 
         http = HangingDeleteHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         http.add_route("POST", "/agent/runs", StubResponse(200, {"run_id": "r-1"}))
         http.add_route(
             "GET",
             "/events",
-            StubResponse(200, chunks=[frame_bytes(1, "stream.error", {})]),
+            StubResponse(200, chunks=[stream_error_bytes()]),
         )
         client = VoiceAgentClient(agent_config(), http=http)
         t0 = time.monotonic()
@@ -951,7 +1246,7 @@ class ReconcileSessionHttp(StubHttp):
                     self.cancelled += 1
                     raise
             # 首次（被取消）与重放都返回同一 Session（服务端幂等契约）
-            return StubResponse(201, {"session_id": "s-1"})
+            return StubResponse(201, session_payload())
         return await super().post(url, **kwargs)
 
 
@@ -1013,7 +1308,7 @@ class TestLateSideEffectsAndReconciliation:
         删除 Session 级联回收可能已提交的 Run；零残留。"""
         set_budget(monkeypatch, 0.15)
         http = HangingRunHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         client = VoiceAgentClient(agent_config(), http=http)
         answer, source = client.ask("q")
         assert source == "error" and answer == COPY_UNAVAILABLE
@@ -1095,7 +1390,7 @@ class TestLateSideEffectsAndReconciliation:
         assert not hasattr(vaa, "_EXECUTOR"), "模块级线程池必须已删除"
         set_budget(monkeypatch, 0.1)
         http = HangingRunHttp()
-        http.add_route("POST", "/sessions", StubResponse(201, {"session_id": "s-1"}))
+        http.add_route("POST", "/sessions", StubResponse(201, session_payload()))
         client = VoiceAgentClient(agent_config(), http=http)
         _answer, source = client.ask("q")
         assert source == "error"

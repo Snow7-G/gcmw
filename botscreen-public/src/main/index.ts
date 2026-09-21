@@ -9,6 +9,7 @@ import fs from 'node:fs'
 import { Readable } from 'node:stream'
 import { isTrustedAppUrl, registerTrustedIpc } from './securityGuards'
 import { resolveRange } from './range'
+import { resolveWindowMode } from './windowMode'
 
 let exitArmed = false
 let exitInputBuffer = ''
@@ -27,10 +28,15 @@ const isTrustedUrl = (url: string): boolean =>
 // CI smoke mode: dev-only (never in packaged builds, even with the env set).
 const isSmokeRun = !app.isPackaged && process.env.ELECTRON_SMOKE === '1'
 
+// Window locks (kiosk / always-on-top / refocus / block-close) all derive from
+// ONE decision — see windowMode.ts. DEBUG=1 must yield a normal, framed,
+// closable window; every lock is applied only in kiosk mode.
+const windowMode = resolveWindowMode(process.env)
+
 function createWindow(): void {
   // Create the browser window.
   const mainWindow = new BrowserWindow({
-    ...(!process.env.DEBUG
+    ...(windowMode.kiosk
       ? {
           fullscreen: true,
           frame: false,
@@ -52,16 +58,20 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => {
-    mainWindow.setAlwaysOnTop(true, 'screen-saver')
+    if (windowMode.alwaysOnTop) {
+      mainWindow.setAlwaysOnTop(true, 'screen-saver')
+    }
     mainWindow.show()
     mainWindow.focus()
   })
 
-  if (!process.env.DEBUG) {
+  if (windowMode.refocusOnBlur) {
     mainWindow.on('blur', () => {
       mainWindow.focus()
     })
+  }
 
+  if (windowMode.blockClose) {
     mainWindow.on('close', (e) => {
       e.preventDefault()
     })

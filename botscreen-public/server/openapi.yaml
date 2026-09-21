@@ -11,7 +11,7 @@ servers:
 security: []
 tags:
   - name: 问答
-    description: 知识库检索与大模型兜底问答
+    description: 问答入口；回答引擎可为 legacy（KB → 大模型兜底）或 agent（8001 已审核资料 + 引用门槛）
   - name: 麦克风
     description: 前端、语音转发节点与硬件唤醒状态协作
   - name: 实时推送
@@ -23,9 +23,14 @@ paths:
     post:
       tags: [问答]
       summary: 提交问题并获取回答
-      description: 优先检索本地知识库，未命中时调用 DeepSeek，并将回答推送到 SSE 客户端。
+      description: |
+        回答引擎双模式，由 `GCMW_VOICE_ANSWER_BACKEND` 决定；请求/响应结构与旧版逐字一致。
+        - `legacy`（默认）：先检索本地 docx 知识库，未命中该库时调用 DeepSeek。
+        - `agent`：只走新 Agent（Manager → RAG → Verifier，端口 8001），回答必须原句引用已审核资料并带引用编号；
+          任何故障（不可达/超时/证据不足/协议违规）都失败关闭为固定安全文案，**绝不回退** KB 或 DeepSeek。
+        配置非法时服务拒绝启动，不会静默回退 legacy。
       operationId: chatApi
-      x-source-location: server/qa_server.py:485
+      x-source-location: server/qa_server.py:511
       requestBody:
         required: true
         content:
@@ -55,7 +60,7 @@ paths:
       summary: 获取推荐问题
       description: 返回知识库中前 6 个问题。
       operationId: getSuggestions
-      x-source-location: server/qa_server.py:522
+      x-source-location: server/qa_server.py:573
       responses:
         '200':
           description: 推荐问题列表
@@ -70,7 +75,7 @@ paths:
       summary: 手动唤醒麦克风
       description: 前端点击麦克风后设置唤醒标记，并推送 `manual_wakeup` 事件。
       operationId: micWakeup
-      x-source-location: server/qa_server.py:541
+      x-source-location: server/qa_server.py:592
       responses:
         '200':
           description: 唤醒成功
@@ -85,7 +90,7 @@ paths:
       summary: 通知硬件语音唤醒
       description: 语音转发节点检测到唤醒词后调用；若已处于唤醒状态则不重复触发。
       operationId: micHardwareWakeup
-      x-source-location: server/qa_server.py:553
+      x-source-location: server/qa_server.py:604
       responses:
         '200':
           description: 硬件唤醒处理结果
@@ -107,7 +112,7 @@ paths:
       summary: 停止麦克风会话
       description: 清除唤醒状态与最近 ASR 文本，并推送 `mic_stop` 事件。
       operationId: micStop
-      x-source-location: server/qa_server.py:567
+      x-source-location: server/qa_server.py:618
       responses:
         '200':
           description: 停止成功
@@ -122,7 +127,7 @@ paths:
       summary: 查询麦克风状态
       description: 供前端和 ROS/ROS2 语音转发节点轮询唤醒状态及最近 ASR 文本。
       operationId: getMicStatus
-      x-source-location: server/qa_server.py:578
+      x-source-location: server/qa_server.py:629
       responses:
         '200':
           description: 当前麦克风状态
@@ -141,7 +146,7 @@ paths:
       summary: 回传 ASR 识别文本
       description: 语音转发节点收到 ASR 结果后回传文本，并推送 `asr_received` 事件。
       operationId: notifyAsr
-      x-source-location: server/qa_server.py:593
+      x-source-location: server/qa_server.py:644
       requestBody:
         required: true
         content:
@@ -171,7 +176,7 @@ paths:
 
         服务端约每 0.5 秒检查一次新事件。
       operationId: subscribeEvents
-      x-source-location: server/qa_server.py:603
+      x-source-location: server/qa_server.py:654
       responses:
         '200':
           description: SSE 事件流
@@ -209,7 +214,7 @@ paths:
       tags: [系统]
       summary: 服务健康检查
       operationId: healthCheck
-      x-source-location: server/qa_server.py:639
+      x-source-location: server/qa_server.py:690
       responses:
         '200':
           description: 服务、知识库和匹配阈值状态

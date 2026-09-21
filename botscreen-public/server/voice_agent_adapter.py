@@ -16,6 +16,19 @@ Design contract (do not weaken):
   with source_id / knowledge_version / 64-hex lowercase content_hash) +
   ``run.completed`` with ``result == "answered"``. Anything else discards the
   partial answer;
+* every protocol frame is BOUND to this turn before it may advance the state
+  machine. Apart from the transport-level ``stream.error``, a frame must be a
+  complete #30 ``SSEEvent`` envelope validated by ``SSEEvent.model_validate``
+  (protocol_version pinned to 1.0, ``seq >= 1``, non-empty tenant/device/
+  session/run, layer↔event map and the per-event ``data`` key allowlist), and
+  must additionally satisfy: the outer SSE ``event:`` name equals the envelope
+  ``event``; the SSE ``id:`` is a positive integer equal to the envelope
+  ``seq``; tenant, device, session and run all equal the identity the server
+  granted this turn (the Session response is the authority); and ``seq`` starts
+  at 1 and advances by exactly one. A foreign run/session/device/tenant, an
+  outer/inner event mismatch, a duplicate, a rewind, a gap or a malformed
+  ``id`` therefore all fail closed — no partial answer is delivered, the fixed
+  safe copy is returned and the bounded cleanup path runs;
 * the credential lives ONLY in the ``Authorization: Bearer`` header — never in
   URLs, logs, exception texts, or anything this module returns.
 
@@ -72,7 +85,6 @@ import codecs
 import json
 import os
 import re
-import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -102,6 +114,17 @@ VOICE_TURN_TIMEOUT_S = _TOTAL_DEADLINE_S + _CLEANUP_TOTAL_GRACE_S + 5.0
 
 #: 64 位小写十六进制（引用三元组的 content_hash 门槛）
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+#: SSE ``id:`` 必须是纯 ASCII 十进制正整数（服务端写的是 ``id: {seq}``）。
+_SSE_ID_RE = re.compile(r"^[0-9]+$")
+
+#: 传输层故障帧的事件名。它携带的是 ErrorEnvelope 而**不是** SSEEvent，且
+#: 服务端刻意不给它 ``id``（失败不得看起来像进度）——因此它是唯一不按
+#: SSEEvent 解析的帧，但同样必须失败关闭。
+_STREAM_ERROR_EVENT = "stream.error"
+
+#: 新订阅（不带 Last-Event-ID / after_seq）的流必须从 seq=1 开始且逐一递增
+_FIRST_SEQ = 1
 
 #: 固定文案 —— 绝不携带服务端异常原文或凭据
 COPY_REFUSED = "目前没有足够可靠的资料回答这个问题，建议咨询专业人员。"
@@ -179,7 +202,9 @@ class SseFrameParser:
     """增量 SSE 解析：跨 chunk 的多字节 UTF-8、\\n\\n 与 \\r\\n\\r\\n、
     ``:`` 注释行、多行 ``data:``、EOF flush 全部覆盖。
 
-    ``feed(chunk)`` / ``flush()`` 返回完整帧列表（dict，键 event/data）。
+    ``feed(chunk)`` / ``flush()`` 返回完整帧列表（dict，键 event/id/data）。
+    ``id`` 必须保留：它与信封 ``seq`` 的一致性由调用方校验（只保留 ``event``
+    会让一个「信封说是 seq 5、SSE id 说是 seq 9」的帧无法被识破）。
     终态后同一 chunk 内的迟到帧由调用方丢弃——本解析器只负责成帧，不做
     语义拦截。
     """
@@ -218,19 +243,23 @@ class SseFrameParser:
             return None
         data_lines: list[str] = []
         event = ""
+        sse_id = ""
         is_comment = True
         for line in block.split("\n"):
             if line.startswith(":"):
-                continue  # keep-alive 注释
+                continue  # keep-alive 注释（无 id，不参与序号）
             is_comment = False
             if line.startswith("event:"):
                 event = line[len("event:") :].strip()
+            elif line.startswith("id:"):
+                # 保留 SSE id：调用方要求它等于信封 seq 且为十进制正整数
+                sse_id = line[len("id:") :].strip()
             elif line.startswith("data:"):
                 data_lines.append(line[len("data:") :].lstrip(" "))
-            # 其余字段（id:/retry:）与交付无关，忽略
+            # 其余字段（retry:）与交付无关，忽略
         if is_comment:
             return None
-        return {"event": event, "data": "\n".join(data_lines)}
+        return {"event": event, "id": sse_id, "data": "\n".join(data_lines)}
 
 
 # ============ 客户端 ============
@@ -247,6 +276,32 @@ class _TurnState:
     session_sent: bool = False
     #: the Run POST was issued — cascaded by the Session delete
     run_sent: bool = False
+
+
+@dataclass(frozen=True)
+class _SessionIdentity:
+    """本轮 Session 创建响应授予的身份（租户 / 设备 / 会话）。
+
+    这是**本轮唯一可信的身份来源**：客户端从不自行声明身份，只把服务端授予
+    的三元组记下来，作为后续每一个协议帧必须吻合的期望值——这样「别的租户/
+    设备/会话」的帧永远无法冒充本轮的进度。
+    """
+
+    session_id: str
+    tenant_id: str
+    device_id: str
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> _SessionIdentity | None:
+        """从 Session 响应体提取三元组；任一缺失/非字符串/空 → None。"""
+        values = (
+            payload.get("session_id"),
+            payload.get("tenant_id"),
+            payload.get("device_id"),
+        )
+        if not all(isinstance(value, str) and value for value in values):
+            return None
+        return cls(session_id=values[0], tenant_id=values[1], device_id=values[2])
 
 
 class VoiceAgentClient:
@@ -303,15 +358,15 @@ class VoiceAgentClient:
         try:
             try:
                 async with asyncio.timeout_at(deadline):
-                    session_id = await self._create_session(
+                    identity = await self._create_session(
                         client, state, session_key, deadline
                     )
-                    state.session_id = session_id
+                    state.session_id = identity.session_id
                     run_id = await self._create_run(
-                        client, state, session_id, run_key, question, deadline
+                        client, state, identity.session_id, run_key, question, deadline
                     )
                     state.run_id = run_id
-                    answer = await self._collect(client, run_id, deadline)
+                    answer = await self._collect(client, identity, run_id, deadline)
                 reached_terminal = True
                 return answer, "agent"
             except TimeoutError:
@@ -344,9 +399,12 @@ class VoiceAgentClient:
 
     @staticmethod
     def _remaining_timeout(deadline: float) -> httpx.Timeout:
-        # the deadline lives on the loop clock, which on the default event loop
-        # IS time.monotonic() — same epoch, so the subtraction is sound
-        return VoiceAgentClient._httpx_timeout(deadline - time.monotonic())
+        # the deadline is minted on the RUNNING LOOP's clock, so the remaining
+        # budget is measured on that same clock. Nothing here assumes
+        # loop.time() and time.monotonic() share an epoch — on a non-default
+        # event loop they need not.
+        remaining = deadline - asyncio.get_running_loop().time()
+        return VoiceAgentClient._httpx_timeout(remaining)
 
     def _headers(self) -> dict[str, str]:
         # 凭据只出现在这里
@@ -359,7 +417,7 @@ class VoiceAgentClient:
 
     async def _create_session(
         self, client: Any, state: _TurnState, session_key: str, deadline: float
-    ) -> str:
+    ) -> _SessionIdentity:
         state.session_sent = True  # 先置位：请求在途即视为"结果可能已提交"
         try:
             resp = await client.post(
@@ -379,12 +437,17 @@ class VoiceAgentClient:
         if resp.status_code != 201:  # 契约严格锁定：session 创建返回 201
             raise VoiceAgentBackendError(f"session http {resp.status_code}")
         try:
-            session_id = resp.json().get("session_id")
+            payload = resp.json()
         except ValueError as exc:
             raise VoiceAgentBackendError("session malformed json") from exc
-        if not isinstance(session_id, str) or not session_id:
+        if not isinstance(payload, dict):
             raise VoiceAgentBackendError("session malformed payload")
-        return session_id
+        # 服务端授予的身份即本轮期望身份：缺 tenant/device 的响应不可信，
+        # 因为后续每一帧都要靠这三项 + run_id 才能判定"是不是本轮的帧"。
+        identity = _SessionIdentity.from_payload(payload)
+        if identity is None:
+            raise VoiceAgentBackendError("session malformed identity")
+        return identity
 
     async def _create_run(
         self,
@@ -414,9 +477,12 @@ class VoiceAgentClient:
         if resp.status_code != 200:
             raise VoiceAgentBackendError(f"run http {resp.status_code}")
         try:
-            run_id = resp.json().get("run_id")
+            payload = resp.json()
         except ValueError as exc:
             raise VoiceAgentBackendError("run malformed json") from exc
+        if not isinstance(payload, dict):
+            raise VoiceAgentBackendError("run malformed payload")
+        run_id = payload.get("run_id")
         if not isinstance(run_id, str) or not run_id:
             raise VoiceAgentBackendError("run malformed payload")
         return run_id
@@ -494,8 +560,14 @@ class VoiceAgentClient:
 
     # ---------- SSE 收集与交付门槛 ----------
 
-    async def _collect(self, client: Any, run_id: str, deadline: float) -> str:
-        state = _CollectState()
+    async def _collect(
+        self,
+        client: Any,
+        identity: _SessionIdentity,
+        run_id: str,
+        deadline: float,
+    ) -> str:
+        state = _CollectState(identity, run_id)
         try:
             async with client.stream(
                 "GET",
@@ -527,7 +599,8 @@ class VoiceAgentClient:
             raise VoiceAgentBackendError("stream read failed") from exc
 
         if state.failed:
-            raise VoiceAgentBackendError("stream failed (stream.error/malformed)")
+            # 信封校验、身份绑定、序号连续性或 stream.error 任一失败：不交付
+            raise VoiceAgentBackendError("stream failed (envelope/identity/seq)")
         if state.terminal is None:
             # EOF 前没有终态：失败关闭（含"响应提前结束"）
             raise VoiceAgentBackendError("stream ended without terminal")
@@ -544,16 +617,40 @@ class VoiceAgentClient:
 
 
 class _CollectState:
-    """一次 SSE 收集的可变状态机（frame → 状态回写；终态后停止派发）。"""
+    """一次 SSE 收集的可变状态机（frame → 严格校验 → 状态回写）。
 
-    __slots__ = ("failed", "parser", "parts", "terminal", "verified")
+    除传输层 ``stream.error`` 外，每一帧都要通过 :meth:`apply` 的全部绑定判定
+    才能推进状态机：完整 #30 ``SSEEvent`` 信封 → 外层/内层事件名一致 →
+    ``id`` 是正整数且等于信封 ``seq`` → 租户/设备/会话/run 四项等于本轮期望
+    身份 → ``seq`` 从 1 起严格逐一递增。任一项不吻合立即失败关闭，**不交付
+    任何部分答案**。
+    """
 
-    def __init__(self) -> None:
+    __slots__ = (
+        "_expected",
+        "_next_seq",
+        "failed",
+        "parser",
+        "parts",
+        "terminal",
+        "verified",
+    )
+
+    def __init__(self, identity: _SessionIdentity, run_id: str) -> None:
         self.parser = SseFrameParser()
         self.parts: list[str] = []
         self.verified = False
         self.terminal: str | None = None
         self.failed = False
+        # 本轮期望身份：租户/设备/会话来自 Session 响应，run 来自 Run 响应。
+        # 客户端从不自行声明身份，只核对服务端授予的三元组 + run。
+        self._expected = (
+            identity.tenant_id,
+            identity.device_id,
+            identity.session_id,
+            run_id,
+        )
+        self._next_seq = _FIRST_SEQ
 
     def finished(self) -> bool:
         return self.terminal is not None or self.failed
@@ -563,7 +660,14 @@ class _CollectState:
             return  # 终态后同 chunk 的迟到帧：一律丢弃
         event = frame.get("event", "")
         raw = frame.get("data", "")
+        sse_id = frame.get("id", "")
+        if event == _STREAM_ERROR_EVENT:
+            # 传输层 ErrorEnvelope：不是 SSEEvent（服务端也刻意不给它 id，
+            # 失败不得看起来像进度）——但同样只能失败关闭
+            self.failed = True
+            return
         if not raw:
+            self.failed = True  # 无载荷的协议帧不是可验证的进度
             return
         try:
             payload = json.loads(raw)
@@ -573,12 +677,16 @@ class _CollectState:
         if not isinstance(payload, dict):
             self.failed = True
             return
-        business = payload.get("data")
-        if not isinstance(business, dict):
-            # SSEEvent 信封：业务载荷必须位于内层 data
+        envelope = _parse_envelope(payload)
+        if envelope is None:
+            self.failed = True  # 信封不合规（版本/层级/键白名单/身份）→ 失败关闭
+            return
+        if not self._bound_to_this_turn(envelope, event, sse_id):
             self.failed = True
             return
+        self._next_seq += 1
 
+        business = envelope.data
         if event == "answer.delta":
             delta = business.get("delta")
             if isinstance(delta, str) and delta:
@@ -591,8 +699,52 @@ class _CollectState:
                 self.terminal = result
             else:
                 self.failed = True
-        elif event == "stream.error":
-            self.failed = True
+
+    def _bound_to_this_turn(self, envelope: Any, event: str, sse_id: str) -> bool:
+        """帧与「本轮身份 + 序号」的绑定判定；任一不吻合返回 False。
+
+        ``id``/``seq`` 一致之前先查 ``seq`` 连续性：重复、倒退与空洞都会让
+        ``seq != _next_seq``，因此"从 1 开始并逐 1 递增"是被同一条判定强制的。
+        """
+        if envelope.event.value != event:
+            return False  # 外层 SSE 事件名必须等于信封 event
+        seq = envelope.seq
+        if seq != self._next_seq:
+            return False  # 重复 / 倒退 / 空洞 / 非 1 起始
+        if not _SSE_ID_RE.match(sse_id) or int(sse_id) != seq:
+            return False  # SSE id 必须是十进制正整数且等于信封 seq
+        actual = (
+            envelope.tenant_id,
+            envelope.device_id,
+            envelope.session_id,
+            envelope.run_id,
+        )
+        return actual == self._expected
+
+
+def _parse_envelope(payload: dict[str, Any]) -> Any | None:
+    """用服务端同一份契约模型严格校验完整 #30 ``SSEEvent`` 信封。
+
+    返回校验通过的 ``SSEEvent``；不合规返回 ``None``（调用方据此失败关闭）。
+    ``SSEEvent`` 自身已经强制：``protocol_version`` 必须等于 ``"1.0"``、
+    ``seq >= 1``、租户/设备/会话/run 非空且长度合规、``layer`` 必须落在该事件的
+    层级映射内、``data`` 键必须命中该事件的白名单且不含禁止键。校验失败时模型
+    配置了 ``hide_input_in_errors``，载荷值不会被带进异常文本；本函数也绝不把
+    异常向上抛，失败原因统一由调用方归一为固定文案。
+
+    惰性导入的原因：ROS 传送节点只 ``from voice_agent_adapter import
+    VOICE_TURN_TIMEOUT_S``，在那种独立环境里不该因为缺 pydantic 而导入失败；
+    而真要校验信封时（agent 模式的 8000 进程内）契约必然可用——拿不到契约就
+    等于无法验证，只能失败关闭。
+    """
+    try:
+        from app.contracts.events import SSEEvent
+    except Exception:  # noqa: BLE001 — 契约不可用 = 无法验证 = 失败关闭
+        return None
+    try:
+        return SSEEvent.model_validate(payload)
+    except Exception:  # noqa: BLE001 — 校验失败：只失败关闭，绝不回声输入
+        return None
 
 
 def _citations_valid(citations: Any) -> bool:

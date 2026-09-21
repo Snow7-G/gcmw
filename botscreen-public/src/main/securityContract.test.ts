@@ -140,6 +140,42 @@ describe('trusted-origin wiring contract', () => {
   })
 })
 
+/**
+ * DEBUG=1 must produce a normal window: framed, closable, not pinned, not
+ * refocusing. The failure mode these tests exist for is precisely the one we
+ * hit in deployment — a lock applied *outside* the kiosk branch (the old
+ * `setAlwaysOnTop` ran unconditionally), or a lock that quietly lost its guard.
+ */
+describe('window mode contract (kiosk lock vs closable developer window)', () => {
+  it('derives every lock from the single resolved mode', () => {
+    expect(mainSource).toContain("import { resolveWindowMode } from './windowMode'")
+    expect(mainSource).toMatch(/const windowMode = resolveWindowMode\(process\.env\)/)
+    expect(mainSource).toMatch(/windowMode\.kiosk\s*\?/)
+  })
+
+  it('keeps always-on-top behind the mode flag', () => {
+    expect(mainSource).toMatch(
+      /if \(windowMode\.alwaysOnTop\) \{\s*\n\s*mainWindow\.setAlwaysOnTop\(/
+    )
+  })
+
+  it('keeps blur-refocus and close-blocking behind the mode flags', () => {
+    const blurGuard = /windowMode\.refocusOnBlur\) \{\s*\n\s*mainWindow\.on\('blur'/
+    const closeGuard = /windowMode\.blockClose\) \{\s*\n\s*mainWindow\.on\('close'/
+    expect(mainSource).toMatch(blurGuard)
+    expect(mainSource).toMatch(closeGuard)
+  })
+
+  it('no window lock is decided by an inline DEBUG check any more', () => {
+    expect(mainSource).not.toMatch(/process\.env\.DEBUG\s*\?/)
+    expect(mainSource).not.toMatch(/if \(!process\.env\.DEBUG\)/)
+  })
+
+  it('keeps packaged devTools disabled', () => {
+    expect(mainSource).toMatch(/devTools:\s*!app\.isPackaged/)
+  })
+})
+
 describe('smoke probe contract', () => {
   it('is gated to dev only — packaged builds can never enable it', () => {
     expect(mainSource).toMatch(
