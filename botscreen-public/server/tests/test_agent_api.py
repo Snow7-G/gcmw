@@ -1370,9 +1370,14 @@ class TestExpiryReclaimIsSharedAndOrdered:
             self._assert_durable_gone(repository, original, run)
             assert h.service.sessions.keys() == {replay.json()["session_id"]}
 
-    def test_expired_session_is_never_served_even_when_reclaim_failed(self):
-        """故障期间会话虽然还在内存里，但它**已经过期**：任何读/写都要拒绝，
-        不能因为"没清干净"就继续服务。"""
+    def test_expired_session_is_never_served_on_any_path(self):
+        """正常过期（未注入故障）：会话已过期，三条读/写入口一律 404，且都被
+        彻底回收 —— 内存与仓储一致。
+
+        本用例刻意关闭故障注入，证明的是「过期即拒绝服务」；存储故障下
+        「记录与内存索引都保留、恢复后再清完」由参数化用例
+        ``test_storage_fault_keeps_records_and_next_sweep_finishes`` 覆盖。
+        """
         repository = UnavailableOnceRepository()
         with running_app(repository=repository) as h:
             session = new_session(h)

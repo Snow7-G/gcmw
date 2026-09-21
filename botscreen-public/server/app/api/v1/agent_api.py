@@ -292,13 +292,15 @@ class RunAdmissionService:
         2. only then ``_purge_session`` — session, runs, both idempotency tables
            and the executor tasks of this session's runs.
 
-        On a real storage fault the ``AppError`` PROPAGATES and **nothing in
-        memory changes**: the session keeps its records, so the cleanup index
-        survives and the next attempt — the very next request that touches this
-        session, or the sweeper — resumes where it stopped. Purging memory first
-        is exactly the bug this replaces: the sweeper iterates the in-memory
-        sessions, so a cache-only purge made the durable runs unreachable
-        forever.
+        On a real storage fault the ``AppError`` PROPAGATES and the cleanup is
+        left HALF DONE — never falsely complete: each run whose durable delete
+        already succeeded is dropped from memory too, while the runs from the
+        failing one onward and the session itself (with both idempotency tables)
+        stay put. The session therefore keeps acting as the cleanup index and the
+        next attempt — the very next request that touches this session, or the
+        sweeper — resumes at the first run still durable. What must never happen
+        is purging memory FIRST: the sweeper iterates the in-memory sessions, so
+        a cache-only purge would make the durable runs unreachable forever.
 
         Returns True when the session is gone (reclaimed, or never here).
         """
