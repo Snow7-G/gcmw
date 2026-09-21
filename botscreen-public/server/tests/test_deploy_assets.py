@@ -37,30 +37,10 @@ CONFIG_DIR = DEPLOY_DIR / "config"
 _HEX40 = re.compile(r"\b[0-9a-f]{40}\b")
 _SECRETISH_NAMES = ("API_KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD")
 _PLACEHOLDERISH = ("YOUR_", "<", "CHANGEME", "set-me")
-# Startup hooks some shells use to inject wrapper functions over the real tools.
-_INJECTION = ("BASH_ENV", "ENV")
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
-
-
-def _shell_env() -> dict[str, str]:
-    """An environment in which ``rm`` is the real ``rm``.
-
-    Developer shells — this project's authoring environment included — sometimes
-    inject an ``rm`` wrapper through ``BASH_ENV`` or a PATH shim that refuses
-    "bulk" deletes. The bundle is a POSIX shell tool: whether a restore works has
-    to be decided by the script, not by whatever the ambient shell has done to
-    the word ``rm``. Without this, a shim blocking one delete turns a passing
-    restore into a spurious failure and the assertions stop meaning what they
-    say. CI sets neither, so there this is a no-op.
-    """
-    env = {key: value for key, value in os.environ.items() if key not in _INJECTION}
-    env["PATH"] = os.pathsep.join(
-        entry for entry in env.get("PATH", "").split(os.pathsep) if "shim" not in entry
-    )
-    return env
 
 
 def _unit(name: str) -> str:
@@ -626,9 +606,8 @@ class TestBackupAndRollbackRestoreTheFiles:
 
     File operations only: every directory is an argument to the scripts, which is
     what makes this runnable in a temp dir — no service is touched and nothing
-    needs sudo. The scripts are invoked with a sanitised environment (see
-    ``_shell_env``) so what is measured is the script, not a wrapper the developer's
-    shell put in front of ``rm``.
+    needs sudo. The scripts inherit the ambient environment, exactly as an
+    operator's shell would give it to them.
 
     Why this exists: the previous procedure timestamped per file, backed up only
     qa-server.service, and then overwrote botscreen.service and the user unit with
@@ -639,8 +618,9 @@ class TestBackupAndRollbackRestoreTheFiles:
 
     - a snapshot that cannot be *proven* complete changes **nothing** (the old code
       restored some files, kept the rest new, and once even exited 0);
-    - a write that fails anyway is reported as a partial restore, naming what was
-      already changed, rather than exiting non-zero in silence.
+    - a write that fails anyway is reported as a partial restore — naming the
+      failing target as possibly modified and counting only the targets whose copy
+      AND mode both landed — rather than exiting non-zero in silence.
     """
 
     STAMP = "20260921-120000"
@@ -679,7 +659,6 @@ class TestBackupAndRollbackRestoreTheFiles:
             check=False,
             capture_output=True,
             text=True,
-            env=_shell_env(),
         )
 
     @staticmethod
@@ -782,7 +761,6 @@ class TestBackupAndRollbackRestoreTheFiles:
             check=False,
             capture_output=True,
             text=True,
-            env=_shell_env(),
         )
 
     def test_backup_then_rollback_restores_content_and_mode(self, tmp_path):
@@ -1203,6 +1181,46 @@ class TestBackupAndRollbackRestoreTheFiles:
             _read(layout["user_unit_dir"] / "gcmw-agent-demo.service")
             == "OLD user unit\n"
         )
+
+    def test_a_target_that_copied_but_could_not_be_chmodded_is_called_out(
+        self, tmp_path
+    ):
+        """A landed copy is not a finished restore.
+
+        An entry counts as done only when BOTH steps ran. If the copy succeeds and
+        the mode change is refused, that target's CONTENT has already changed while
+        the entry is still a failure — so it has to be reported as possibly
+        modified and excluded from the completed count. The first version of this
+        report did neither: it listed only completed entries and said nothing about
+        the one it stopped on.
+        """
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        # A target we can WRITE but do not OWN: /dev/null is 0666 and owned by root
+        # everywhere, so `cp -f` into it succeeds and `chmod` is refused. That is the
+        # shape of a real "copy landed, mode refused" failure, without inventing a
+        # fault the script cannot meet in the field.
+        launcher = layout["deploy_dir"] / "bin" / "start-botscreen-ui"
+        launcher.unlink()
+        launcher.symlink_to("/dev/null")
+        # chmod is refused only for a file we are neither root nor the owner of.
+        if os.geteuid() == 0 or os.stat("/dev/null").st_uid == os.geteuid():
+            pytest.skip("root, or /dev/null is ours: the mode change cannot fail")
+
+        partial = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert partial.returncode != 0
+        assert "MAY HAVE BEEN PARTIALLY MODIFIED" in partial.stderr, partial.stderr
+        assert str(launcher) in partial.stderr, "the failing target must be named"
+        assert "3 of 5" in partial.stderr, (
+            "and the count must stay at 3: a copy alone does not make it restored"
+        )
+        assert str(layout["system_unit_dir"] / "qa-server.service") in partial.stderr
 
 
 class TestReadmeCoversTheOperationalContract:

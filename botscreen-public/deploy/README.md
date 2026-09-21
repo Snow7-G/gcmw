@@ -259,9 +259,11 @@ between two writes can still leave the tree half restored. Two things keep a
 half-done restore from being mistaken for a finished one. A defect discoverable
 *in advance* — a partial snapshot, a truncated manifest, a redirected target — is
 rejected before anything is touched. And if a write fails anyway, the restore
-stops there, exits non-zero, and prints `THE TREE IS PARTIALLY RESTORED` followed
-by the exact list of targets it had already changed; the snapshot is untouched, so
-re-running the same command finishes the job.
+stops there, exits non-zero, and prints `THE TREE IS PARTIALLY RESTORED` with two
+separate lists: the targets whose **copy and mode both landed** (counted), and the
+one it stopped on, named as possibly modified — a copy can succeed while the mode
+change is refused, so a failure is never assumed to have left its target alone.
+The snapshot itself is untouched, so re-running the same command finishes the job.
 
 `MANIFEST.tsv` records one of two things per file, and both are handled:
 

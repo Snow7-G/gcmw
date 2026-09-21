@@ -280,15 +280,19 @@ while [ "$i" -lt "$rows" ]; do
     esac
   else
     echo >&2
-    echo "STOPPED after ${#changed[@]} of ${rows} target(s): the step for ${dest} failed." >&2
-    echo "THE TREE IS PARTIALLY RESTORED. Targets already changed:" >&2
+    echo "STOPPED on ${dest}: its step failed." >&2
+    echo "That target MAY HAVE BEEN PARTIALLY MODIFIED. A copy can succeed and the" >&2
+    echo "mode change still fail, and it is counted as done only when BOTH steps have" >&2
+    echo "run - so do not assume it kept either its old or its new content." >&2
+    echo "Fully restored before the failure: ${#changed[@]} of ${rows}" >&2
     if [ "${#changed[@]}" -gt 0 ]; then
       for already in "${changed[@]}"; do
         echo "  ${already}" >&2
       done
     fi
-    echo "Nothing further was attempted. The snapshot is unchanged, so after fixing" >&2
-    echo "the cause, re-running this exact command finishes the job." >&2
+    echo "THE TREE IS PARTIALLY RESTORED. Nothing further was attempted. The snapshot" >&2
+    echo "is unchanged, so after fixing the cause, re-running this exact command" >&2
+    echo "finishes the job." >&2
     exit 1
   fi
   i=$((i + 1))
