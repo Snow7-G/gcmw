@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+#
+# Launch the packaged Electron UI on the X display that belongs to THIS user.
+#
+# Why the display is resolved instead of hardcoded: on the target host `:0` is
+# the KIOSK session, and that session's window manager does not reparent client
+# windows — a plain `xclock` stays an undecorated 300x300 window there, while the
+# same client on the operator's own session is wrapped by `mutter-x11-frames`
+# into a framed window with a title bar. A packaged Electron window is not even
+# mapped on `:0` (the main process hangs). So "framed and closable" is only
+# achievable on a display the operator's session actually decorates.
+#
+# Behaviour:
+# - if DISPLAY is already set and its socket exists, honour it;
+# - otherwise pick the X socket owned by this uid;
+# - if neither works, fail LOUDLY (exit 2) rather than silently picking a display
+#   that cannot render a closable window.
+set -euo pipefail
+
+if [ -n "${DISPLAY:-}" ] && [ -S "/tmp/.X11-unix/X${DISPLAY#:}" ]; then
+  display="$DISPLAY"
+else
+  display=""
+  for sock in /tmp/.X11-unix/X*; do
+    [ -S "$sock" ] || continue
+    if [ "$(stat -c %u "$sock")" = "$(id -u)" ]; then
+      display=":${sock##*X}"
+      break
+    fi
+  done
+fi
+
+if [ -z "$display" ]; then
+  echo "start-botscreen-ui: no X display owned by uid $(id -u) — is a session running?" >&2
+  exit 2
+fi
+
+export DISPLAY="$display"
+export RCPATH="${RCPATH:-@@GCMW_RCPATH@@}"
+# Any NON-EMPTY value selects the developer window (framed + closable); see
+# src/main/windowMode.ts. Default it here so a manual desktop launch behaves the
+# same as the systemd unit.
+export DEBUG="${DEBUG:-1}"
+
+echo "start-botscreen-ui: DISPLAY=$display DEBUG=$DEBUG"
+# exec: the app replaces this shell, so its exit code (and any signal) reaches
+# systemd unchanged — that is what makes `Restart=on-failure` mean what it says
+# for a normal user-initiated close (exit code 0 → no restart).
+exec "@@GCMW_RELEASE_DIR@@/botscreen" "$@"

@@ -1,0 +1,24 @@
+[Unit]
+Description=Botscreen voice bridge (agent mode) — loopback only
+Documentation=file:@@GCMW_DEPLOY_DIR@@/README.md
+After=network.target
+# NOTE: the Agent API it talks to (`gcmw-agent-demo.service`) is a USER unit in
+# the operator's session, so it cannot be ordered against from here. Bring it up
+# first — see "Startup order" in @@GCMW_DEPLOY_DIR@@/README.md. A bridge started
+# against a down API is safe: it answers with the fixed fail-closed copy and
+# never falls back to the legacy model.
+
+[Service]
+Type=simple
+User=@@GCMW_USER@@
+WorkingDirectory=@@GCMW_SERVER_DIR@@
+EnvironmentFile=@@GCMW_CONFIG_DIR@@/voice-bridge.env
+# Loopback is pinned HERE as well as in qa_server.py: two independent gates, so
+# a future change to the code default cannot silently expose this to the LAN.
+ExecStart=@@GCMW_VENV_PYTHON@@ -m uvicorn qa_server:app --host 127.0.0.1 --port 8000
+# A CLEAN exit means an operator stopped it on purpose — do not resurrect it.
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
