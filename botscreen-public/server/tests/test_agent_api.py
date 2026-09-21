@@ -1159,3 +1159,245 @@ class TestActiveSweeper:
         assert sweeper.done()
         assert sweeper.cancelled()
         assert svc.sessions == {}
+
+
+# ---------------------------------------------------------------------------
+# 第六轮 P1：过期回收必须「先删仓储、再清内存」，且所有入口共用同一条流程
+# ---------------------------------------------------------------------------
+
+
+class TestExpiryReclaimIsSharedAndOrdered:
+    """审查复现的缺口：请求路径先把内存索引清掉，sweeper 便再也找不到那些 Run，
+    持久记录成了孤儿（"重启才消失"不算回收）。
+
+    矩阵：过期后「先 GET Run / 先 POST Run / 先 DELETE Session / 只跑 sweeper」
+    四条入口，每一条都必须把持久记录清干净；再叠加「存储故障保留重试」与
+    「多 Run 部分失败后可续跑」两条异常路径。
+    """
+
+    @staticmethod
+    def _expire(h: Harness, session: dict) -> None:
+        h.clock.advance(h.service.sessions[session["session_id"]].ttl_s + 1)
+
+    @staticmethod
+    def _identity(session: dict, run: dict) -> RunIdentity:
+        return RunIdentity(
+            run_id=run["run_id"],
+            tenant_id="t1",
+            device_id="d1",
+            session_id=session["session_id"],
+        )
+
+    def _assert_durable_gone(self, repository, session: dict, run: dict) -> None:
+        with pytest.raises(RunRepositoryError) as exc:
+            asyncio.run(repository.state(self._identity(session, run)))
+        assert exc.value.fault is RunRepositoryFault.NOT_FOUND
+
+    def _assert_durable_present(self, repository, session: dict, run: dict) -> None:
+        assert isinstance(
+            asyncio.run(repository.state(self._identity(session, run))), RunState
+        )
+
+    def _assert_memory_empty(self, h: Harness) -> None:
+        assert h.service.sessions == {}
+        assert h.service.runs == {}
+        assert h.service.idempotency == {}
+        assert h.service.session_idempotency == {}
+
+    def _assert_memory_intact(self, h: Harness) -> None:
+        assert len(h.service.sessions) == 1
+        assert len(h.service.runs) == 1
+
+    @pytest.mark.parametrize(
+        "first_move", ["get_run", "post_run", "delete_session", "sweeper"]
+    )
+    def test_every_entry_point_fully_reclaims(self, first_move):
+        repository = MemoryRunRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="k")
+            self._expire(h, session)
+
+            status = self._first_move(h, first_move, session, run)
+            if status is not None:
+                assert status == 404, first_move
+
+            # 第一条入口之后持久记录就必须没了 —— 不是"等 sweeper 再说"
+            self._assert_durable_gone(repository, session, run)
+            self._assert_memory_empty(h)
+            # 再跑 sweeper 无事可做：证明清理没有被推迟
+            assert asyncio.run(h.service.expire_due_sessions()) == 0
+
+    def _first_move(self, h: Harness, move: str, session: dict, run: dict):
+        """执行"过期后的第一个动作"，返回 HTTP 状态码（sweeper 返回 None）。"""
+        if move == "get_run":
+            return h.client.get(f"/api/v1/agent/runs/{run['run_id']}").status_code
+        if move == "post_run":
+            return h.client.post(
+                "/api/v1/agent/runs",
+                json={
+                    "session_id": session["session_id"],
+                    "input": {"type": "text", "text": "再问一次"},
+                    "idempotency_key": "k2",
+                },
+            ).status_code
+        if move == "delete_session":
+            return h.client.delete(
+                f"/api/v1/sessions/{session['session_id']}"
+            ).status_code
+        assert move == "sweeper"
+        assert asyncio.run(h.service.expire_due_sessions()) == 1
+        return None
+
+    @pytest.mark.parametrize(
+        "first_move", ["get_run", "post_run", "delete_session", "sweeper"]
+    )
+    def test_storage_fault_keeps_records_and_next_sweep_finishes(self, first_move):
+        """真实存储故障：请求被拒、内存索引与持久记录**都留下**，
+        故障恢复后 sweeper 清完。这里同时钉住"故障时绝不假装回收成功"。"""
+        repository = UnavailableOnceRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="k")
+            self._expire(h, session)
+
+            if first_move == "sweeper":
+                # 故障让这一轮 sweep 一个都收不回来（绝不假装成功）
+                assert asyncio.run(h.service.expire_due_sessions()) == 0
+            else:
+                status = self._first_move(h, first_move, session, run)
+                assert status == 404, first_move
+            assert repository.delete_attempts == 1
+
+            # 内存索引完整保留：这就是重试入口，不能提前丢
+            self._assert_memory_intact(h)
+            self._assert_durable_present(repository, session, run)
+
+            # 故障恢复 → sweeper 清完
+            assert asyncio.run(h.service.expire_due_sessions()) == 1
+            self._assert_memory_empty(h)
+            self._assert_durable_gone(repository, session, run)
+
+    def test_partial_failure_resumes_and_cancels_each_task_once(self):
+        """两个 Run、第二个删除失败：已删的不再被声称存在、未删的仍是唯一重试
+        线索、会话保留；恢复后继续跑完。后台任务在唯一 choke point 被中断，
+        且**每个任务恰好一次**（不重复、不泄漏）。"""
+
+        class FlakySecondDelete(MemoryRunRepository):
+            def __init__(self) -> None:
+                super().__init__()
+                self.fail_for: set[str] = set()
+                self.attempts: list[str] = []
+
+            async def delete(self, identity) -> None:
+                self.attempts.append(identity.run_id)
+                if identity.run_id in self.fail_for:
+                    raise RunRepositoryError(
+                        RunRepositoryFault.UNAVAILABLE, "storage down"
+                    )
+                return await super().delete(identity)
+
+        class CancelRecorder:
+            def __init__(self) -> None:
+                self.cancelled: list[str] = []
+
+            def cancel(self, run_id: str) -> None:
+                self.cancelled.append(run_id)
+
+        repository = FlakySecondDelete()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            first = new_run(h, session["session_id"], key="first")
+            # Terminal-out the first run through the REPOSITORY (simulating an
+            # external writer), not through the cancel route: the route would
+            # cancel the executor task itself, and then "each task is interrupted
+            # exactly once by the reclaim" would no longer be what we measure.
+            asyncio.run(
+                repository.commit_transition(
+                    self._identity(session, first),
+                    expected_state=RunState.ACCEPTED,
+                    next_state=RunState.CANCELLED,
+                )
+            )
+            second = new_run(h, session["session_id"], key="second")
+            recorder = CancelRecorder()
+            h.service.executor = recorder
+            repository.fail_for.add(second["run_id"])
+            self._expire(h, session)
+
+            assert asyncio.run(h.service.expire_due_sessions()) == 0  # 会话保留
+
+            # 已删的：内存与仓储都不再声称它存在；任务已中断
+            assert first["run_id"] not in h.service.runs
+            self._assert_durable_gone(repository, session, first)
+            # 未删的：仍在内存里，是唯一的重试线索
+            assert second["run_id"] in h.service.runs
+            self._assert_durable_present(repository, session, second)
+            assert session["session_id"] in h.service.sessions
+
+            repository.fail_for.clear()
+            assert asyncio.run(h.service.expire_due_sessions()) == 1
+            self._assert_memory_empty(h)
+            self._assert_durable_gone(repository, session, second)
+
+        assert sorted(recorder.cancelled) == sorted(
+            [first["run_id"], second["run_id"]]
+        ), "每个 Run 的后台任务必须恰好被中断一次"
+
+    def test_idempotent_replay_after_expiry_keeps_the_old_session_reclaimable(self):
+        """幂等重放：同 key 拿到新会话，但**旧会话不能被丢掉** —— 它是旧
+        持久 Run 的清理索引，之后由 sweeper 正常清完。"""
+        repository = MemoryRunRepository()
+        with running_app(repository=repository) as h:
+            key = "voice-session-abc"
+            original = h.client.post(
+                "/api/v1/sessions", json={"idempotency_key": key}
+            ).json()
+            run = new_run(h, original["session_id"], key="k")
+            self._expire(h, original)
+
+            replay = h.client.post("/api/v1/sessions", json={"idempotency_key": key})
+            assert replay.status_code == 201
+            assert replay.json()["session_id"] != original["session_id"]
+
+            # 旧会话与它的 Run 仍在内存里（清理索引没被提前丢弃）
+            assert original["session_id"] in h.service.sessions
+            assert run["run_id"] in h.service.runs
+            self._assert_durable_present(repository, original, run)
+
+            # 于是 sweeper 仍能把它清干净
+            assert asyncio.run(h.service.expire_due_sessions()) == 1
+            self._assert_durable_gone(repository, original, run)
+            assert h.service.sessions.keys() == {replay.json()["session_id"]}
+
+    def test_expired_session_is_never_served_even_when_reclaim_failed(self):
+        """故障期间会话虽然还在内存里，但它**已经过期**：任何读/写都要拒绝，
+        不能因为"没清干净"就继续服务。"""
+        repository = UnavailableOnceRepository()
+        with running_app(repository=repository) as h:
+            session = new_session(h)
+            run = new_run(h, session["session_id"], key="k")
+            repository.fail_first_delete = False  # 本次不注入故障
+            self._expire(h, session)
+
+            assert (
+                h.client.get(f"/api/v1/agent/runs/{run['run_id']}").status_code == 404
+            )
+            assert (
+                h.client.post(
+                    "/api/v1/agent/runs",
+                    json={
+                        "session_id": session["session_id"],
+                        "input": {"type": "text", "text": "再问一次"},
+                        "idempotency_key": "k2",
+                    },
+                ).status_code
+                == 404
+            )
+            assert (
+                h.client.delete(f"/api/v1/sessions/{session['session_id']}").status_code
+                == 404
+            )
+            # 三条路径都把该会话彻底回收了：内存与仓储一致
+            self._assert_memory_empty(h)
+            self._assert_durable_gone(repository, session, run)
