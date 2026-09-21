@@ -364,6 +364,12 @@ cage -s -- \
 
 机器人语音链路（M260C + 讯飞 AIUI → ROS → `/mic/*` → `/chat` → `/sse` → 页面 TTS 播报）保持不变，仅 `/chat` 的**回答引擎**可通过环境变量切换：
 
+自由问答使用的在线 ASR 依赖网络。断网时可能出现进程仍存活、但无法返回识别结果；网络恢复后是否自动重连、是否需要重启，尚待现场验证。回答侧也可能联网：legacy 模式未命中知识库时调用 DeepSeek，Agent 使用 cloud provider 时调用云端模型。Mock 模式仅回答侧不出网，不代表整条语音链路离线可用。TTS 的实际执行方及联网依赖仍待核实。
+
+生产部署用的两个 systemd 单元（`robot-mic.service`、`voice-transfer.service`）**不在本仓库**，
+只存在于部署主机上；`server/start_robot*.sh` 是**开发期**一键脚本（`&` 起、前台 `wait`、Ctrl+C 清场），
+不是生产形态。
+
 | 变量 | 说明 |
 |---|---|
 | `GCMW_VOICE_ANSWER_BACKEND` | `legacy`（默认，KB → DeepSeek，行为不变）或 `agent`（走新 Agent：Manager → RAG → Verifier） |

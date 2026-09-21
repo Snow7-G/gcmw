@@ -24,7 +24,11 @@ API_URL = "http://127.0.0.1:8000"
 # 语义（业务 60s + 清理 grace + 余量）。调用方超时必须大于适配器预算。
 try:
     from voice_agent_adapter import VOICE_TURN_TIMEOUT_S as VOICE_CHAT_TIMEOUT_S
-except ImportError:  # 仅拷贝节点脚本部署时的回退值，必须与适配器保持同步
+except ImportError:
+    # 仅拷贝节点脚本部署（适配器不在同目录）时的回退值。约束是**不得小于**
+    # 适配器公布的调用方超时：小了就是调用方先超时、适配器仍在跑，即第四轮
+    # 修过的「迟到副作用 / 结果未知」。由 tests/test_voice_agent_adapter.py 的
+    # TestVoiceTurnTimeoutContract 守这个方向，不要只改这个数。
     VOICE_CHAT_TIMEOUT_S = 75.0
 WAKEUP_TOPIC = "wheeltec_mic/wakeup_trigger"
 POLL_INTERVAL = 0.5  # 轮询间隔（秒）

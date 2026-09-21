@@ -10,12 +10,15 @@ not merely that the caller stopped waiting.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import json
 import pathlib
+import sys
 import threading
 import time
 from typing import Any
+from unittest import mock
 
 import httpx
 import pytest
@@ -1150,6 +1153,47 @@ class TestAbsoluteDeadline:
 
 
 class TestVoiceTurnTimeoutContract:
+    NODES = ("voice_transfer_node.py", "voice_transfer_node_ros2.py")
+
+    @staticmethod
+    def _server_dir() -> pathlib.Path:
+        return pathlib.Path(__file__).resolve().parent.parent
+
+    @classmethod
+    def _budget_prologue(cls, node: str) -> tuple[str, float]:
+        """The try/except that picks the caller-side budget, plus its fallback value.
+
+        Read out of the file with ``ast`` instead of importing the module: both
+        nodes import ``rclpy`` at module scope, and a contract about a number must
+        not require a ROS installation to check. Reading it structurally also means
+        these assertions follow the block if it moves.
+        """
+        src = (cls._server_dir() / node).read_text(encoding="utf-8")
+        for stmt in ast.parse(src).body:
+            if not isinstance(stmt, ast.Try):
+                continue
+            imports_adapter = any(
+                isinstance(n, ast.ImportFrom) and n.module == "voice_agent_adapter"
+                for n in ast.walk(stmt)
+            )
+            catches_import_error = any(
+                isinstance(h.type, ast.Name) and h.type.id == "ImportError"
+                for h in stmt.handlers
+            )
+            if not (imports_adapter and catches_import_error):
+                continue
+            for handler in stmt.handlers:
+                for n in ast.walk(handler):
+                    if isinstance(n, ast.Assign) and any(
+                        getattr(t, "id", None) == "VOICE_CHAT_TIMEOUT_S"
+                        for t in n.targets
+                    ):
+                        return (
+                            ast.get_source_segment(src, stmt) or "",
+                            ast.literal_eval(n.value),
+                        )
+        raise AssertionError(f"{node}: no ImportError fallback for the voice budget")
+
     def test_ros_timeout_exceeds_adapter_budget(self):
         assert vaa.VOICE_TURN_TIMEOUT_S >= (
             vaa._TOTAL_DEADLINE_S + vaa._CLEANUP_GRACE_S
@@ -1166,6 +1210,47 @@ class TestVoiceTurnTimeoutContract:
         # 适配器预算本身即 ROS 预算的组成部分：预算内完成的回答必然早于
         # ROS 超时窗口（近 deadline 回归见 TestAbsoluteDeadline）
         assert vaa.VOICE_TURN_TIMEOUT_S > vaa._TOTAL_DEADLINE_S
+
+    # ---- V-1：回退值是同一契约的第二处真值来源 -------------------------------
+
+    def test_the_nodes_take_the_adapter_constant_when_it_is_importable(self):
+        """能导入时取的就是适配器常量本身，而不是各自写死的一个数。"""
+        for node in self.NODES:
+            prologue, _ = self._budget_prologue(node)
+            namespace: dict[str, Any] = {}
+            exec(prologue, namespace)  # noqa: S102 - 执行的是被测文件里那段真实代码
+            assert namespace["VOICE_CHAT_TIMEOUT_S"] == vaa.VOICE_TURN_TIMEOUT_S
+            assert namespace["VOICE_CHAT_TIMEOUT_S"] is not None
+
+    def test_the_fallback_budget_is_never_smaller_than_the_adapter_budget(self):
+        """V-1：回退值只能比适配器宽松，不能更紧；两个节点还要一致。
+
+        更紧就是第四轮修过的那类缺陷：调用方先超时、适配器仍在跑 → 迟到副作用 /
+        结果未知。当前 75.0 > 69.0 在安全侧，但**方向本身此前无人守** —— 适配器预算
+        涨过 75.0 时不会有任何东西变红。这条测试就是那个守。
+        """
+        fallbacks: dict[str, float] = {}
+        for node in self.NODES:
+            _, fallback = self._budget_prologue(node)
+            fallbacks[node] = fallback
+            assert fallback >= vaa.VOICE_TURN_TIMEOUT_S, (
+                f"{node}: 回退值 {fallback} 小于适配器公布的 {vaa.VOICE_TURN_TIMEOUT_S}"
+                " —— 调用方会比适配器先放弃"
+            )
+        assert len(set(fallbacks.values())) == 1, (
+            f"两个节点的回退值必须一致：{fallbacks}"
+        )
+
+    def test_the_fallback_path_needs_no_ros_and_no_adapter_on_the_path(self):
+        """适配器不在同目录时走回退值；这条路既不需要 ROS，也不需要 RPC 依赖。"""
+        for node in self.NODES:
+            prologue, fallback = self._budget_prologue(node)
+            assert "rclpy" not in prologue, "这段预算代码不该牵扯 ROS 导入"
+            namespace: dict[str, Any] = {}
+            # 让 `from voice_agent_adapter import ...` 抛 ImportError。
+            with mock.patch.dict(sys.modules, {"voice_agent_adapter": None}):
+                exec(prologue, namespace)  # noqa: S102 - 同上
+            assert namespace["VOICE_CHAT_TIMEOUT_S"] == fallback
 
 
 # ============ 清理语义（成功零 DELETE / 失败级联 / 有界可取消） ============
