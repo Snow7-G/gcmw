@@ -640,7 +640,11 @@ class TestBackupAndRollbackRestoreTheFiles:
         }
 
     def _script(
-        self, layout: dict[str, Path], name: str, *extra: str
+        self,
+        layout: dict[str, Path],
+        name: str,
+        *extra: str,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
@@ -659,7 +663,42 @@ class TestBackupAndRollbackRestoreTheFiles:
             check=False,
             capture_output=True,
             text=True,
+            env=env,
         )
+
+    def _chmod_stub(self, tmp_path: Path, fail_on: Path) -> dict[str, str]:
+        """An environment whose ``chmod`` refuses exactly one path.
+
+        The failure worth reproducing is "the copy landed, the mode change was
+        refused": that is what makes a failed entry's content already different
+        from both the old and the new state. Aiming a target at a device node to
+        provoke it is not acceptable here — the script really walks the symlink and
+        really tries to chmod that device, and only the privilege check stops it.
+        So the tool itself is stubbed, for the child process only, and every other
+        argument is forwarded to the real one. Nothing is removed from the
+        environment: the stub directory is merely first on PATH.
+        """
+        stub_dir = tmp_path / "stub-bin"
+        stub_dir.mkdir()
+        real_chmod = shutil.which("chmod")
+        assert real_chmod, "chmod has to be on PATH for this test"
+        stub = stub_dir / "chmod"
+        stub.write_text(
+            "#!/bin/sh\n"
+            'for arg in "$@"; do\n'
+            f'  if [ "$arg" = "{fail_on}" ]; then\n'
+            f'    echo "chmod: stub refusing {fail_on}" >&2\n'
+            "    exit 1\n"
+            "  fi\n"
+            "done\n"
+            f'exec "{real_chmod}" "$@"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        return {
+            **os.environ,
+            "PATH": f"{stub_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        }
 
     @staticmethod
     def _write(path: Path, content: str, mode: int = 0o644) -> None:
@@ -1193,6 +1232,10 @@ class TestBackupAndRollbackRestoreTheFiles:
         modified and excluded from the completed count. The first version of this
         report did neither: it listed only completed entries and said nothing about
         the one it stopped on.
+
+        The mode step is made to fail with a ``chmod`` stub that refuses exactly
+        this one path (see ``_chmod_stub``): no device is touched, and nothing is
+        removed from the environment.
         """
         layout = self._layout(tmp_path)
         self._full_old_state(layout)
@@ -1202,18 +1245,12 @@ class TestBackupAndRollbackRestoreTheFiles:
         )
 
         self._new_state(layout)
-        # A target we can WRITE but do not OWN: /dev/null is 0666 and owned by root
-        # everywhere, so `cp -f` into it succeeds and `chmod` is refused. That is the
-        # shape of a real "copy landed, mode refused" failure, without inventing a
-        # fault the script cannot meet in the field.
         launcher = layout["deploy_dir"] / "bin" / "start-botscreen-ui"
-        launcher.unlink()
-        launcher.symlink_to("/dev/null")
-        # chmod is refused only for a file we are neither root nor the owner of.
-        if os.geteuid() == 0 or os.stat("/dev/null").st_uid == os.geteuid():
-            pytest.skip("root, or /dev/null is ours: the mode change cannot fail")
+        stub_env = self._chmod_stub(tmp_path, launcher)
 
-        partial = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        partial = self._script(
+            layout, "rollback-assets.sh", "--stamp", self.STAMP, env=stub_env
+        )
         assert partial.returncode != 0
         assert "MAY HAVE BEEN PARTIALLY MODIFIED" in partial.stderr, partial.stderr
         assert str(launcher) in partial.stderr, "the failing target must be named"
@@ -1221,6 +1258,19 @@ class TestBackupAndRollbackRestoreTheFiles:
             "and the count must stay at 3: a copy alone does not make it restored"
         )
         assert str(layout["system_unit_dir"] / "qa-server.service") in partial.stderr
+
+        # The failure is exactly "copied but not chmodded", so the target now holds
+        # the OLD bytes at the NEW mode. That is the state a report has to warn
+        # about, and it is why the count cannot include this entry.
+        assert _read(launcher) == "OLD launcher\n", "the copy did land"
+        assert launcher.stat().st_mode & 0o777 == 0o755, (
+            "and the recorded mode 0700 was never applied"
+        )
+        # The three earlier entries were untouched by the stub, so they are whole.
+        assert _read(layout["system_unit_dir"] / "qa-server.service") == "OLD qa\n"
+        assert (
+            layout["system_unit_dir"] / "qa-server.service"
+        ).stat().st_mode & 0o777 == 0o600
 
 
 class TestReadmeCoversTheOperationalContract:
