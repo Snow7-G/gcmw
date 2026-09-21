@@ -18,7 +18,10 @@ Contract notes (verified by tests/test_deploy_assets.py):
 - the origin allowlist is exact: no ``*``, and credentials are allowed because
   the origins are explicit (per CORS, ``*`` + credentials is invalid);
 - authentication is untouched: an unknown/missing device credential is still
-  rejected by the API's own entry guard, CORS or not.
+  rejected by the API's own entry guard, CORS or not;
+- exit codes distinguish "operator stopped me" (0) from "the service thread died"
+  (non-zero), so the unit's ``Restart=on-failure`` actually covers an unexpected
+  8001 outage instead of treating it as a clean shutdown.
 """
 
 from __future__ import annotations
@@ -113,7 +116,20 @@ def main(argv: list[str] | None = None) -> int:
             pass
     finally:
         namespace["stop_server"](handle)
-    return 0
+
+    if stopping.is_set():
+        # An operator stop (SIGTERM/SIGINT). Exit 0 on purpose: the unit is
+        # `Restart=on-failure`, so a clean exit must NOT resurrect the service.
+        return 0
+
+    # The service thread ended on its own — the API is down but this process
+    # would otherwise look deliberately stopped, and `Restart=on-failure` would
+    # leave 8001 dead. Report failure so systemd restarts it.
+    print(
+        "agent API service thread exited without a stop signal; reporting failure",
+        file=sys.stderr,
+    )
+    return 1
 
 
 if __name__ == "__main__":

@@ -19,8 +19,11 @@ from __future__ import annotations
 import importlib.util
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -71,6 +74,46 @@ def _load_agent_entry_uncached():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _write_stub_assembly(
+    directory: Path, *, thread_alive: bool, cleanup_log: Path
+) -> Path:
+    """Write a fake ``scripts/demo_showcase.py`` for the Agent entry point.
+
+    The entry only needs ``create_app``, a ``start_server`` returning an object
+    with a ``.thread``, and ``stop_server``. Nothing here binds a port, touches
+    the network or starts Electron — ``thread_alive`` decides, deterministically,
+    whether the service thread is still running or has already exited.
+    """
+    scripts = directory / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    stub = scripts / "demo_showcase.py"
+    stub.write_text(
+        "class _Thread:\n"
+        "    def is_alive(self):\n"
+        f"        return {thread_alive!r}\n"
+        "\n"
+        "\n"
+        "class _Handle:\n"
+        "    def __init__(self):\n"
+        "        self.thread = _Thread()\n"
+        "\n"
+        "\n"
+        "def create_app(*args, **kwargs):\n"
+        "    return object()\n"
+        "\n"
+        "\n"
+        "def start_server(host, port, cors_for_dev_frontends):\n"
+        "    return _Handle()\n"
+        "\n"
+        "\n"
+        "def stop_server(handle):\n"
+        f"    with open({str(cleanup_log)!r}, 'a', encoding='utf-8') as stream:\n"
+        "        stream.write('stopped\\n')\n",
+        encoding="utf-8",
+    )
+    return stub
 
 
 class TestBundleHasNoHostSpecificOrSecretValues:
@@ -257,6 +300,71 @@ class TestAgentApiEntry:
         assert module.main(["--server-dir", str(tmp_path)]) == 2
         assert "demo assembly not found" in capsys.readouterr().err
 
+    def test_stop_signal_is_a_clean_exit_and_cleanup_still_runs(
+        self, tmp_path, monkeypatch
+    ):
+        """P2 regression (review probe): an operator stop must exit 0.
+
+        The unit is ``Restart=on-failure``, so a signal must NOT be reported as a
+        failure — otherwise stopping the demo Agent API would bounce it straight
+        back up. Cleanup has to run on this path too.
+        """
+        module = _load_agent_entry()
+        cleanup = tmp_path / "cleanup.log"
+        _write_stub_assembly(tmp_path, thread_alive=True, cleanup_log=cleanup)
+
+        handlers: dict[int, object] = {}
+
+        class _SignalRecorder:
+            SIGTERM = signal.SIGTERM
+            SIGINT = signal.SIGINT
+
+            @staticmethod
+            def signal(signum, handler):
+                handlers[signum] = handler
+
+        # Replace the module's `signal` handle: calling the real one from a worker
+        # thread is illegal, and a real handler would also outlive the test.
+        monkeypatch.setattr(module, "signal", _SignalRecorder())
+
+        result: dict[str, int] = {}
+        worker = threading.Thread(
+            target=lambda: result.__setitem__(
+                "code", module.main(["--server-dir", str(tmp_path)])
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            deadline = time.monotonic() + 5
+            while signal.SIGTERM not in handlers and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert signal.SIGTERM in handlers, "the entry never installed a handler"
+            handlers[signal.SIGTERM](signal.SIGTERM, None)
+        finally:
+            worker.join(timeout=10)
+
+        assert not worker.is_alive(), "the entry did not return after the stop signal"
+        assert result["code"] == 0
+        assert cleanup.read_text(encoding="utf-8") == "stopped\n"
+
+    def test_a_service_thread_that_dies_alone_is_reported_as_failure(
+        self, tmp_path, capsys
+    ):
+        """P2 regression (review probe): the thread exiting on its own used to
+        return 0 as well.
+
+        With ``Restart=on-failure`` that reads as a deliberate stop, so an
+        unexpected 8001 outage would never be restarted. Cleanup still runs.
+        """
+        module = _load_agent_entry()
+        cleanup = tmp_path / "cleanup.log"
+        _write_stub_assembly(tmp_path, thread_alive=False, cleanup_log=cleanup)
+
+        assert module.main(["--server-dir", str(tmp_path)]) != 0
+        assert "without a stop signal" in capsys.readouterr().err
+        assert cleanup.read_text(encoding="utf-8") == "stopped\n"
+
 
 class TestEnvironmentExamples:
     @pytest.mark.parametrize(
@@ -288,23 +396,30 @@ class TestEnvironmentExamples:
     reason="render-assets.sh needs bash + python3",
 )
 class TestRenderScript:
-    def _render(self, tmp_path: Path, bundle: Path | None = None) -> Path:
+    def _render(
+        self,
+        tmp_path: Path,
+        bundle: Path | None = None,
+        deploy_dir: str | None = "/opt/gcmw/deploy/current",
+        root: str = "/opt/gcmw",
+    ) -> Path:
         out = tmp_path / "rendered"
+        arguments = [  # check=False on purpose: the helper's output IS the diagnosis
+            "bash",
+            str((bundle or DEPLOY_DIR) / "bin" / "render-assets.sh"),
+            "--out",
+            str(out),
+            "--root",
+            root,
+            "--user",
+            "demo-user",
+            "--home",
+            "/home/demo-user",
+        ]
+        if deploy_dir is not None:
+            arguments += ["--deploy-dir", deploy_dir]
         completed = subprocess.run(
-            [  # check=False on purpose: the helper's output IS the diagnosis
-                "bash",
-                str((bundle or DEPLOY_DIR) / "bin" / "render-assets.sh"),
-                "--out",
-                str(out),
-                "--root",
-                "/opt/gcmw",
-                "--user",
-                "demo-user",
-                "--home",
-                "/home/demo-user",
-                "--deploy-dir",
-                "/opt/gcmw/deploy/current",
-            ],
+            arguments,
             check=False,
             capture_output=True,
             text=True,
@@ -318,6 +433,96 @@ class TestRenderScript:
             )
         self.helper_stdout = completed.stdout
         return out
+
+    @staticmethod
+    def _install(rendered: Path, root: Path) -> None:
+        """Simulate the README's install step, so unit targets can be dereferenced.
+
+        Everything the units exec is created as a stand-in: a fake ``botscreen``
+        for the release and a fake interpreter under ``<root>/venv``. Nothing
+        here launches Electron or binds a port.
+
+        The README is installed straight from the bundle (the renderer does not
+        copy it: its placeholder table documents the token NAMES, so substituting
+        them would destroy it).
+        """
+        bundle = root / "deploy" / "current"
+        shutil.copytree(rendered / "bin", bundle / "bin")
+        shutil.copy2(DEPLOY_DIR / "README.md", bundle / "README.md")
+
+        release = root / "current"
+        release.mkdir(parents=True, exist_ok=True)
+        stub_app = release / "botscreen"
+        stub_app.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub_app.chmod(0o755)
+
+        interpreter = root / "venv" / "bin" / "python"
+        interpreter.parent.mkdir(parents=True, exist_ok=True)
+        interpreter.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        interpreter.chmod(0o755)
+
+    @staticmethod
+    def _exec_targets_under(root: Path, out: Path) -> list[str]:
+        complete = re.compile(r"@@GCMW_[A-Z_]+@@")
+        targets: list[str] = []
+        for unit_path in sorted((out / "systemd").glob("*.service")):
+            for entry in _directive(_read(unit_path), "ExecStart"):
+                assert not complete.search(entry), (
+                    f"{unit_path.name} keeps an unrendered token: {entry}"
+                )
+                for token in entry.split():
+                    candidate = token.strip('"')
+                    if candidate.startswith(f"{root}/"):
+                        assert Path(candidate).is_file(), (
+                            f"{unit_path.name} execs {candidate}, which the"
+                            " documented install step must create"
+                        )
+                        targets.append(candidate)
+        return targets
+
+    def test_default_deploy_dir_targets_the_install_dir_not_the_checkout(
+        self, tmp_path
+    ):
+        """P1 regression (review probe: ``unit_targets_source=True``).
+
+        Omitting ``--deploy-dir`` used to default to the bundle's own source
+        directory, so the rendered units exec'd unrendered templates sitting in
+        the repository — and the render still exited 0, which is why the existing
+        cases (all of which pass --deploy-dir explicitly) never caught it.
+        """
+        root = tmp_path / "opt" / "gcmw"
+        rendered = self._render(tmp_path, deploy_dir=None, root=str(root))
+        self._install(rendered, root)
+
+        unit = _read(rendered / "systemd" / "botscreen.service")
+        assert _directive(unit, "ExecStart") == [
+            f"{root}/deploy/current/bin/start-botscreen-ui"
+        ]
+        assert str(DEPLOY_DIR) not in unit, (
+            "a default render must never exec the checkout"
+        )
+
+    def test_every_exec_target_of_a_default_render_is_rendered_and_installed(
+        self, tmp_path
+    ):
+        """P1 regression (review probe: ``target_has_unrendered_tokens=True``).
+
+        Dereference what all three units exec after the documented install: each
+        target must exist and must be the RENDERED copy, not the template.
+        """
+        root = tmp_path / "opt" / "gcmw"
+        rendered = self._render(tmp_path, deploy_dir=None, root=str(root))
+        self._install(rendered, root)
+
+        targets = self._exec_targets_under(root, rendered)
+        bundle_bin = f"{root}/deploy/current/bin"
+        assert f"{bundle_bin}/start-botscreen-ui" in targets
+        assert f"{bundle_bin}/run-demo-agent-api.py" in targets, (
+            "the units must exec the installed bundle's entry points"
+        )
+        launcher = _read(root / "deploy" / "current" / "bin" / "start-botscreen-ui")
+        assert "@@GCMW_" not in launcher
+        assert f'exec "{root}/current/botscreen"' in launcher
 
     def test_leaves_no_placeholder_behind(self, tmp_path):
         out = self._render(tmp_path)

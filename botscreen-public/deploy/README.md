@@ -65,11 +65,64 @@ deploy/bin/render-assets.sh --out /tmp/gcmw-rendered \
 
 The renderer substitutes, then asserts **no `@@GCMW_` survives**, then runs
 `bash -n` on the shell files, an AST parse on the Python entry, and
-`systemd-analyze verify` where available. Nothing is installed by it.
+`systemd-analyze verify` where available. **Nothing is installed by it.**
 
-Use a stable path for the deploy bundle (`<root>/deploy/current`) so the unit
-files do not have to change when the release SHA changes: the release is reached
-through `<root>/current`, which is swapped atomically.
+`--deploy-dir` defaults to `<root>/deploy/current`, so omitting it is safe: the
+rendered units point at the **installed** bundle, never at this checkout.
+(Defaulting to the source directory produced units that exec'd unrendered
+templates in the repository — and the render still exited 0.) Override it only for
+a rehearsal layout.
+
+## Install
+
+**Install the rendered files, never the templates.** The units exec
+`<root>/deploy/current/bin/…`, so that directory must exist and hold the rendered
+`bin/`; a unit pointing back into the checkout is exactly the bug this section
+prevents.
+
+| Rendered | Goes to | Mode | Owner |
+|---|---|---|---|
+| `bin/render-assets.sh` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
+| `bin/start-botscreen-ui` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
+| `bin/run-demo-agent-api.py` | `<root>/deploy/current/bin/` | `0755` | `root:root` |
+| `systemd/qa-server.service` | `/etc/systemd/system/` | `0644` | `root:root` |
+| `systemd/botscreen.service` | `/etc/systemd/system/` | `0644` | `root:root` |
+| `systemd/gcmw-agent-demo.service` | `~/.config/systemd/user/` | `0644` | the operator |
+| `config/voice-bridge.env` | `<root>/config/` | `0600` | `root:root` |
+| `config/demo-agent-api.env` | `<root>/config/` | `0600` | the operator |
+| `README.md` (**not rendered**) | `<root>/deploy/current/README.md` | `0644` | `root:root` |
+
+This README is copied straight from the bundle, not rendered — its placeholder
+table documents the token **names**, so substituting them would destroy it.
+
+```bash
+sudo install -d -m 0755 /opt/gcmw/deploy/current/bin /opt/gcmw/config
+sudo install -m 0755 <rendered>/bin/start-botscreen-ui     /opt/gcmw/deploy/current/bin/
+sudo install -m 0755 <rendered>/bin/run-demo-agent-api.py  /opt/gcmw/deploy/current/bin/
+sudo install -m 0755 <rendered>/bin/render-assets.sh       /opt/gcmw/deploy/current/bin/
+sudo install -m 0644 <bundle>/README.md                    /opt/gcmw/deploy/current/README.md
+
+# back up the units BEFORE overwriting them
+sudo install -d -m 0755 /var/backups/gcmw
+sudo cp -a /etc/systemd/system/qa-server.service \
+  /var/backups/gcmw/qa-server.service.$(date +%Y%m%d-%H%M%S)
+sudo install -m 0644 <rendered>/systemd/qa-server.service /etc/systemd/system/
+sudo install -m 0644 <rendered>/systemd/botscreen.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# the Agent API unit belongs to the OPERATOR's session: install it as that user
+install -m 0644 <rendered>/systemd/gcmw-agent-demo.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+Two permission traps worth stating out loud:
+
+- `voice-bridge.env` is read by **PID 1** on behalf of a system unit, so
+  `0600 root:root` is correct — the service user never needs to open it.
+- `demo-agent-api.env` is read by the **user** manager. A `root:root 0600` file
+  there is silently ignored (`EnvironmentFile=-…` is optional), so the offline
+  MockProvider would be used even after you configure a cloud provider. Keep it
+  readable by that user (`0600`, owner = operator), or omit it entirely for mock mode.
 
 ## Startup order
 
@@ -111,22 +164,68 @@ entry guard (CORS never bypasses authentication).
 
 ## Rollback
 
-The release tree and the units are independent knobs.
+Two independent things can be wrong — the **release** the units point at, and the
+**deployment assets** (rendered `bin/`, unit files). Fix them in that order, then
+bring the stack back in *startup* order. **Never restart the UI first.**
+
+The release is reached through `<root>/current`, which is swapped atomically, so
+the unit files do not change when the release SHA changes. But **a swap restarts
+nothing**: a running process keeps the image it started with, so pointing
+`<root>/current` at an older release has no effect on the Agent API or the UI until
+they are restarted. That is the trap in doing only step 2.
+
+### 1. Decide what to restore
+
+| Symptom | Restore |
+|---|---|
+| the new release behaves badly | step 2 (release) |
+| a unit was overwritten, or a launcher is broken | step 3 (assets + units) |
+| both | step 2, then step 3 |
+
+### 2. Release (atomic symlink swap)
 
 ```bash
-# A) back to the previous release (atomic symlink swap)
 sudo ln -sfn /opt/gcmw/releases/<PREVIOUS_SHA> /opt/gcmw/current.new
 sudo mv -Tf /opt/gcmw/current.new /opt/gcmw/current
-sudo systemctl restart qa-server.service botscreen.service
+readlink -f /opt/gcmw/current          # confirm before restarting anything
+```
 
-# B) back to the previous unit files
+### 3. Deployment assets and units
+
+The units exec `<root>/deploy/current/bin/…`, so the **rendered** launcher and
+entry point must be restored as well — restoring the symlink alone is not enough.
+
+```bash
+sudo install -d -m 0755 /opt/gcmw/deploy/current/bin
+sudo install -m 0755 <rendered>/bin/start-botscreen-ui     /opt/gcmw/deploy/current/bin/
+sudo install -m 0755 <rendered>/bin/run-demo-agent-api.py  /opt/gcmw/deploy/current/bin/
+sudo install -m 0644 <bundle>/README.md                    /opt/gcmw/deploy/current/README.md
+
+# prefer the timestamped copies taken during install
 sudo install -m 0644 /var/backups/gcmw/qa-server.service.<STAMP>  /etc/systemd/system/qa-server.service
 sudo install -m 0644 /var/backups/gcmw/botscreen.service.<STAMP>  /etc/systemd/system/botscreen.service
-sudo systemctl daemon-reload && sudo systemctl restart qa-server.service botscreen.service
-
-# C) Agent API back to the pre-migration interpreter/entry
-systemctl --user daemon-reload && systemctl --user restart gcmw-agent-demo.service
+sudo systemctl daemon-reload
 ```
+
+### 4. Bring the stack back — startup order, matching scope
+
+```bash
+# a) Agent API first. It is a USER unit: run it as its OWNING user, without sudo.
+systemctl --user restart gcmw-agent-demo.service
+curl -sf -o /dev/null -w '8001 ready: %{http_code}\n' http://127.0.0.1:8001/api/v1/health/ready
+
+# b) only once 8001 answers: the voice bridge (system)
+sudo systemctl restart qa-server.service
+curl -s http://127.0.0.1:8000/health          # expect "answer_backend":"agent"
+
+# c) and only then the UI (system)
+sudo systemctl restart botscreen.service
+```
+
+Scopes are not interchangeable: `sudo systemctl` cannot manage the user unit, and
+`systemctl --user` cannot manage the system ones. Running a restart in the wrong
+scope fails (or applies to nothing), which is how a "rolled back" host ends up
+still serving the old code.
 
 Always back up the unit files **before** installing new ones
 (`install -d -m 0755 /var/backups/gcmw && cp -a <unit> /var/backups/gcmw/<unit>.<timestamp>`).

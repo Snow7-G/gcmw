@@ -15,7 +15,7 @@
 #   <root>/current/botscreen-public/server     server sources
 #   <root>/venv/bin/python             interpreter
 #   <root>/config                      EnvironmentFile directory
-#   <deploy dir>                       this bundle (self-locating)
+#   <root>/deploy/current              this bundle once INSTALLED (see README)
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,7 +26,7 @@ user="$(id -un)"
 home="${HOME}"
 server_dir=""
 release_dir=""
-deploy_dir="${bundle}"
+deploy_dir=""
 config_dir=""
 venv_python=""
 rcpath=""
@@ -52,6 +52,11 @@ done
 [ -n "$out" ] || { echo "--out DIR is required" >&2; exit 2; }
 : "${server_dir:=${root}/current/botscreen-public/server}"
 : "${release_dir:=${root}/current}"
+# NOT $bundle: the default must be the path the bundle is INSTALLED to, because
+# the rendered units exec `$deploy_dir/bin/...`. Defaulting to the source checkout
+# produced units that pointed at unrendered templates in the repository, and the
+# render still exited 0. Override with --deploy-dir for a rehearsal layout.
+: "${deploy_dir:=${root}/deploy/current}"
 : "${config_dir:=${root}/config}"
 : "${venv_python:=${root}/venv/bin/python}"
 : "${rcpath:=${root}/src}"
@@ -161,5 +166,10 @@ fi
 
 echo
 echo "RENDER DONE -> $out"
-echo "Next: install systemd/*.service, place config/*.env (mode 600), then follow"
-echo "the startup order in README.md."
+echo "Next: install the RENDERED files (the ones under $out), never the templates:"
+echo "  bin/          -> $deploy_dir/bin          (0755)  <- the units exec these"
+echo "  systemd/*     -> /etc/systemd/system     (0644)  or ~/.config/systemd/user for the user unit"
+echo "  config/*.env  -> $config_dir              (0600)"
+echo "Also copy README.md (NOT rendered: its table documents the token names) to"
+echo "  $deploy_dir/README.md   (0644)"
+echo "Then daemon-reload and follow the startup order in README.md."
