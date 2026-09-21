@@ -17,6 +17,7 @@ here rather than left to a README reminder.
 from __future__ import annotations
 
 import importlib.util
+import os
 import re
 import shutil
 import signal
@@ -36,10 +37,30 @@ CONFIG_DIR = DEPLOY_DIR / "config"
 _HEX40 = re.compile(r"\b[0-9a-f]{40}\b")
 _SECRETISH_NAMES = ("API_KEY", "TOKEN", "SECRET", "CREDENTIAL", "PASSWORD")
 _PLACEHOLDERISH = ("YOUR_", "<", "CHANGEME", "set-me")
+# Startup hooks some shells use to inject wrapper functions over the real tools.
+_INJECTION = ("BASH_ENV", "ENV")
 
 
 def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _shell_env() -> dict[str, str]:
+    """An environment in which ``rm`` is the real ``rm``.
+
+    Developer shells — this project's authoring environment included — sometimes
+    inject an ``rm`` wrapper through ``BASH_ENV`` or a PATH shim that refuses
+    "bulk" deletes. The bundle is a POSIX shell tool: whether a restore works has
+    to be decided by the script, not by whatever the ambient shell has done to
+    the word ``rm``. Without this, a shim blocking one delete turns a passing
+    restore into a spurious failure and the assertions stop meaning what they
+    say. CI sets neither, so there this is a no-op.
+    """
+    env = {key: value for key, value in os.environ.items() if key not in _INJECTION}
+    env["PATH"] = os.pathsep.join(
+        entry for entry in env.get("PATH", "").split(os.pathsep) if "shim" not in entry
+    )
+    return env
 
 
 def _unit(name: str) -> str:
@@ -605,12 +626,21 @@ class TestBackupAndRollbackRestoreTheFiles:
 
     File operations only: every directory is an argument to the scripts, which is
     what makes this runnable in a temp dir — no service is touched and nothing
-    needs sudo.
+    needs sudo. The scripts are invoked with a sanitised environment (see
+    ``_shell_env``) so what is measured is the script, not a wrapper the developer's
+    shell put in front of ``rm``.
 
     Why this exists: the previous procedure timestamped per file, backed up only
     qa-server.service, and then overwrote botscreen.service and the user unit with
     no copy at all. A rollback that references a file nobody saved is not a
     rollback, and prose in a README could not catch that — this can.
+
+    Two contracts are pinned beyond the happy path, because both were real:
+
+    - a snapshot that cannot be *proven* complete changes **nothing** (the old code
+      restored some files, kept the rest new, and once even exited 0);
+    - a write that fails anyway is reported as a partial restore, naming what was
+      already changed, rather than exiting non-zero in silence.
     """
 
     STAMP = "20260921-120000"
@@ -649,6 +679,7 @@ class TestBackupAndRollbackRestoreTheFiles:
             check=False,
             capture_output=True,
             text=True,
+            env=_shell_env(),
         )
 
     @staticmethod
@@ -659,15 +690,29 @@ class TestBackupAndRollbackRestoreTheFiles:
 
     def _old_state(self, layout: dict[str, Path]) -> None:
         """Before the install: three files, and no user unit / Agent entry point."""
-        self._write(layout["system_unit_dir"] / "qa-server.service", "OLD qa\n")
+        self._write(layout["system_unit_dir"] / "qa-server.service", "OLD qa\n", 0o600)
         self._write(layout["system_unit_dir"] / "botscreen.service", "OLD ui\n")
         self._write(
             layout["deploy_dir"] / "bin" / "start-botscreen-ui", "OLD launcher\n", 0o700
         )
 
+    def _full_old_state(self, layout: dict[str, Path]) -> None:
+        """All five managed files present, so every manifest row is COPIED.
+
+        The ABSENT path is covered by _old_state; this is the shape that makes a
+        snapshot droppable in the middle, which is what the review injected.
+        """
+        self._old_state(layout)
+        self._write(
+            layout["user_unit_dir"] / "gcmw-agent-demo.service", "OLD user unit\n"
+        )
+        self._write(
+            layout["deploy_dir"] / "bin" / "run-demo-agent-api.py", "OLD entry\n", 0o755
+        )
+
     def _new_state(self, layout: dict[str, Path]) -> None:
-        self._write(layout["system_unit_dir"] / "qa-server.service", "NEW qa\n")
-        self._write(layout["system_unit_dir"] / "botscreen.service", "NEW ui\n")
+        self._write(layout["system_unit_dir"] / "qa-server.service", "NEW qa\n", 0o600)
+        self._write(layout["system_unit_dir"] / "botscreen.service", "NEW ui\n", 0o640)
         self._write(
             layout["user_unit_dir"] / "gcmw-agent-demo.service", "NEW user unit\n"
         )
@@ -676,6 +721,68 @@ class TestBackupAndRollbackRestoreTheFiles:
         )
         self._write(
             layout["deploy_dir"] / "bin" / "run-demo-agent-api.py", "NEW entry\n", 0o755
+        )
+
+    @staticmethod
+    def _managed(layout: dict[str, Path]) -> dict[str, Path]:
+        """The five files an install overwrites. Order matches the scripts."""
+        return {
+            "qa-server.service": layout["system_unit_dir"] / "qa-server.service",
+            "botscreen.service": layout["system_unit_dir"] / "botscreen.service",
+            "gcmw-agent-demo.service": (
+                layout["user_unit_dir"] / "gcmw-agent-demo.service"
+            ),
+            "start-botscreen-ui": (layout["deploy_dir"] / "bin" / "start-botscreen-ui"),
+            "run-demo-agent-api.py": (
+                layout["deploy_dir"] / "bin" / "run-demo-agent-api.py"
+            ),
+        }
+
+    @classmethod
+    def _fingerprint(cls, layout: dict[str, Path]) -> dict[str, tuple[str, int] | None]:
+        """Content AND mode of every managed file, or None where it is absent."""
+        return {
+            name: (
+                (_read(path), path.stat().st_mode & 0o777) if path.is_file() else None
+            )
+            for name, path in cls._managed(layout).items()
+        }
+
+    @classmethod
+    def _manifest_lines(cls, layout: dict[str, Path], stamp: str) -> list[str]:
+        return _read(layout["backup_dir"] / stamp / "MANIFEST.tsv").splitlines()
+
+    @classmethod
+    def _write_manifest(
+        cls, layout: dict[str, Path], stamp: str, lines: list[str]
+    ) -> None:
+        path = layout["backup_dir"] / stamp / "MANIFEST.tsv"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _rollback_elsewhere(
+        self, layout: dict[str, Path], elsewhere: dict[str, Path], *extra: str
+    ) -> subprocess.CompletedProcess:
+        """Roll back the real snapshot while pointing the directories at a
+        different root — the operator-supplied directories must win, so this has
+        to be refused rather than silently writing to the manifest's paths."""
+        return subprocess.run(
+            [
+                "bash",
+                str(BIN_DIR / "rollback-assets.sh"),
+                "--backup-dir",
+                str(layout["backup_dir"]),
+                "--system-unit-dir",
+                str(elsewhere["system_unit_dir"]),
+                "--user-unit-dir",
+                str(elsewhere["user_unit_dir"]),
+                "--deploy-dir",
+                str(elsewhere["deploy_dir"]),
+                *extra,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_shell_env(),
         )
 
     def test_backup_then_rollback_restores_content_and_mode(self, tmp_path):
@@ -763,6 +870,339 @@ class TestBackupAndRollbackRestoreTheFiles:
         assert f"stamp={self.STAMP}" in version
         assert "current=" in version
         assert "server_head=" in version
+
+    # ------------------------------------------------------------------
+    # A snapshot that cannot be proven complete must change NOTHING.
+    #
+    # The failure these pin is nastier than a plain crash: the old restore
+    # checked and wrote in the same pass, so a snapshot missing its fifth file
+    # put the first four back, kept the fifth new, and exited 1 — a tree where
+    # some files are old, some new, and nothing records which is which. A
+    # truncated manifest was worse still: it restored one file and exited 0.
+    #
+    # An interrupted backup is not a contrived input. It is what a killed or
+    # disk-full run leaves behind, and "restore the newest snapshot" picked it
+    # by name ordering.
+    # ------------------------------------------------------------------
+
+    def test_a_snapshot_missing_its_last_file_is_refused_before_any_write(
+        self, tmp_path
+    ):
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        stored = layout["backup_dir"] / self.STAMP / "files" / "5_run-demo-agent-api.py"
+        assert stored.is_file(), "precondition: the fifth file was snapshotted"
+        stored.unlink()
+
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert "incomplete" in refused.stderr
+        assert self._fingerprint(layout) == before, (
+            "the old code restored the first four files and left the fifth new"
+        )
+        assert "Nothing was modified" in refused.stderr
+
+    def test_a_truncated_manifest_is_refused_before_any_write(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        lines = self._manifest_lines(layout, self.STAMP)
+        assert len(lines) == 6, "precondition: header + five rows"
+        self._write_manifest(layout, self.STAMP, lines[:2])  # header + one row
+
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert "5" in refused.stderr and "expected" in refused.stderr
+        assert self._fingerprint(layout) == before, (
+            "the old code restored the single surviving row and exited 0"
+        )
+
+    def test_a_duplicated_target_is_refused_before_any_write(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        lines = self._manifest_lines(layout, self.STAMP)
+        launcher = lines[4].split("\t")[2]
+        row = lines[5].split("\t")
+        # Row 5 now names the launcher as well: one target twice, and the Agent
+        # entry point never named at all.
+        lines[5] = "\t".join([row[0], row[1], launcher, row[3]])
+        self._write_manifest(layout, self.STAMP, lines)
+
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert "exactly once" in refused.stderr
+        assert self._fingerprint(layout) == before
+
+    def test_an_extra_target_is_refused_before_any_write(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        outsider = tmp_path / "elsewhere" / "something-else.service"
+        lines = self._manifest_lines(layout, self.STAMP)
+        # A sixth row, whose stored path DOES exist: only the count rejects it.
+        lines.append(f"COPIED\t644\t{outsider}\tfiles/1_qa-server.service")
+        self._write_manifest(layout, self.STAMP, lines)
+
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert "6 target" in refused.stderr
+        assert not outsider.exists()
+        assert self._fingerprint(layout) == before
+
+    def test_a_manifest_cannot_redirect_a_write_outside_the_named_directories(
+        self, tmp_path
+    ):
+        """A complete-looking manifest is still refused if its targets are not
+        the five files under the directories this caller named."""
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        outside = tmp_path / "elsewhere" / "bin"
+        lines = self._manifest_lines(layout, self.STAMP)
+        for index in range(1, 6):
+            fields = lines[index].split("\t")
+            fields[2] = str(outside / f"file{index}")
+            lines[index] = "\t".join(fields)
+        self._write_manifest(layout, self.STAMP, lines)
+
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert "do not cover" in refused.stderr
+        assert not outside.exists(), "the manifest must not steer cp or rm"
+        assert self._fingerprint(layout) == before
+
+    def test_a_manifest_path_that_escapes_the_snapshot_is_refused(self, tmp_path):
+        """A stored path is a claim about a file INSIDE the snapshot."""
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        lines = self._manifest_lines(layout, self.STAMP)
+        fields = lines[5].split("\t")
+        lines[5] = "\t".join([*fields[:3], "../../../../etc/hosts"])
+        self._write_manifest(layout, self.STAMP, lines)
+
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert ".." in refused.stderr
+        assert self._fingerprint(layout) == before
+
+    def test_directories_that_disagree_with_the_manifest_are_refused(self, tmp_path):
+        """The caller's directories decide, not the manifest.
+
+        Without this the operator can hand the script a temp root and watch it
+        write to the live install path the manifest recorded instead.
+        """
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        elsewhere = self._layout(tmp_path / "elsewhere")
+        refused = self._rollback_elsewhere(layout, elsewhere, "--stamp", self.STAMP)
+        assert refused.returncode != 0
+        assert "do not cover" in refused.stderr or "exactly once" in refused.stderr
+        assert self._fingerprint(layout) == before, "the live tree must be untouched"
+        assert not elsewhere["system_unit_dir"].exists(), (
+            "nothing may be created under the other root either"
+        )
+        assert not elsewhere["deploy_dir"].exists()
+
+    def test_a_leftover_staging_directory_cannot_be_named(self, tmp_path):
+        """An unfinished backup is not a snapshot, whatever its name says."""
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        partial = layout["backup_dir"] / f".{self.STAMP}.partial.AbC123"
+        (partial / "files").mkdir(parents=True)
+        (partial / "MANIFEST.tsv").write_text(
+            "status\tmode\toriginal\tstored\n", encoding="utf-8"
+        )
+
+        refused = self._script(
+            layout, "rollback-assets.sh", "--stamp", f".{self.STAMP}.partial.AbC123"
+        )
+        assert refused.returncode == 2
+        assert "staging" in refused.stderr
+        assert self._fingerprint(layout) == before
+
+        listed = self._script(layout, "rollback-assets.sh", "--list")
+        assert listed.returncode == 0
+        assert f"  {self.STAMP}\n" in listed.stdout, "the published stamp is listed"
+        assert f".{self.STAMP}.partial" not in listed.stdout, (
+            "an unfinished backup must not be offered as a choice"
+        )
+
+    def test_rollback_requires_an_explicit_stamp(self, tmp_path):
+        """No newest-wins: name ordering is what picks the interrupted snapshot."""
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        refused = self._script(layout, "rollback-assets.sh")
+        assert refused.returncode == 2
+        assert "--stamp is required" in refused.stderr
+        assert self._fingerprint(layout) == before
+
+    def test_dry_run_validates_before_it_prints_a_plan(self, tmp_path):
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        before = self._fingerprint(layout)
+
+        plan = self._script(
+            layout, "rollback-assets.sh", "--stamp", self.STAMP, "--dry-run"
+        )
+        assert plan.returncode == 0, plan.stderr
+        assert "would:" in plan.stdout
+        assert "NOTHING was modified" in plan.stdout
+        assert self._fingerprint(layout) == before
+
+        stored = layout["backup_dir"] / self.STAMP / "files" / "5_run-demo-agent-api.py"
+        stored.unlink()
+        refused = self._script(
+            layout, "rollback-assets.sh", "--stamp", self.STAMP, "--dry-run"
+        )
+        assert refused.returncode != 0, "a dry run must validate the same way"
+        assert "incomplete" in refused.stderr
+        assert self._fingerprint(layout) == before
+
+    def test_an_interrupted_backup_publishes_nothing(self, tmp_path):
+        """A run that dies halfway must leave no stamp to roll back to."""
+        layout = self._layout(tmp_path)
+        self._old_state(layout)
+        # Fail on the SECOND file, so the first is already staged when it dies:
+        # the staging directory has content at the moment of the failure.
+        unreadable = layout["system_unit_dir"] / "botscreen.service"
+        unreadable.chmod(0o000)
+        try:
+            unreadable.read_bytes()
+        except PermissionError:
+            pass
+        else:
+            unreadable.chmod(0o644)
+            pytest.skip("this user can read a mode-000 file, so the copy cannot fail")
+
+        died = self._script(layout, "backup-assets.sh", "--stamp", self.STAMP)
+        assert died.returncode != 0
+        assert not (layout["backup_dir"] / self.STAMP).exists(), (
+            "a partial snapshot must never be published under the stamp"
+        )
+        leftovers = [
+            entry.name
+            for entry in layout["backup_dir"].iterdir()
+            if entry.name.startswith(".")
+        ]
+        assert leftovers == [], f"staging was not cleaned up: {leftovers}"
+
+        unreadable.chmod(0o644)
+        refused = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert refused.returncode != 0, "there is nothing valid to roll back to"
+
+    def test_a_write_that_fails_midway_is_reported_as_a_partial_restore(self, tmp_path):
+        """The restore cannot be atomic, so it must not pretend it was.
+
+        A real failure between two writes leaves some files old and some new. What
+        is not acceptable is exiting non-zero WITHOUT saying which files already
+        changed — from the outside that is indistinguishable from a clean restore,
+        and it is the one outcome the validation pass cannot rule out in advance.
+        """
+        layout = self._layout(tmp_path)
+        self._full_old_state(layout)
+        assert (
+            self._script(layout, "backup-assets.sh", "--stamp", self.STAMP).returncode
+            == 0
+        )
+
+        self._new_state(layout)
+        # Make the fourth write impossible without depending on permissions (which
+        # differ under root): deploy/current/bin becomes a FILE, so writing
+        # bin/<name> fails with ENOTDIR on any POSIX cp.
+        bin_dir = layout["deploy_dir"] / "bin"
+        for child in bin_dir.iterdir():
+            child.unlink()
+        bin_dir.rmdir()
+        bin_dir.write_text("not a directory\n", encoding="utf-8")
+
+        partial = self._script(layout, "rollback-assets.sh", "--stamp", self.STAMP)
+        assert partial.returncode != 0
+        assert "PARTIALLY RESTORED" in partial.stderr, partial.stderr
+        assert "3 of 5" in partial.stderr, (
+            "the report has to say how far it got, not just that it failed"
+        )
+        # the three writes that did happen really are the old bytes
+        assert _read(layout["system_unit_dir"] / "qa-server.service") == "OLD qa\n"
+        assert _read(layout["system_unit_dir"] / "botscreen.service") == "OLD ui\n"
+        assert (
+            _read(layout["user_unit_dir"] / "gcmw-agent-demo.service")
+            == "OLD user unit\n"
+        )
 
 
 class TestReadmeCoversTheOperationalContract:

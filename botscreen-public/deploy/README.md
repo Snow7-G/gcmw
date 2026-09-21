@@ -109,6 +109,10 @@ sudo bin/backup-assets.sh --stamp "${STAMP}" --backup-dir /var/backups/gcmw \
   --user-unit-dir /home/<operator>/.config/systemd/user   # explicit: this runs as root
 #    Anything that does not exist yet is recorded ABSENT, so rolling back a
 #    first-time install removes it again instead of leaving it behind.
+#    The snapshot is BUILT under a temporary .<stamp>.partial.xxxxxx directory and
+#    published under the stamp only once all five files are in it. A run that
+#    dies halfway therefore leaves no stamp anyone can name — no half-snapshot
+#    that a restore would read as "some files old, some new".
 
 # 1) rendered sources
 sudo install -d -m 0755 /opt/gcmw/deploy/current/bin /opt/gcmw/config
@@ -226,6 +230,38 @@ sudo bin/rollback-assets.sh --stamp <STAMP> \
 sudo systemctl daemon-reload          # system scope
 systemctl --user daemon-reload        # user scope — the Agent unit is the operator's
 ```
+
+**`--stamp` is required and there is no "newest wins" default.** The snapshot you
+least want to restore is the one left by an install that died halfway, and sorting
+directory names is exactly what picks that one. `--list` shows the stamps that
+were actually published; a leftover `.<stamp>.partial.xxxxxx` directory is never
+listed and cannot be named.
+
+**Nothing is written until the whole snapshot has been checked.** The restore
+first proves *all* of the following, and refuses with a non-zero exit — changing
+nothing at all — if any one fails:
+
+| Checked before the first write | Why it matters |
+|---|---|
+| the manifest's header | a truncated file must not be read as data |
+| exactly five entries, no repeats | a short manifest used to restore one file and **exit 0** |
+| every status and every mode | `COPIED`/`ABSENT`, and a real octal mode |
+| every `COPIED` file is present | the old code restored the first four, kept the fifth new, and exited 1 |
+| stored paths stay inside the snapshot | a manifest is not allowed to name `/etc/hosts` |
+| targets == the five files under **the directories you passed** | otherwise the manifest decides where `cp`/`rm` goes, and a temp `--deploy-dir` still writes to the live install |
+
+That last row is why the directory arguments are not decoration: they are the
+constraint the manifest is checked against, and the destination is always taken
+from them. `--dry-run` runs the identical checks.
+
+This is not a transaction, and it is not claimed to be one: a real disk error
+between two writes can still leave the tree half restored. Two things keep a
+half-done restore from being mistaken for a finished one. A defect discoverable
+*in advance* — a partial snapshot, a truncated manifest, a redirected target — is
+rejected before anything is touched. And if a write fails anyway, the restore
+stops there, exits non-zero, and prints `THE TREE IS PARTIALLY RESTORED` followed
+by the exact list of targets it had already changed; the snapshot is untouched, so
+re-running the same command finishes the job.
 
 `MANIFEST.tsv` records one of two things per file, and both are handled:
 
