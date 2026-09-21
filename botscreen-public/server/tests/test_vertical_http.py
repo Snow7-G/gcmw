@@ -132,6 +132,10 @@ class TestAnsweredOverHttp:
 
 class TestRefusalAndEscalationOverHttp:
     def test_a_question_without_evidence_fails_without_answer_events(self):
+        # 样本问句必须落在演示语料**之外**：语料补了眼科条目后，原先用的
+        # "近视激光手术多少钱"已经能检到资料并被正常回答，不再是"无证据"样本。
+        # 本用例钉的是"检不到证据 → 拒答且不产生任何 answer 事件"，所以换成与
+        # 语料无交集的问句（意图与断言都不变，只换样本）。
         with running_app(agent_executor=True) as harness:
             session = harness.client.post(
                 "/api/v1/sessions", json={"channel": "text"}
@@ -140,7 +144,7 @@ class TestRefusalAndEscalationOverHttp:
                 "/api/v1/agent/runs",
                 json={
                     "session_id": session["session_id"],
-                    "input": {"type": "text", "text": "近视激光手术多少钱"},
+                    "input": {"type": "text", "text": "牙疼吃什么药"},
                     "idempotency_key": "k3",
                 },
             ).json()

@@ -34,37 +34,20 @@ from ..agents.medical_qa import MedicalQAAgent
 from ..agents.registry import AgentManifest, AgentRegistry
 from ..agents.verifier import SafetyEvidenceVerifier
 from ..config import Settings
-from ..contracts.common import TenantContext
-from ..contracts.knowledge import ApprovalDecision, CandidateInput, KnowledgeSourceType
+from ..knowledge.demo_seed import (
+    DEMO_TENANT_ID,
+    canned_replies,
+    seed_demo_knowledge,
+)
 from ..knowledge.store import KnowledgeStore
 from ..providers.mock import MockProvider
 from ..providers.model_gateway import ModelGateway
 from ..tools.builtins import build_gateway
 from .executor import RunExecutor
 
-#: the tenant the synthetic demo knowledge is published for. A run from any
-#: other tenant must find no evidence and be refused (isolation is real).
-DEMO_TENANT_ID = "t1"
-
-#: knowledge validity window for the synthetic corpus (fixed, aware UTC).
-_KNOWLEDGE_VALID_FROM = datetime(2026, 1, 1, tzinfo=timezone.utc)
-
-#: the demo corpus: SYNTHETIC sentences whose full text the MockProvider echoes
-#: back, so every demo answer passes the exact-match support gate honestly.
-_DEMO_KNOWLEDGE: tuple[dict[str, str], ...] = (
-    {
-        "source_id": "faq-fever",
-        "title": "发热护理须知",
-        "content": "体温超过38.5建议门诊就诊。",
-        "question": "发热",
-    },
-    {
-        "source_id": "faq-eye",
-        "title": "用眼卫生须知",
-        "content": "眼部不适需及时就诊。",
-        "question": "眼睛",
-    },
-)
+# 演示语料与「可重复执行」的装载流程都在 app.knowledge.demo_seed：语料文本、
+# 单句约束、审核发布路径与幂等语义集中一处，便于审计与测试。DEMO_TENANT_ID
+# 依旧从这个模块可见（``__all__`` 保留），历史引用不受影响。
 
 #: red-flag / risk markers. RECORDED ATTESTATION ONLY — see module docstring.
 _DEMO_RED_FLAGS: tuple[str, ...] = ("自杀",)
@@ -79,39 +62,6 @@ _AUDIT_LOGGER = logging.getLogger("gcmw.audit")
 def _tool_audit_sink(record: Any) -> None:
     """One structured JSON line per tool call (routable to file/SIEM)."""
     _AUDIT_LOGGER.warning(record.model_dump_json())
-
-
-def _cite(sentence: str) -> str:
-    """Compose a model reply whose citation sits INSIDE the sentence.
-
-    The support gate splits claims on sentence terminators, so a marker placed
-    after the closing 。 would land in a bodyless fragment and be read as a
-    dangling citation. A citation always goes BEFORE the sentence-ending
-    punctuation — which is also what the #53 prompt asks for."""
-    body = sentence.rstrip("。")
-    return f"{body}（资料[1]）。"
-
-
-def _publish(store: KnowledgeStore, source_id: str, title: str, content: str) -> None:
-    """Drive the #56 governance lifecycle to APPROVED for the demo tenant."""
-    context = TenantContext(tenant_id=DEMO_TENANT_ID)
-    store.add_candidate(
-        context,
-        CandidateInput(
-            source_id=source_id,
-            source_type=KnowledgeSourceType.FAQ,
-            title=title,
-            content=content,
-            source_uri=f"kbase://{source_id}",
-        ),
-        actor="demo-content-owner",
-    )
-    store.mark_in_review(context, source_id, actor="demo-content-owner")
-    store.approve(
-        context,
-        source_id,
-        ApprovalDecision(reviewer="demo-reviewer", valid_from=_KNOWLEDGE_VALID_FROM),
-    )
 
 
 def build_agent_executor(
@@ -132,12 +82,12 @@ def build_agent_executor(
         return None
 
     store = KnowledgeStore()
-    canned: dict[str, str] = {}
-    for entry in _DEMO_KNOWLEDGE:
-        _publish(store, entry["source_id"], entry["title"], entry["content"])
-        # the reply quotes the approved sentence VERBATIM plus its marker, so
-        # the exact-match support gate passes honestly (no paraphrase)
-        canned[entry["question"]] = _cite(entry["content"])
+    # 演示语料的装载走 app.knowledge.demo_seed 的**可重复执行**流程：内容未变
+    # 时零写入（重复启动不重复造版本），内容变化时才 revoke → 重新发布。
+    seed_demo_knowledge(store)
+    # the reply quotes the approved sentence VERBATIM plus its marker, so
+    # the exact-match support gate passes honestly (no paraphrase)
+    canned = canned_replies()
 
     tools = build_gateway(
         knowledge_store=store, audit_sink=audit_sink or _tool_audit_sink
